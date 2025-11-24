@@ -37,7 +37,7 @@ pub fn run_poseidon_benchmark<const WIDTH: usize, const N_COMMITED_CUBES: usize,
 ) where
     KoalaBearInternalLayerParameters: InternalLayerBaseParameters<KoalaBearParameters, WIDTH>,
 {
-    init_tracing();
+    let _trace_guard = init_tracing();
     precompute_dft_twiddles::<F>(1 << 24);
 
     let whir_config_builder = WhirConfigBuilder {

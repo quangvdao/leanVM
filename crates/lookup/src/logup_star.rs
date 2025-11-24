@@ -232,7 +232,7 @@ mod tests {
     }
 
     fn test_logup_star_helper(log_table_len: usize, log_indexes_len: usize) {
-        init_tracing();
+        let _trace_guard = init_tracing();
 
         let table_length = 1 << log_table_len;
 

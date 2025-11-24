@@ -300,7 +300,7 @@ mod tests {
     fn test_gkr_quotient() {
         let log_n = 22;
         let n = 1 << log_n;
-        init_tracing();
+        let _trace_guard = init_tracing();
 
         let mut rng = StdRng::seed_from_u64(0);
 

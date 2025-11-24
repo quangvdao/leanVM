@@ -148,7 +148,7 @@ pub fn run_whir_recursion_benchmark() {
             .unwrap();
     }
 
-    utils::init_tracing();
+    let _trace_guard = utils::init_tracing();
     let bytecode = compile_program(program_str);
 
     // in practice we will precompute all the possible values

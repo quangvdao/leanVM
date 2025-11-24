@@ -95,7 +95,7 @@ version = "0.3.0"
 source = "git+https://github.com/leanEthereum/multilinear-toolkit.git#99573608916262f1643de9ce5d67f54a15d05524"
 dependencies = [
  "fiat-shamir",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "p3-field",
  "p3-util",
  "rand",
@@ -1210,6 +1210,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-chrome"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf0a738ed5d6450a9fb96e86a23ad808de2b727fd1394585da5cdd6788ffe724"
+dependencies = [
+ "serde_json",
+ "tracing-core",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-core"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1320,6 +1331,7 @@ dependencies = [
  "p3-util",
  "rand",
  "tracing",
+ "tracing-chrome",
  "tracing-forest",
  "tracing-subscriber",
 ]

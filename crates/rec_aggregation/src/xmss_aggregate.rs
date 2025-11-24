@@ -255,7 +255,7 @@ pub fn run_xmss_benchmark(n_xmss: usize) {
     )
     .no_vec_runtime_memory;
 
-    utils::init_tracing();
+    let _trace_guard = utils::init_tracing();
 
     precompute_dft_twiddles::<F>(1 << 24);
 

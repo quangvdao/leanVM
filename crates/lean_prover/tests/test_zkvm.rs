@@ -112,7 +112,7 @@ fn test_prove_fibonacci() {
 }
 
 fn test_zk_vm_helper(program_str: &str, (public_input, private_input): (&[F], &[F]), no_vec_runtime_memory: usize) {
-    utils::init_tracing();
+    let _trace_guard = utils::init_tracing();
     let bytecode = compile_program(program_str.to_string());
     let time = std::time::Instant::now();
     let (proof_data, _, summary) = prove_execution(
