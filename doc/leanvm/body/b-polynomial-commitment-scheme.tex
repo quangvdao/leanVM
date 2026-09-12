@@ -13,11 +13,11 @@ here & in \cite{ACFY25,NA25,BCHKS25} & meaning\\
 $\nv_i$        & $m_i$        & variables of the multilinear at level $i$\\
 $\nlev$        & $r$          & number of levels\\
 $\ell_i$       & $\ell_i$, $\nu$ & fold factor, and the interleaving exponent\\
-$\rate_i$      & $\rho_i$     & code rate\\
+$\rate_i$, $\rho_{-,i}$ & $\rho_i$, $(k_i-1)/n_i$ & code rate and reduced degree ratio\\
 $\rexp_i$      & $R_i$        & rate exponent, $\rate_i=2^{-\rexp_i}$\\
 $\rad_i$       & $\gamma_i$   & proximity radius\\
 $\slack_i$     & $\eta_i$     & Johnson slack\\
-$\mcapar$      & $\theta$     & MCA parameter (denoted $m$ in \cite{BCHKS25})\\
+$\mcapar$      & $m$          & MCA interpolation multiplicity\\
 $\dmin$        & $\delta$     & relative minimum distance\\
 $\lambda$      & $\lambda$, $\alpha$ & batching challenge, as in \S\ref{sec:stacking}\\
 $\fc_j$        & $s_j$        & sumcheck fold challenge\\
@@ -51,7 +51,7 @@ $e_c$          & $\beta_c$    & the fixed $\Ftwo$-basis, as in Annex \ref{annex:
 
 \subsubsection{Codes, interleaving, and list decoding}\label{sec:codes}
 
-We use the Reed-Solomon code $\RS[\E,\dom,\kdim]$ of Definition~\ref{def:rs-code}, with $|\dom|=\blen$, dimension $\kdim=2^\kappa$, and rate $\rate=\kdim/\blen$. Messages are indexed by $\cube{\kappa}$; the linear encoder $\Enc$ of \S\ref{sec:binary-rs} maps them onto the code and preserves $\K$-valued words.
+We use the Reed-Solomon code $\RS[\E,\dom,\kdim]$ of Definition~\ref{def:rs-code}, with $|\dom|=\blen$, dimension $\kdim=2^\kappa$, rate $\rate=\kdim/\blen$, degree bound $D=\kdim-1$, and reduced degree ratio $\rho_-=D/\blen$. Messages are indexed by $\cube{\kappa}$; the linear encoder $\Enc$ of \S\ref{sec:binary-rs} maps them onto the code and preserves $\K$-valued words.
 
 \begin{definition}[Interleaved words, lists, folds]\label{def:interleaved}
 An \emph{interleaved word} is a matrix $\orc \in \E^{\cube{\ell} \times \dom}$; it is an \emph{interleaved codeword} if every row $\orc[u, \cdot]$ is a codeword $(u \in \cube{\ell})$. $\orc$ \emph{agrees} with an interleaved codeword $U$ on $\aset \subseteq \dom$ if $\orc[u,x] = U[u,x]$ for all $u \in \cube{\ell}$ and all $x \in \aset$; it is \emph{$\rad$-close} to $U$ if they agree on some $\aset$ with $|\aset| \ge (1-\rad)\blen$; and $\lst_\rad(\orc)$ is the set of interleaved codewords $\rad$-close to $\orc$. A single word \emph{agrees with the code} on $\aset$ if some codeword equals it there, and $\orc$ \emph{agrees with the interleaved code} on $\aset$ if some interleaved codeword equals its rows there. An interleaved codeword $U$ \emph{decodes} to the multilinear $g_U : \cube{\ell + \kappa} \to \E$ with $U[u, \cdot] = \Enc(g_U(u, \cdot))$; distinct $U$ decode to distinct $g_U$, hence distinct $\mle{g_U}$. For $\fc \in \E^{j}$, $j \le \ell$, the \emph{fold} $\orc_\fc \in \E^{\cube{\ell - j} \times \dom}$ is $\orc_\fc[u, x] := \sum_{\iota \in \cube{j}} \eq(\fc, \iota)\, \orc[(\iota, u), x]$ (for $j = \ell$, a single word in $\E^{\dom}$).
@@ -62,7 +62,11 @@ If $U$ is an interleaved codeword then so is $U_\fc$, with $\mle{g_{U_\fc}} = \m
 \end{fact}
 
 \begin{theorem}[Johnson bound]\label{thm:johnson-interleaved}
-For every interleaved word $\orc$ of $\RS[\E,\dom,2^\kappa]$ (rate $\rate$) and every $\slack \in (0, 1-\sqrt{\rate})$: $\ |\lst_{1-\sqrt{\rate}-\slack}(\orc)| \le \frac{1}{2\slack\sqrt{\rate}}$. (see \S\ref{app:johnson} for a self-contained proof)
+For every interleaved word $\orc$ of $\RS[\E,\dom,\kdim]$, and every integer agreement threshold $A$ satisfying $A^2>\blen(\kdim-1)$,
+\[
+ |\lst_{1-A/\blen}(\orc)| \le \left\lfloor\frac{\blen(A-\kdim+1)}{A^2-\blen(\kdim-1)}\right\rfloor.
+\]
+See \S\ref{app:johnson} for a self-contained proof. The bound is independent of the interleaving width because a column can be encoded injectively as one symbol over a field extension, preserving equality.
 \end{theorem}
 
 \subsubsection{PCS and round-by-round soundness}\label{sec:iopcs}
@@ -99,7 +103,7 @@ The encoder $\Enc_{\kappa,\rexp}$ of Definition~\ref{def:enc} evaluates $2^\kapp
 
 \begin{protocol}[Whir/Ligerito]\label{fig:protocol}
 \ \par\smallskip
-\emph{Parameters.} The scheme commits to $f : \cube{\nv} \to \K$ across $\nlev \ge 1$ \emph{levels} $i = 0, \dots, \nlev-1$ plus a plaintext final level $\nlev$: variable counts $\nv = \nv_0 > \nv_1 > \dots > \nv_\nlev \ge 0$ with fold factors $\ell_i := \nv_i - \nv_{i+1} \ge 1$ and $\nv_\nlev$ small (e.g.\ $\nv_\nlev \le 5$); per level, a rate $\rate_i = 2^{-\rexp_i}$, $\rexp_i \ge 1$, giving the encoder $\Enc_i := \Enc_{\kappa_i, \rexp_i}$ of \S\ref{sec:binary-rs} with $\kappa_i := \nv_{i+1}$, i.e.\ the code $\mathcal{C}_i := \RS[\E, \dom_i, 2^{\kappa_i}]$ over its domain $\dom_i \subseteq \K$ of size $\blen_i = 2^{\kappa_i + \rexp_i}$ (requires $\kappa_i + \rexp_i \le 64$); and a query count $\nq_i$. (The proximity radii $\rad_i \in (0, 1 - \sqrt{\rate_i})$ appear only in the analysis.)
+\emph{Parameters.} The scheme commits to $f : \cube{\nv} \to \K$ across $\nlev \ge 1$ \emph{levels} $i = 0, \dots, \nlev-1$ plus a plaintext final level $\nlev$: variable counts $\nv = \nv_0 > \nv_1 > \dots > \nv_\nlev \ge 0$ with fold factors $\ell_i := \nv_i - \nv_{i+1} \ge 1$ and $\nv_\nlev$ small (e.g.\ $\nv_\nlev \le 5$); per level, a rate $\rate_i = 2^{-\rexp_i}$, $\rexp_i \ge 1$, giving the encoder $\Enc_i := \Enc_{\kappa_i, \rexp_i}$ of \S\ref{sec:binary-rs} with $\kappa_i := \nv_{i+1}$, i.e.\ the code $\mathcal{C}_i := \RS[\E, \dom_i, 2^{\kappa_i}]$ over its domain $\dom_i \subseteq \K$ of size $\blen_i = 2^{\kappa_i + \rexp_i}$ (requires $\kappa_i + \rexp_i \le 64$); and a query count $\nq_i$. Its degree bound is $D_i:=2^{\kappa_i}-1$ and its reduced degree ratio is $\rho_{-,i}:=D_i/\blen_i$, distinct from the code rate $\rate_i=2^{\kappa_i}/\blen_i$. The integer agreement thresholds $A_i>\sqrt{D_i\blen_i}$ appear only in the analysis.
 
 \smallskip
 \textbf{Commit}$(f : \cube{\nv} \to \K)$: $\mathbf{P}$ sends the oracle $\orc^{(0)}[u, \cdot] := \Enc_0(f(u, \cdot))$, $u \in \cube{\ell_0}$, whose entries are $\K$ elements. No OOD sample is taken.
@@ -134,16 +138,16 @@ Fix a commitment $\mathsf{cm} = \orc^{(0)}$ and input claims $\{(W_t, c_t)\}_t$,
 \[
 \relopen \;:=\; \Bigl\{ \bigl(\orc^{(0)}, \{(W_t, c_t)\}_t\bigr) \;:\; \exists\, U \in \lst_{\rad_0}(\orc^{(0)}) \text{ with } \inner{W_t}{g_U} = c_t \text{ for all } t \Bigr\}.
 \]
-The commitment binds the prover to the list $\polyset_{\mathsf{cm}} := \{\mle{g_U} : U \in \lst_{\rad_0}(\orc^{(0)})\}$, of size at most $L_0 := \tfrac{1}{2\slack_0\sqrt{\rate_0}}$ for $\rad_0 = 1 - \sqrt{\rate_0} - \slack_0$, by the Johnson bound (Theorem~\ref{thm:johnson-interleaved}).
+The commitment binds the prover to the list $\polyset_{\mathsf{cm}} := \{\mle{g_U} : U \in \lst_{\rad_0}(\orc^{(0)})\}$. We set $\rad_i:=1-A_i/\blen_i$ and write $L_i$ for the exact integer list bound in Theorem~\ref{thm:mca-johnson}; in particular, $|\polyset_{\mathsf{cm}}|\le L_0$.
 
 \begin{theorem}[RBR soundness]\label{thm:rbr}
-Suppose that for every level $i$: $\rad_i = 1 - \sqrt{\rate_i} - \slack_i$ with $\slack_i \in (0, 1-\sqrt{\rate_i})$, $L_i := \tfrac{1}{2\slack_i\sqrt{\rate_i}}$, and $\epsilon_i := \mcanumi{i}/|\E|$ is the mutual correlated agreement error of Theorem~\ref{thm:mca-johnson} below for $\mathcal{C}_i$ at radius $\rad_i$. Then the Protocol~\ref{fig:protocol} is a $L_0$-list binding PCS, and its opening phase $\relopen$ has the following RBR soundness error at each verifier message:
+Suppose that at every level $i$, the integer threshold $A_i$ and interpolation certificate satisfy Theorem~\ref{thm:mca-johnson}. Let $L_i$ be its list bound, let $E_i$ be its exceptional count, and set $\rad_i:=1-A_i/\blen_i$. Then Protocol~\ref{fig:protocol} is an $L_0$-list binding PCS, and its opening phase for $\relopen$ has the following RBR soundness error at each verifier message:
 \[
 \begin{array}{llcl}
 \textnormal{batching, level } i: & \varepsilon^{\mathrm{batch}}_i &=& \dfrac{(J_i - 1)\, L_i}{|\E|} , \\[2ex]
-\textnormal{fold challenge } \fc_j, \textnormal{ level } i: & \varepsilon^{\mathrm{fold}}_{i,j} &=& \dfrac{2 L_i}{|\E|} + 2^{\ell_i - j}\, \epsilon_i , \\[2ex]
+\textnormal{fold challenge } \fc_j, \textnormal{ level } i: & \varepsilon^{\mathrm{fold}}_{i,j} &=& \dfrac{E_i+2 L_i}{|\E|} , \\[2ex]
 \textnormal{OOD challenge entering level } i \ge 1: & \varepsilon^{\mathrm{ood}}_i &=& \dbinom{L_i}{2} \cdot \dfrac{\nv_i}{|\E|} , \\[2ex]
-\textnormal{query message } \qset_i: & \varepsilon^{\mathrm{query}}_i &=& (1 - \rad_i)^{\nq_i} , \\[2ex]
+\textnormal{query message } \qset_i: & \varepsilon^{\mathrm{query}}_i &=& \left(\dfrac{A_i-1}{\blen_i}\right)^{\nq_i} , \\[2ex]
 \textnormal{final batching challenge } \lambda: & \varepsilon^{\mathrm{fin}} &=& \dfrac{\nq_{\nlev-1}}{|\E|} , \\[2ex]
 \textnormal{each of the } \nv_\nlev \textnormal{ closing rounds}: & \varepsilon^{\mathrm{tail}} &=& \dfrac{2}{|\E|} .
 \end{array}
@@ -173,29 +177,50 @@ Then, for every two-row word $\orc$,
 
 We record Theorem~\ref{thm:mca-udr} only for comparison, we don't need it in the List-Decoding Regime, we instead need:
 
-\begin{theorem}[MCA up to the Johnson bound; {\cite[Thm.~4.6]{BCHKS25}}]\label{thm:mca-johnson}
-Let $\RS[\E,\dom,\kdim]$ have block length $\blen = |\dom|$ and set $\rate := (\kdim-1)/\blen$, the \emph{slightly reduced rate} (\cite{BCHKS25} parametrize by the degree bound $\kdim - 1$, not the dimension $\kdim$). Let $\rad \in (0, 1-\sqrt{\rate})$, and set $\slack := 1 - \sqrt{\rate} - \rad$ and $\mcapar := \max\{\lceil \tfrac{\sqrt{\rate}}{\slack} \rceil, 3\}$ (denoted $m$ in~\cite{BCHKS25}). For every two-row word $\orc$,
+\begin{theorem}[MCA up to the Johnson bound; {\cite{DKT26}}]\label{thm:mca-johnson}
+Let $\RS[\E,\dom,\kdim]$ have block length $\blen=|\dom|$, degree bound $D:=\kdim-1$, and reduced degree ratio $\rho_-:=D/\blen$, where $1\le D\le\blen-2$. Fix an integer threshold $D<A\le\blen$ with $A^2>\blen D$. Choose integers $m\ge1$, $1\le B\le\lfloor(mA-1)/D\rfloor$, and $H\ge B$. Set $u:=\min\{B,m-1\}$ and
 \[
-\Pr_{\fc \leftarrow \E}\!\left[\; \exists \aset \subseteq \dom,\ |\aset| \ge (1-\rad) \blen :\ \begin{array}{l} \orc_\fc \text{ agrees with the code on } \aset, \text{ and} \\ \orc \text{ does not agree with the interleaved code on } \aset \end{array} \right] \;\le\; \frac{\mcanum}{|\E|},
+ N:=\sum_{b=0}^{B}(mA-Db),\qquad W:=\sum_{b=0}^{B}b(mA-Db),\qquad R:=\sum_{b=0}^{u}(m-b),\qquad T:=\sum_{b=0}^{u}b(m-b).
 \]
-where
+Suppose $N>\blen R$ and $(H+1)N-W>\blen((H+1)R-T)$. Define
 \[
-\mcanum \;=\; \frac{2(\mcapar + \tfrac12)^5 + 3(\mcapar + \tfrac12)\rad\rate}{3\rate^{3/2}} \cdot \blen \;+\; \frac{\mcapar + \tfrac12}{\sqrt{\rate}}
+ \Psi_D(B):=1+(2D-1)(2B-1)+2(B-2D-1)_+
+\]
+and
+\[
+ E:=(2B-1)H+\frac{\blen-D}{A-D}\bigl(B+H\Psi_D(B)\bigr)+(\blen-D-1)B,
+ \qquad
+ L:=\min\left\{B,\left\lfloor\frac{\blen(A-D)}{A^2-\blen D}\right\rfloor\right\}.
+\]
+Every received word has at most $L$ degree-at-most-$D$ codewords agreeing on at least $A$ positions. For every two-row word $\orc$,
+\[
+\Pr_{\fc \leftarrow \E}\!\left[\; \exists \aset \subseteq \dom,\ |\aset| \ge A :\ \begin{array}{l} \orc_\fc \text{ agrees with the code on } \aset, \text{ and} \\ \orc \text{ does not agree with the interleaved code on } \aset \end{array} \right] \;\le\; \frac{E}{|\E|}.
+\]
+The conclusion preserves the full common agreement set and holds over every field extension. A closed sufficient certificate sets $\slack:=A/\blen-\sqrt{\rho_-}>0$ and
+\[
+ m=\max\left\{\left\lceil\frac{\sqrt{\rho_-}}{2\slack}\right\rceil,3\right\},\qquad t=m+\frac12,\qquad B=\left\lceil\frac{t}{\sqrt{\rho_-}}\right\rceil-1,\qquad H=\left\lceil\frac{t^2}{3\rho_-}\right\rceil-1.
 \]
 \end{theorem}
 
-We write $\epsilon := \mcanum/|\E|$ for this MCA error at radius $\rad$. MCA is exactly what Lemma~\ref{lem:fold-list} needs: folding should not create \emph{new} nearby codewords.
+The interpolation threshold is the classical Johnson threshold; the gain is in the exceptional count. At fixed reduced rate and positive Johnson slack, Theorem~\ref{thm:mca-johnson} gives $E=O(\blen/\slack^3)$. The bound of BCHKS~\cite[Thm.~4.6]{BCHKS25} uses $m_{\mathrm B}=\max\{\lceil\sqrt{\rho_-}/\slack\rceil,3\}$, $t_{\mathrm B}=m_{\mathrm B}+1/2$, and
+\[
+ E_{\mathrm{BCHKS}}=\frac{2t_{\mathrm B}^5+3t_{\mathrm B}(1-A/\blen)\rho_-}{3\rho_-^{3/2}}\blen+\frac{t_{\mathrm B}}{\sqrt{\rho_-}},
+\]
+which scales as $O(\blen/\slack^5)$. The implementation checks the displayed integer certificate directly, including the one finite certificate used instead of the closed choice.
 
 \begin{lemma}[Folding preserves lists]\label{lem:fold-list}
-Let $\RS[\E,\dom,\kdim]$ have rate $\rate$, let $\rad \in (0, 1-\rate)$, and let $\epsilon$ be an MCA error at radius $\rad$. For every interleaved word $\orc \in \E^{\cube{\ell} \times \dom}$, $\ell \ge 1$:
+Let $\RS[\E,\dom,\kdim]$ have full agreement-set line MCA at threshold $A$ with exceptional count $E$, as in Theorem~\ref{thm:mca-johnson}. For every interleaved word $\orc \in \E^{\cube{\ell} \times \dom}$, $\ell \ge 1$:
 \[
-\Pr_{\fc \leftarrow \E}\Bigl[\, \lst_\rad(\orc_\fc) \neq \{ U_\fc : U \in \lst_\rad(\orc) \} \,\Bigr] \;\le\; 2^{\ell-1} \epsilon .
+\Pr_{\fc \leftarrow \E}\Bigl[\, \lst_{1-A/\blen}(\orc_\fc) \neq \{ U_\fc : U \in \lst_{1-A/\blen}(\orc) \} \,\Bigr] \;\le\; \frac{E}{|\E|} .
 \]
+The bound is independent of $\ell$.
 \end{lemma}
 
 \begin{proof}
-$\supseteq$ holds always: $U \in \lst_\rad(\orc)$ agreeing with $\orc$ on $\aset$ gives $U_\fc$ agreeing with $\orc_\fc$ on $\aset$. For $\subseteq$: for $u \in \cube{\ell-1}$ let $E_u$ be the MCA event for the two-row word $(\orc[(0,u),\cdot], \orc[(1,u),\cdot])$, so $\Pr[\bigcup_u E_u] \le 2^{\ell-1}\epsilon$. Suppose no $E_u$ occurs, and let $V \in \lst_\rad(\orc_\fc)$ with common agreement set $\aset$, $|\aset| \ge (1-\rad)\blen$. For each $u$, the row $\orc_\fc[u,\cdot]$ agrees on $\aset$ with the codeword $V[u,\cdot]$, so (as $E_u$ failed) there are, for each $\iota \in \{0,1\}$, codewords $W_{(\iota,u)}$ equal to $\orc[(\iota,u),\cdot]$ on $\aset$; the interleaved codeword $W$ with these rows lies in $\lst_\rad(\orc)$ (same $\aset$ for all $u$). Finally $W_\fc[u,\cdot]$ agrees with $V[u,\cdot]$ on $\aset$, and $|\aset| \ge (1-\rad)\blen > \kdim$ while distinct codewords agree on fewer than $\kdim$ points, so $V = W_\fc$.
+$\supseteq$ holds always: folding an interleaved codeword that agrees on a common set of at least $A$ columns preserves those agreements. For $\subseteq$, regard all $2^{\ell-1}$ row pairs as one interleaved received line. The width-free interleaving transfer of~\cite{DKT26} applies the scalar full agreement-set MCA theorem once to this entire line, with exceptional count $E$. Outside that event, every codeword tuple near the folded word decomposes into two codeword tuples near the two coefficient arrays with the same full common agreement set. These tuples form an interleaved codeword $U$ near $\orc$, and their affine combination is the original folded candidate. Hence the two lists are equal.
 \end{proof}
+
+Applying the lemma successively to a height-$h$ multilinear fold gives ordinary interactive error at most $hE/|\E|$ by a union bound over its independent challenges. For RBR soundness, each current fold challenge is conditioned on the preceding transcript and pays only $E/|\E|$.
 
 \begin{lemma}[OOD separation]\label{lem:ood}
 Let $\orc$ be an interleaved word with $|\lst_\rad(\orc)| \le L$, decoding to $\nv$-variable multilinears. Then $\Pr_{z \leftarrow \E^{\nv}}[\exists \text{ distinct } U, U' \in \lst_\rad(\orc) : \mle{g_U}(z) = \mle{g_{U'}}(z)] \le \binom{L}{2} \nv / |\E|$.
@@ -241,7 +266,7 @@ H_U(0) + H_U(1) \;=\; \bigl\langle\, \mle{W}(\fc^{<j}, \cdot),\; g_U \,\bigr\ran
 the inequality being the assumed violation; hence $h_j \neq H_U$ as polynomials. Two bad events over $\fc_j$:
 \begin{itemize}[itemsep=1pt]
 \item $B_1$: $h_j(\fc_j) = H_U(\fc_j)$ for some $U \in \lst$. For each $U$, two distinct polynomials of degree at most $2$ agree on at most $2$ points, so $\Pr[B_1] \le 2 L_i / |\E|$.
-\item $B_2$: $\lst_{\rad_i}(\orc^{(i)}_{\fc^{\le j}}) \neq \{ U_{\fc_j} : U \in \lst \}$, i.e.\ folding does not map the old list onto the new one. The matrix $\orc^{(i)}_{\fc^{<j}}$ has $2^{\ell_i - j + 1}$ rows, so Lemma~\ref{lem:fold-list} with $\ell = \ell_i - j + 1$ gives $\Pr[B_2] \le 2^{\ell_i - j} \epsilon_i$.
+\item $B_2$: $\lst_{\rad_i}(\orc^{(i)}_{\fc^{\le j}}) \neq \{ U_{\fc_j} : U \in \lst \}$, i.e.\ folding does not map the old list onto the new one. Lemma~\ref{lem:fold-list} applies to all remaining rows as one interleaved word and gives $\Pr[B_2] \le E_i/|\E|$, independently of their number.
 \end{itemize}
 If neither occurs, every $V \in \lst_{\rad_i}(\orc^{(i)}_{\fc^{\le j}})$ is $V = U_{\fc_j}$ for some $U \in \lst$, with $\mle{g_V} = \mle{g_U}(\fc_j, \cdot)$ by Fact~\ref{fact:fold-decode}, so
 \[
@@ -249,7 +274,7 @@ If neither occurs, every $V \in \lst_{\rad_i}(\orc^{(i)}_{\fc^{\le j}})$ is $V =
 \;=\; \sum_{x \in \cube{\nv_i - j}} \mle{W}(\fc^{<j}, \fc_j, x)\, \mle{g_U}(\fc_j, x)
 \;=\; H_U(\fc_j) \;\neq\; h_j(\fc_j) \;=\; \rc{j} ,
 \]
-using $\neg B_1$ for the inequality: every $V$ violates the round-$j$ claim. The total error is $2 L_i/|\E| + 2^{\ell_i - j} \epsilon_i$.
+using $\neg B_1$ for the inequality: every $V$ violates the round-$j$ claim. The combined fold error is $(2 L_i+E_i)/|\E|$.
 
 \medskip\noindent\emph{The level interface.}
 After the last fold challenge of level $i < \nlev - 1$, we know: every codeword within $\rad_i$ of the single row $c := \orc^{(i)}_\fc \in \E^{\dom_i}$ violates the residual claim $(W', c')$. The prover now sends the new oracle $\orc^{(i+1)}$.
@@ -261,12 +286,12 @@ After $z$, two properties must hold: the one above, which does not involve $z$; 
 Assume both properties of the previous step; the prover has since sent its answer $\cood$. The values $\mle{g_U}(z)$ are pairwise distinct across $\lst_{\rad_{i+1}}(\orc^{(i+1)})$, so at most one member $U^\ast$ can satisfy $\mle{g_{U^\ast}}(z) = \cood$: every other member violates the OOD claim $(\eq(z, \cdot),\, \cood)$, whatever $\qset_i$ is. If no such $U^\ast$ exists, we are done. Otherwise write $g^\ast := g_{U^\ast}$, a multilinear on $\cube{\nv_{i+1}}$, and distinguish two cases.
 \begin{itemize}[itemsep=1pt]
 \item \emph{$\Enc_i(g^\ast)$ agrees with $c$ on at least $(1 - \rad_i) \blen_i$ coordinates.} Then the codeword $\Enc_i(g^\ast)$ lies in $\lst_{\rad_i}(c)$, hence violates the residual claim by assumption: $\inner{W'}{g^\ast} \neq c'$, whatever $\qset_i$ is.
-\item \emph{Otherwise.} A uniform column $x \leftarrow \dom_i$ satisfies $\Enc_i(g^\ast)[x] = c[x]$ with probability less than $1 - \rad_i$, so all $\nq_i$ i.i.d.\ queries do so simultaneously with probability less than $(1 - \rad_i)^{\nq_i}$; and any disagreeing query $x_q$ makes $U^\ast$ violate the consistency claim $(W^{(i)}_{x_q},\, c_q)$, since $c_q = c[x_q]$.
+\item \emph{Otherwise.} Because $\Enc_i(g^\ast)$ is outside the threshold-$A_i$ list, it agrees with $c$ on at most $A_i-1$ columns. All $\nq_i$ independent uniform queries land in this agreement set with probability at most $((A_i-1)/\blen_i)^{\nq_i}$; any disagreeing query $x_q$ makes $U^\ast$ violate the consistency claim $(W^{(i)}_{x_q},\, c_q)$, since $c_q = c[x_q]$.
 \end{itemize}
-Except with probability $(1 - \rad_i)^{\nq_i}$, every member of $\lst_{\rad_{i+1}}(\orc^{(i+1)})$ thus violates at least one of the $J_{i+1}$ claims, which is exactly the assumption of the batching step at level $i + 1$.
+Except with probability $((A_i-1)/\blen_i)^{\nq_i}$, every member of $\lst_{\rad_{i+1}}(\orc^{(i+1)})$ thus violates at least one of the $J_{i+1}$ claims, which is exactly the assumption of the batching step at level $i + 1$.
 
 \medskip\noindent\emph{Final level.}
-At level $\nlev - 1$ the fold challenges end as above: every codeword within $\rad_{\nlev-1}$ of $c := \orc^{(\nlev-1)}_\fc$ violates the residual claim. The prover sends $\ffinal$. If $\Enc_{\nlev-1}(\ffinal)$ agrees with $c$ on at least $(1 - \rad_{\nlev-1}) \blen_{\nlev-1}$ coordinates then $\Enc_{\nlev-1}(\ffinal) \in \lst_{\rad_{\nlev-1}}(c)$, so $\ffinal$ violates the residual claim; otherwise, except with probability $(1 - \rad_{\nlev-1})^{\nq_{\nlev-1}}$, some query disagrees and $\ffinal$ violates that consistency claim. Either way it violates one of the $\nq_{\nlev-1}+1$ batched claims, hence the batch itself except with probability $\nq_{\nlev-1}/|\E|$ (Lemma~\ref{lem:sz}), with no union over a list: $\ffinal$ is transmitted, not one of the codewords near an oracle. The $\nv_\nlev$ rounds that follow are a plain sumcheck (Fact~\ref{fact:sumcheck}) on a polynomial that $\mathbf{V}$ holds, so the terminal check against $\mle{\ffinal}$ fails.
+At level $\nlev - 1$ the fold challenges end as above: every codeword within $\rad_{\nlev-1}$ of $c := \orc^{(\nlev-1)}_\fc$ violates the residual claim. The prover sends $\ffinal$. If $\Enc_{\nlev-1}(\ffinal)$ agrees with $c$ on at least $A_{\nlev-1}$ coordinates then $\Enc_{\nlev-1}(\ffinal) \in \lst_{\rad_{\nlev-1}}(c)$, so $\ffinal$ violates the residual claim; otherwise, except with probability $((A_{\nlev-1}-1)/\blen_{\nlev-1})^{\nq_{\nlev-1}}$, some query disagrees and $\ffinal$ violates that consistency claim. Either way it violates one of the $\nq_{\nlev-1}+1$ batched claims, hence the batch itself except with probability $\nq_{\nlev-1}/|\E|$ (Lemma~\ref{lem:sz}), with no union over a list: $\ffinal$ is transmitted, not one of the codewords near an oracle. The $\nv_\nlev$ rounds that follow are a plain sumcheck (Fact~\ref{fact:sumcheck}) on a polynomial that $\mathbf{V}$ holds, so the terminal check against $\mle{\ffinal}$ fails.
 
 \end{proof}
 
@@ -292,11 +317,15 @@ Conclusion: at commitment, both the FFT and the Merkle leaf hashing cost are pro
 We prove Theorem~\ref{thm:johnson-interleaved} in its general form (arbitrary code).
 
 \begin{theorem}[Johnson bound, agreement form]\label{thm:johnson-general}
-Let $\mathcal{C} \subseteq \Sigma^\blen$ be a code, over any alphabet $\Sigma$, in which two distinct codewords agree on at most $\rate \blen$ coordinates, and let $\slack \in (0, 1 - \sqrt{\rate})$. Then every word $\mathbf{c} \in \Sigma^\blen$ has at most $\tfrac{1}{2\slack\sqrt{\rate}}$ codewords agreeing with it on at least $(\sqrt{\rate} + \slack)\, \blen$ coordinates.
+Let $\mathcal{C} \subseteq \Sigma^\blen$ be a code, over any alphabet $\Sigma$, in which two distinct codewords agree on at most $D$ coordinates. For every integer $A$ with $A^2>\blen D$, every word $\mathbf{c} \in \Sigma^\blen$ has at most
+\[
+ \left\lfloor\frac{\blen(A-D)}{A^2-\blen D}\right\rfloor
+\]
+codewords agreeing with it on at least $A$ coordinates.
 \end{theorem}
 
 \begin{proof}
-Let $U_1, \dots, U_L$ be distinct codewords, each agreeing with $\mathbf{c}$ on at least $(\sqrt{\rate}+\slack) \blen$ coordinates. For each $j$, fix a set $\aset_j$ of exactly $a := \lceil (\sqrt{\rate}+\slack) \blen \rceil$ coordinates on which $U_j$ agrees with $\mathbf{c}$, and write $\varphi := a/\blen$, so $\sqrt{\rate} + \slack \le \varphi \le 1$. For a coordinate $i$, let $d_i := |\{ j : i \in \aset_j \}|$; then $\sum_i d_i = L a = L \varphi \blen$.
+Let $U_1, \dots, U_L$ be distinct codewords, each agreeing with $\mathbf{c}$ on at least $A$ coordinates. For each $j$, fix a set $\aset_j$ of exactly $A$ coordinates on which $U_j$ agrees with $\mathbf{c}$, and write $\varphi:=A/\blen$ and $\rate:=D/\blen$. For a coordinate $i$, let $d_i := |\{ j : i \in \aset_j \}|$; then $\sum_i d_i = LA=L\varphi\blen$.
 
 Wherever two codewords both agree with $\mathbf{c}$ they agree with each other, so $|\aset_j \cap \aset_{j'}| \le \rate \blen$ for $j \neq j'$, and counting ordered pairs,
 \[
@@ -308,5 +337,9 @@ L \varphi^2 - \varphi \;\le\; (L-1)\, \rate
 \qquad\Longleftrightarrow\qquad
 L\, (\varphi^2 - \rate) \;\le\; \varphi - \rate .
 \]
-Finally $\varphi^2 - \rate \ge (\sqrt{\rate}+\slack)^2 - \rate = 2\slack\sqrt{\rate} + \slack^2 > 2\slack\sqrt{\rate}$ while $\varphi - \rate \le 1$, so $L \le \tfrac{1}{2\slack\sqrt{\rate}}$.
+Since $A^2>\blen D$, the denominator is positive, and the displayed inequality gives
+\[
+ L\le\frac{\varphi-\rate}{\varphi^2-\rate}=\frac{\blen(A-D)}{A^2-\blen D}.
+\]
+Taking the floor proves the claim.
 \end{proof}

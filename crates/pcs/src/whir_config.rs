@@ -16,9 +16,8 @@
 //!
 //! - batching challenges -> `johnson_algebraic_bits` (one challenge per level,
 //!   powers of it over the level's claim list, as in the doc),
-//! - fold challenge `s_j` -> `2 L/|F| + 2^(l-j) eps`: the MCA part via
-//!   `paper_johnson_log_a` (worst round `j = 1`), the `2 L/|F|` part
-//!   under `johnson_algebraic_bits`,
+//! - fold challenge `s_j` -> `(E + 2 L)/|F|`, checked as one combined bound by
+//!   `capacity_mca_fold_bits`,
 //! - OOD challenge -> `paper_ood_bits`,
 //! - query message -> `(1 - gamma)^t`, plus [`QUERY_GRINDING_BITS`].
 //!
@@ -58,11 +57,6 @@ pub fn validate_log_inv_rate(log_inv_rate: usize) -> Result<(), String> {
 /// level commitment and before its query positions are sampled, so the query
 /// count only needs to close the remaining `SECURITY_BITS - 17` bits.
 pub const QUERY_GRINDING_BITS: usize = 17;
-
-/// Maximum BCHKS25 integer parameter considered by the per-level eta search.
-/// Production configurations hit the proximity-gap boundary far below this;
-/// the generous cap makes the optimizer deterministic even if sizes expand.
-const JOHNSON_ETA_SEARCH_MAX_M: usize = 4096;
 
 pub const INITIAL_FOLDING_FACTOR: usize = 6;
 pub const SUBSEQUENT_FOLDING_FACTOR: usize = 4;
@@ -313,10 +307,9 @@ fn derive_ladder_shape(log_n: usize, initial_k: usize, log_inv_rate: usize) -> R
 //
 // That analysis is always the Johnson radius with explicit slack `eta`
 // (gamma = (1 - sqrt(rho)) - eta) WITH out-of-domain binding (`doc/leanvm/body/b-polynomial-commitment-scheme.tex`,
-// Thm `thm:rbr`). The MCA theorem (`thm:mca-johnson` = BCHKS25 Thm 4.6) gives
-// the proximity-gap exceptional set `a = O_rho(n / eta^5)`, and the eta search
-// keeps `log2(q/a)` above the target on its own rather than grinding the fold
-// challenges for it. Binding to a
+// Thm `thm:rbr`). The capacity MCA theorem (`thm:mca-johnson`) gives the
+// proximity-gap exceptional set `E = O(n / eta^3)`. The parameter search
+// checks the combined fold row `(E + 2L)/|F|` exactly. Binding to a
 // single codeword of the (Johnson-bounded) interleaved list is via
 // `ood_samples` explicit multilinear OOD evaluations, except at L0, where the
 // opening's own post-commit random evaluation claim plays the OOD role (union
@@ -347,6 +340,20 @@ pub struct WhirLevelConfig {
     pub k: usize,
     /// Slack from the Johnson radius: γ = (1 − √ρ) − η.
     pub eta: f64,
+    /// Integer agreement threshold `A = ceil((sqrt(D/n) + eta) n)` used by
+    /// the capacity MCA theorem.
+    pub agreement: usize,
+    /// Interpolation multiplicity in the capacity MCA certificate.
+    pub interpolation_m: usize,
+    /// Jet-degree cutoff in the capacity MCA certificate.
+    pub jet_degree: usize,
+    /// Auxiliary interpolation height in the capacity MCA certificate.
+    pub interpolation_height: usize,
+    /// Exact Johnson list bound used by fold, OOD, and algebraic checks.
+    pub list_bound: usize,
+    /// Whether this is the theorem's closed parameter choice or an explicitly
+    /// checked finite interpolation certificate.
+    pub certificate_variant: JohnsonCertificateVariant,
     /// Number of codeword position queries opened at this level (the FRI
     /// query phase). Bounds the per-query soundness term `(1−γ)^Q`.
     pub queries: usize,
@@ -361,6 +368,16 @@ pub struct WhirLevelConfig {
     pub ood_samples: usize,
     /// Security target this level guarantees, post-grinding.
     pub target_security_bits: usize,
+}
+
+/// Provenance of a capacity MCA interpolation certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JohnsonCertificateVariant {
+    /// The all-characteristic closed parameter choice from `thm:mca-johnson`.
+    Closed,
+    /// A finite parameter choice checked directly from the interpolation
+    /// surplus inequality.
+    Finite,
 }
 
 /// Descriptor for the final-residual block (`yr`) sent in the clear at the
@@ -378,7 +395,7 @@ pub struct FinalBlockConfig {
 ///
 /// **Validation invariants** (checked by [`Self::validate`]):
 /// 1. `initial_k + Σ levels[1..].k + final_block.yr_log_n == log_n`.
-/// 2. Each level's proximity-gap bits reach `target_security_bits`.
+/// 2. Each level's combined fold-challenge bits reach `target_security_bits`.
 /// 3. Each level's query soundness reaches `target_security_bits −
 ///    grinding_bits` (queries cover what grinding doesn't).
 /// 4. `eta` is finite and inside the Johnson range for the level's rate.
@@ -400,8 +417,7 @@ pub struct WhirSecurityConfig {
     /// failure probabilities is bounded by `2^-target_security_bits`.
     pub target_security_bits: usize,
     /// Identifier of the proximity-gap analysis used. Self-documents which
-    /// theorem the per-level parameters were derived from. Example:
-    /// `"ben_sasson_2025_thm_4_6"`.
+    /// theorem the per-level parameters were derived from.
     pub analysis_version: String,
     /// Per-level parameters, in order L0, L1, L2, ....
     pub levels: Vec<WhirLevelConfig>,
@@ -421,73 +437,277 @@ fn reduced_rate(log_inv_rate: usize, log_msg_cols: usize) -> f64 {
     (dimension - 1.0) / ((log_msg_cols + log_inv_rate) as f64).exp2()
 }
 
-/// Proximity-gap exceptional set for the list-decoding (Johnson) regime, per
-/// `doc/leanvm/body/b-polynomial-commitment-scheme.tex` Thm `thm:mca-johnson` = BCHKS25 Theorem 4.6 (list
-/// correlated agreement). For a Reed-Solomon code of (slightly reduced) rate
-/// `ρ`, codeword length `n`, and Johnson slack `η` (proximity radius
-/// `γ = 1 − √ρ − η`), the MCA error is `a/|F|` with
-///
-///   `a = [2(m+½)^5 + 3(m+½)·γ·ρ] / (3·ρ^{3/2}) · n + (m+½)/√ρ`,
-///
-/// where `η = 1 − √ρ − γ` and `m = max(⌈√ρ/η⌉, 3)`. Returns `log₂ a`.
-///
-/// This is the per-fold-step MCA error, stated for a two-row interleaved word
-/// (`C ∈ F^{2×n}`). The ℓ-round lane fold of a `2^ℓ`-interleaved word adds a
-/// row-union factor via the PCS annex, Lemma `lem:fold-list`; see
-/// [`paper_johnson_log_a`].
-fn paper_thm_ca_johnson_log_a(log_inv_rate: usize, eta: f64, log_msg_cols: usize) -> f64 {
+#[derive(Clone, Copy, Debug)]
+struct CapacityMcaCertificate {
+    agreement: usize,
+    interpolation_m: usize,
+    jet_degree: usize,
+    interpolation_height: usize,
+    list_bound: usize,
+    variant: JohnsonCertificateVariant,
+}
+
+fn checked_product(values: &[u128], context: &str) -> Result<u128, String> {
+    values.iter().try_fold(1u128, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or_else(|| format!("{context}: integer overflow"))
+    })
+}
+
+/// Check the finite interpolation surplus certificate behind the capacity MCA
+/// theorem. This is run for both the closed recipe and the finite refinement,
+/// so the hard-coded refinement is never trusted as a constant.
+fn validate_interpolation_support(
+    n: usize,
+    degree: usize,
+    agreement: usize,
+    interpolation_m: usize,
+    jet_degree: usize,
+    height: usize,
+) -> Result<(), String> {
+    if degree == 0 || agreement <= degree || agreement > n || interpolation_m == 0 || jet_degree == 0 {
+        return Err("invalid capacity MCA interpolation parameters".into());
+    }
+
+    let n = n as u128;
+    let degree = degree as u128;
+    let agreement = agreement as u128;
+    let interpolation_m = interpolation_m as u128;
+    let jet_degree = jet_degree as u128;
+    let height = height as u128;
+    let max_jet_degree = checked_product(&[interpolation_m, agreement], "interpolation support")?
+        .checked_sub(1)
+        .ok_or_else(|| "interpolation support: empty numerator".to_string())?
+        / degree;
+    if jet_degree > max_jet_degree {
+        return Err(format!(
+            "capacity MCA jet degree {jet_degree} exceeds interpolation limit {max_jet_degree}"
+        ));
+    }
+
+    let u = jet_degree.min(interpolation_m - 1);
+    let jet_triangle = checked_product(&[jet_degree, jet_degree + 1], "jet triangle")? / 2;
+    let jet_square_sum = checked_product(&[jet_degree, jet_degree + 1, 2 * jet_degree + 1], "jet square sum")? / 6;
+    let u_triangle = checked_product(&[u, u + 1], "equation triangle")? / 2;
+    let u_square_sum = checked_product(&[u, u + 1, 2 * u + 1], "equation square sum")? / 6;
+
+    let variables_slope = checked_product(&[jet_degree + 1, interpolation_m, agreement], "variable slope")?
+        .checked_sub(checked_product(&[degree, jet_triangle], "variable slope")?)
+        .ok_or_else(|| "capacity MCA variable slope is negative".to_string())?;
+    let variables_moment = checked_product(&[interpolation_m, agreement, jet_triangle], "variable moment")?
+        .checked_sub(checked_product(&[degree, jet_square_sum], "variable moment")?)
+        .ok_or_else(|| "capacity MCA variable moment is negative".to_string())?;
+    let equations_slope = checked_product(&[u + 1, interpolation_m], "equation slope")?
+        .checked_sub(u_triangle)
+        .ok_or_else(|| "capacity MCA equation slope is negative".to_string())?;
+    let equations_moment = checked_product(&[interpolation_m, u_triangle], "equation moment")?
+        .checked_sub(u_square_sum)
+        .ok_or_else(|| "capacity MCA equation moment is negative".to_string())?;
+    let slope_rhs = checked_product(&[n, equations_slope], "interpolation slope")?;
+    let surplus_slope = variables_slope
+        .checked_sub(slope_rhs)
+        .filter(|surplus| *surplus > 0)
+        .ok_or_else(|| "capacity MCA interpolation has no positive slope surplus".to_string())?;
+    let moment_rhs = checked_product(&[n, equations_moment], "interpolation moment")?;
+    let required_by_moment = variables_moment.saturating_sub(moment_rhs) / surplus_slope;
+    let required_height = jet_degree.max(required_by_moment);
+    if height < required_height {
+        return Err(format!(
+            "capacity MCA height {height} is below the certified minimum {required_height}"
+        ));
+    }
+    Ok(())
+}
+
+fn johnson_list_bound(n: usize, degree: usize, agreement: usize, jet_degree: usize) -> Result<usize, String> {
+    let n = n as u128;
+    let degree = degree as u128;
+    let agreement = agreement as u128;
+    let denominator = checked_product(&[agreement, agreement], "Johnson list denominator")?
+        .checked_sub(checked_product(&[n, degree], "Johnson list denominator")?)
+        .filter(|denominator| *denominator > 0)
+        .ok_or_else(|| "agreement threshold is not beyond the Johnson radius".to_string())?;
+    let numerator = checked_product(&[n, agreement - degree], "Johnson list numerator")?;
+    let pairwise = numerator / denominator;
+    usize::try_from(pairwise.min(jet_degree as u128)).map_err(|_| "Johnson list bound does not fit usize".into())
+}
+
+fn closed_capacity_certificate(
+    log_inv_rate: usize,
+    log_msg_cols: usize,
+    agreement: usize,
+) -> Result<CapacityMcaCertificate, String> {
     let rho = reduced_rate(log_inv_rate, log_msg_cols);
     let sqrt_rho = rho.sqrt();
-    let gamma = 1.0 - sqrt_rho - eta;
-    // BCHKS25 Thm 4.6: m = ⌈√ρ/(1−√ρ−γ)⌉ = ⌈√ρ/η⌉, floored at 3.
-    let m_param = johnson_m_param(log_inv_rate, log_msg_cols, eta);
-    let half = m_param + 0.5;
-    let half5 = half.powi(5);
-    let numerator = 2.0 * half5 + 3.0 * half * gamma * rho;
-    let denominator = 3.0 * rho.powf(1.5);
-    let n = ((log_msg_cols + log_inv_rate) as f64).exp2();
-    let a = (numerator / denominator) * n + half / sqrt_rho;
-    a.log2()
+    let n = 1usize << (log_msg_cols + log_inv_rate);
+    let degree = (1usize << log_msg_cols) - 1;
+    let mut interpolation_m = ((sqrt_rho / (2.0 * (agreement as f64 / n as f64 - sqrt_rho))).ceil() as usize).max(3);
+    let closed_m_holds = |m: usize| -> Result<bool, String> {
+        let lhs = checked_product(
+            &[4, m as u128, m as u128, agreement as u128, agreement as u128],
+            "closed MCA multiplicity",
+        )?;
+        let twice_m_plus_one = 2 * m as u128 + 1;
+        let rhs = checked_product(
+            &[twice_m_plus_one, twice_m_plus_one, degree as u128, n as u128],
+            "closed MCA multiplicity",
+        )?;
+        Ok(lhs >= rhs)
+    };
+    while interpolation_m > 3 && closed_m_holds(interpolation_m - 1)? {
+        interpolation_m -= 1;
+    }
+    while !closed_m_holds(interpolation_m)? {
+        interpolation_m += 1;
+    }
+
+    let twice_m_plus_one = 2 * interpolation_m as u128 + 1;
+    let jet_rhs = checked_product(
+        &[twice_m_plus_one, twice_m_plus_one, n as u128],
+        "closed MCA jet degree",
+    )?;
+    let mut jet_degree = ((interpolation_m as f64 + 0.5) / sqrt_rho).ceil() as usize - 1;
+    let jet_holds = |b: usize| -> Result<bool, String> {
+        Ok(checked_product(&[4, b as u128, b as u128, degree as u128], "closed MCA jet degree")? < jet_rhs)
+    };
+    while jet_degree > 0 && !jet_holds(jet_degree)? {
+        jet_degree -= 1;
+    }
+    while jet_holds(jet_degree + 1)? {
+        jet_degree += 1;
+    }
+    let height_numerator = jet_rhs;
+    let height_denominator = checked_product(&[12, degree as u128], "closed MCA height")?;
+    let interpolation_height = usize::try_from((height_numerator - 1) / height_denominator)
+        .map_err(|_| "closed MCA height does not fit usize".to_string())?;
+    let list_bound = johnson_list_bound(n, degree, agreement, jet_degree)?;
+    validate_interpolation_support(n, degree, agreement, interpolation_m, jet_degree, interpolation_height)?;
+    Ok(CapacityMcaCertificate {
+        agreement,
+        interpolation_m,
+        jet_degree,
+        interpolation_height,
+        list_bound,
+        variant: JohnsonCertificateVariant::Closed,
+    })
 }
 
-/// Integer parameter `m = max(⌈√ρ/η⌉, 3)` of BCHKS25 Thm 4.6 (list
-/// correlated agreement), represented as `f64` for the bound. Beware: the
-/// plain, non-list Thm 1.5 has the factor-two-smaller `⌈√ρ/(2η)⌉`, and
-/// Flock's Thm 8 quotes Thm 4.6 with that non-list parameter; the list form
-/// costs a factor 2 of slack (see the footnote in the PCS annex
-/// Thm `thm:mca-johnson`).
-fn johnson_m_param(log_inv_rate: usize, log_msg_cols: usize, eta: f64) -> f64 {
-    let sqrt_rho = reduced_rate(log_inv_rate, log_msg_cols).sqrt();
-    ((sqrt_rho / eta).ceil() as usize).max(3) as f64
+/// A finite certificate that reaches the query-only Johnson floor. The
+/// optimizer still derives `A` and validates the certificate algebraically.
+fn finite_capacity_support(n: usize, degree: usize, agreement: usize, queries: usize) -> Option<(usize, usize, usize)> {
+    match (n, degree, agreement, queries) {
+        (131_072, 65_535, 92_682, 222) => Some((24_954, 35_290, 606_738_001)),
+        _ => None,
+    }
 }
 
-/// Johnson-regime proximity-gap `log₂ a` for a level, including the row-union
-/// factor from the PCS annex, Lemma `lem:fold-list` ("Folding preserves lists").
+fn capacity_certificate(
+    log_inv_rate: usize,
+    log_msg_cols: usize,
+    agreement: usize,
+    queries: usize,
+) -> Result<CapacityMcaCertificate, String> {
+    let mut certificate = closed_capacity_certificate(log_inv_rate, log_msg_cols, agreement)?;
+    let n = 1usize << (log_msg_cols + log_inv_rate);
+    let degree = (1usize << log_msg_cols) - 1;
+    if let Some((interpolation_m, jet_degree, interpolation_height)) =
+        finite_capacity_support(n, degree, agreement, queries)
+    {
+        validate_interpolation_support(
+            n,
+            degree,
+            certificate.agreement,
+            interpolation_m,
+            jet_degree,
+            interpolation_height,
+        )?;
+        certificate.interpolation_m = interpolation_m;
+        certificate.jet_degree = jet_degree;
+        certificate.interpolation_height = interpolation_height;
+        certificate.list_bound = johnson_list_bound(n, degree, certificate.agreement, jet_degree)?;
+        certificate.variant = JohnsonCertificateVariant::Finite;
+    }
+    Ok(certificate)
+}
+
+/// Return the exact numerator and denominator of the capacity MCA exceptional
+/// bound
 ///
-/// The base MCA error `ε = a_RLC/|F|` from [`paper_thm_ca_johnson_log_a`] is
-/// stated for a two-row interleaved word (one fold step). Folding a
-/// `2^ℓ`-interleaved word (ℓ = `log_num_interleaved`) over its ℓ lane-fold
-/// rounds pays a row union: `thm:rbr`'s fold row is `2L/|F| + 2^{ℓ-j}·ε` at
-/// round `j`, so the worst round (`j = 1`) pays the factor `2^{ℓ-1}` =
-/// (interleaving factor)/2 (the `2L/|F|` part is checked separately, under
-/// [`johnson_algebraic_bits`]). We bind the per-level grinding to that worst
-/// round, returning `log₂(2^{ℓ-1}·a_RLC) = log₂ a_RLC + (ℓ-1)`.
-///
-/// `ℓ ≤ 1` (`L ≤ 2`) means no row union; the `(ℓ-1)` penalty clamps to 0.
-fn paper_johnson_log_a(log_inv_rate: usize, eta: f64, log_msg_cols: usize, log_num_interleaved: usize) -> f64 {
-    let base = paper_thm_ca_johnson_log_a(log_inv_rate, eta, log_msg_cols);
-    // Row-union factor 2^{ℓ-1} (worst round i=1 of the ℓ-round lane fold),
-    // ℓ = log_num_interleaved. In bits: (ℓ-1), clamped ≥ 0.
-    let row_union_penalty = (log_num_interleaved as f64 - 1.0).max(0.0);
-    base + row_union_penalty
+/// `E = (2B-1)H + (n-D)/(A-D) (B + H Psi) + (n-D-1)B`.
+fn capacity_mca_exceptional_fraction(level: &WhirLevelConfig) -> Result<(u128, u128), String> {
+    let n = (1usize << (level.log_msg_cols + level.log_inv_rate)) as u128;
+    let degree = ((1usize << level.log_msg_cols) - 1) as u128;
+    let agreement = level.agreement as u128;
+    let jet_degree = level.jet_degree as u128;
+    let height = level.interpolation_height as u128;
+    let denominator = agreement
+        .checked_sub(degree)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "capacity MCA agreement must exceed the degree".to_string())?;
+    let psi = 1u128
+        .checked_add(checked_product(
+            &[2 * degree - 1, 2 * jet_degree - 1],
+            "capacity MCA Psi",
+        )?)
+        .and_then(|value| value.checked_add(2 * jet_degree.saturating_sub(2 * degree + 1)))
+        .ok_or_else(|| "capacity MCA Psi: integer overflow".to_string())?;
+    let integral = checked_product(&[2 * jet_degree - 1, height], "capacity MCA integral term")?
+        .checked_add(checked_product(
+            &[n - degree - 1, jet_degree],
+            "capacity MCA integral term",
+        )?)
+        .ok_or_else(|| "capacity MCA integral term: integer overflow".to_string())?;
+    let fractional = checked_product(
+        &[
+            n - degree,
+            jet_degree
+                .checked_add(checked_product(&[height, psi], "capacity MCA fractional term")?)
+                .ok_or_else(|| "capacity MCA fractional term: integer overflow".to_string())?,
+        ],
+        "capacity MCA fractional term",
+    )?;
+    let numerator = checked_product(&[integral, denominator], "capacity MCA exceptional numerator")?
+        .checked_add(fractional)
+        .ok_or_else(|| "capacity MCA exceptional numerator: integer overflow".to_string())?;
+    Ok((numerator, denominator))
 }
 
-/// Per-query log₂(1/(1−γ)) under the Johnson regime: each query closes
-/// `log_2(1/(1-γ))` bits of soundness against a γ-far adversary.
-fn paper_per_query_bits(log_inv_rate: usize, log_msg_cols: usize, eta: f64) -> f64 {
-    let rho = reduced_rate(log_inv_rate, log_msg_cols);
-    let gamma = 1.0 - rho.sqrt() - eta;
-    (1.0 / (1.0 - gamma)).log2()
+fn soundness_budget(target_bits: usize) -> Result<u128, String> {
+    let exponent = (ANALYSIS_LOG_Q as usize)
+        .checked_sub(target_bits)
+        .ok_or_else(|| format!("target {target_bits} exceeds the analysis field size"))?;
+    1u128
+        .checked_shl(exponent as u32)
+        .ok_or_else(|| format!("target {target_bits} is too small for an exact u128 soundness budget"))
+}
+
+fn capacity_mca_fold_within_target(level: &WhirLevelConfig, target_bits: usize) -> Result<bool, String> {
+    let (exceptional_numerator, denominator) = capacity_mca_exceptional_fraction(level)?;
+    let list_numerator = checked_product(&[2, level.list_bound as u128, denominator], "capacity MCA list term")?;
+    let fold_numerator = exceptional_numerator
+        .checked_add(list_numerator)
+        .ok_or_else(|| "capacity MCA fold numerator: integer overflow".to_string())?;
+    let target_numerator = checked_product(&[soundness_budget(target_bits)?, denominator], "capacity MCA target")?;
+    Ok(fold_numerator <= target_numerator)
+}
+
+fn capacity_mca_fold_bits(level: &WhirLevelConfig) -> Result<f64, String> {
+    let (exceptional_numerator, denominator) = capacity_mca_exceptional_fraction(level)?;
+    let fold_numerator = exceptional_numerator
+        .checked_add(checked_product(
+            &[2, level.list_bound as u128, denominator],
+            "capacity MCA list term",
+        )?)
+        .ok_or_else(|| "capacity MCA fold numerator: integer overflow".to_string())?;
+    Ok(ANALYSIS_LOG_Q - (fold_numerator as f64).log2() + (denominator as f64).log2())
+}
+
+/// Exact-threshold query soundness in bits. Outside the threshold-A list, a
+/// word agrees with every codeword on at most `A - 1` positions.
+fn paper_query_bits(level: &WhirLevelConfig) -> f64 {
+    let n = (1usize << (level.log_msg_cols + level.log_inv_rate)) as f64;
+    level.queries as f64 * (n / (level.agreement - 1) as f64).log2()
 }
 
 /// Unique-decoding-regime per-query soundness at `γ = δ/2` (`δ = 1 − ρ`).
@@ -500,8 +720,8 @@ fn udr_per_query_bits_asymptotic(log_inv_rate: usize) -> f64 {
     (1.0 / (1.0 - gamma)).log2()
 }
 
-/// Johnson-bound list size of the *interleaved* RS code at radius
-/// `θ = 1 − √ρ − η`, in log₂. Independent of the interleaving factor.
+/// Johnson-bound list size of the interleaved RS code, in log2. The exact
+/// integer bound is stored in each level certificate.
 ///
 /// Interleaving preserves relative distance (`V^{⊙m}` has the base code's
 /// distance `δ = 1 − ρ`) and only enlarges the alphabet (to `q^m`). The
@@ -519,12 +739,8 @@ fn udr_per_query_bits_asymptotic(log_inv_rate: usize) -> f64 {
 /// `θ = 1 − √ρ − η`, strictly below the Johnson radius by slack `η > 0`, so
 /// that regime never applies and the plain Johnson bound is both correct and
 /// far tighter (it dominates GGR throughout the regime RS can reach).
-fn johnson_interleaved_list_log2(log_inv_rate: usize, log_msg_cols: usize, eta: f64) -> f64 {
-    debug_assert!(eta > 0.0, "η must be > 0 to stay strictly below the Johnson radius");
-    let rho = reduced_rate(log_inv_rate, log_msg_cols);
-    let sqrt_rho = rho.sqrt();
-    let l_base = 1.0 / (2.0 * eta * sqrt_rho);
-    l_base.log2()
+fn johnson_interleaved_list_log2(list_bound: usize) -> f64 {
+    (list_bound as f64).log2()
 }
 
 /// Worst algebraic verifier-challenge transition in the production opening:
@@ -546,14 +762,8 @@ fn johnson_interleaved_list_log2(log_inv_rate: usize, log_msg_cols: usize, eta: 
 ///   query count, so 0 is passed; that pool is a few hundred claims, orders below
 ///   the ring-switch degree the `max` takes anyway; and
 /// - 2 for quadratic sumcheck.
-fn johnson_algebraic_bits_for(
-    log_inv_rate: usize,
-    log_msg_cols: usize,
-    eta: f64,
-    prev_queries: usize,
-    ood_samples: usize,
-) -> f64 {
-    let log2_l = johnson_interleaved_list_log2(log_inv_rate, log_msg_cols, eta);
+fn johnson_algebraic_bits_for(list_bound: usize, prev_queries: usize, ood_samples: usize) -> f64 {
+    let log2_l = johnson_interleaved_list_log2(list_bound);
     let degree = crate::ring_switch::RING_SWITCH_SOUNDNESS_DEGREE
         .max(prev_queries + ood_samples)
         .max(2);
@@ -562,12 +772,20 @@ fn johnson_algebraic_bits_for(
 
 /// `prev_queries` is `levels[i-1].queries`, and 0 for `i = 0`.
 fn johnson_algebraic_bits(level: &WhirLevelConfig, prev_queries: usize) -> f64 {
-    johnson_algebraic_bits_for(
-        level.log_inv_rate,
-        level.log_msg_cols,
-        level.eta,
-        prev_queries,
-        level.ood_samples,
+    johnson_algebraic_bits_for(level.list_bound, prev_queries, level.ood_samples)
+}
+
+fn johnson_algebraic_within_target(
+    level: &WhirLevelConfig,
+    prev_queries: usize,
+    target_bits: usize,
+) -> Result<bool, String> {
+    let degree = crate::ring_switch::RING_SWITCH_SOUNDNESS_DEGREE
+        .max(prev_queries + level.ood_samples)
+        .max(2);
+    Ok(
+        checked_product(&[degree as u128, level.list_bound as u128], "algebraic soundness")?
+            <= soundness_budget(target_bits)?,
     )
 }
 
@@ -583,52 +801,69 @@ fn prev_queries_at(levels: &[WhirLevelConfig], i: usize) -> usize {
 ///   `thm:rbr`'s OOD row `binom(L,2)·μ/|F|`, generalized to `s` samples: the
 ///   bad event is two distinct list elements agreeing on all `s` random
 ///   points of `F^μ` (Schwartz-Zippel, total degree ≤ μ), union over pairs:
-///   `bits = s·(192 − log₂ μ) − (2·log₂ L_int − 1)`.
+///   `bits = s·(192 − log₂ μ) − log₂ binom(L_int, 2)`.
 /// - `ood_samples = 0` (L0): the protocol takes no OOD sample at commitment,
 ///   so the PCS itself is only list binding (the PCS annex, opening paragraph). What this
 ///   term materializes is the OUTER protocol's binding: the opening's own
 ///   evaluation claim sits at a post-commit random point, so at most one
 ///   list member matches it except with `L·μ/|F|` (union over the list, not
 ///   pairs): `bits = 192 − log₂ L_int − log₂ μ`.
-fn paper_ood_bits(log_inv_rate: usize, log_msg_cols: usize, eta: f64, mu_vars: usize, ood_samples: usize) -> f64 {
-    let log2_l = johnson_interleaved_list_log2(log_inv_rate, log_msg_cols, eta);
+fn paper_ood_bits(list_bound: usize, mu_vars: usize, ood_samples: usize) -> f64 {
+    let log2_l = johnson_interleaved_list_log2(list_bound);
     let log2_mu = (mu_vars as f64).log2();
     if ood_samples == 0 {
         ANALYSIS_LOG_Q - log2_l - log2_mu
     } else {
-        ood_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (2.0 * log2_l - 1.0)
+        let pairs = list_bound.saturating_mul(list_bound.saturating_sub(1)) / 2;
+        ood_samples as f64 * (ANALYSIS_LOG_Q - log2_mu) - (pairs as f64).log2()
     }
 }
 
-/// Result of the WHIR-style per-level Johnson-slack search. The search
-/// minimizes queries; ties keep the smallest theorem parameter `m`, which has
-/// the largest eta and therefore the smallest list bound.
+fn ood_within_target(level: &WhirLevelConfig, target_bits: usize) -> Result<bool, String> {
+    let mu = (level.log_msg_cols + level.log_num_interleaved) as u128;
+    let list = level.list_bound as u128;
+    let numerator = if level.ood_samples == 0 {
+        checked_product(&[list, mu], "OOD soundness")?
+    } else {
+        // One sample suffices throughout the supported parameter window. This
+        // one-sample check is conservative for any larger declared count.
+        checked_product(&[list, list.saturating_sub(1), mu], "OOD soundness")? / 2
+    };
+    Ok(numerator <= soundness_budget(target_bits)?)
+}
+
+/// Result of the WHIR-style per-level Johnson-slack search.
 struct OptimizedJohnsonLevel {
     eta: f64,
     queries: usize,
     ood_samples: usize,
+    certificate: CapacityMcaCertificate,
 }
 
-/// Eta at the lower boundary for a fixed BCHKS25 theorem parameter
-/// `m = ceil(sqrt(rho) / eta)`. Moving eta lower would increase `m` and worsen
-/// the proximity-gap bound; this boundary maximizes query soundness for the
-/// given `m`. Step upward by an ulp if floating-point division lands just
-/// below the intended ceil boundary.
-fn johnson_eta_for_m(log_inv_rate: usize, log_msg_cols: usize, m: usize) -> f64 {
-    debug_assert!(m >= 3);
-    let sqrt_rho = reduced_rate(log_inv_rate, log_msg_cols).sqrt();
-    let mut eta = sqrt_rho / m as f64;
-    while johnson_m_param(log_inv_rate, log_msg_cols, eta) > m as f64 {
-        eta = f64::from_bits(eta.to_bits() + 1);
+/// Largest integer `a` such that `(a/n)^queries <= 2^-query_bits`, plus one.
+/// A word outside the threshold-A list has at most `A - 1 = a` agreements, so
+/// this computes the query row without floating-point acceptance decisions.
+fn exact_query_agreement(n: usize, queries: usize, query_bits: usize) -> Result<usize, String> {
+    let exponent = u32::try_from(queries).map_err(|_| "query count does not fit u32".to_string())?;
+    let rhs = num_bigint::BigUint::from(n).pow(exponent);
+    let mut safe = 0usize;
+    let mut unsafe_bound = n;
+    while safe + 1 < unsafe_bound {
+        let candidate = safe + (unsafe_bound - safe) / 2;
+        let lhs = num_bigint::BigUint::from(candidate).pow(exponent) << query_bits;
+        if lhs <= rhs {
+            safe = candidate;
+        } else {
+            unsafe_bound = candidate;
+        }
     }
-    debug_assert_eq!(johnson_m_param(log_inv_rate, log_msg_cols, eta), m as f64);
-    eta
+    safe.checked_add(1)
+        .ok_or_else(|| "query agreement threshold overflow".into())
 }
 
-/// Choose eta independently for one recursive level, following leanVM's
-/// discrete `m` search but using this implementation's exact reduced rate and
-/// corrected BCHKS25 parameter. Candidates must satisfy every non-grindable
-/// 128-bit term and the proximity-gap target without fold grinding.
+/// Choose eta independently for one recursive level. Integer query counts are
+/// searched from the query-only Johnson floor, and every soundness decision is
+/// checked with exact integer arithmetic.
 fn optimize_johnson_level(
     level: usize,
     log_inv_rate: usize,
@@ -638,90 +873,71 @@ fn optimize_johnson_level(
     query_grinding_bits: usize,
     prev_queries: usize,
 ) -> Result<OptimizedJohnsonLevel, String> {
-    let target = target_bits as f64;
-    let query_target = target_bits.saturating_sub(query_grinding_bits).max(1) as f64;
-    let mu = log_msg_cols + log_num_interleaved;
+    let query_target = target_bits.saturating_sub(query_grinding_bits).max(1);
     let block_len = 1usize << (log_msg_cols + log_inv_rate);
-    let mut best: Option<OptimizedJohnsonLevel> = None;
+    let sqrt_rho = reduced_rate(log_inv_rate, log_msg_cols).sqrt();
+    let query_floor = (query_target as f64 / -sqrt_rho.log2()).ceil() as usize;
 
-    for m in 3..=JOHNSON_ETA_SEARCH_MAX_M {
-        let eta = johnson_eta_for_m(log_inv_rate, log_msg_cols, m);
-        let max_eta = 1.0 - reduced_rate(log_inv_rate, log_msg_cols).sqrt();
-        if eta >= max_eta {
+    for queries in query_floor.saturating_sub(2).max(1)..=block_len {
+        let agreement = exact_query_agreement(block_len, queries, query_target)?;
+        let eta = agreement as f64 / block_len as f64 - sqrt_rho;
+        if !eta.is_finite() || eta <= 0.0 || eta >= 1.0 - sqrt_rho {
             continue;
         }
-
-        let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(log_inv_rate, eta, log_msg_cols, log_num_interleaved);
-        // At the theorem-parameter boundaries a grows monotonically with m;
-        // no later candidate can recover once the proximity-gap target fails.
-        if eps_pg + 1e-12 < target {
-            break;
-        }
-
-        let per_q = paper_per_query_bits(log_inv_rate, log_msg_cols, eta);
-        if !per_q.is_finite() || per_q <= 0.0 {
-            continue;
-        }
-        let queries = (query_target / per_q).ceil() as usize;
-        if queries > block_len {
-            continue;
-        }
-
-        let ood_samples = if level == 0 {
-            0
-        } else {
-            match (1..=8usize).find(|&s| paper_ood_bits(log_inv_rate, log_msg_cols, eta, mu, s) + 1e-12 >= target) {
-                Some(samples) => samples,
-                None => continue,
-            }
+        let certificate = match capacity_certificate(log_inv_rate, log_msg_cols, agreement, queries) {
+            Ok(certificate) => certificate,
+            Err(_) => continue,
         };
-        let eps_ood = paper_ood_bits(log_inv_rate, log_msg_cols, eta, mu, ood_samples);
-        if eps_ood + 1e-12 < target
-            || johnson_algebraic_bits_for(log_inv_rate, log_msg_cols, eta, prev_queries, ood_samples) + 1e-12 < target
+        let ood_samples = usize::from(level > 0);
+        let candidate_level = WhirLevelConfig {
+            log_inv_rate,
+            log_msg_cols,
+            log_num_interleaved,
+            k: log_num_interleaved,
+            eta,
+            agreement: certificate.agreement,
+            interpolation_m: certificate.interpolation_m,
+            jet_degree: certificate.jet_degree,
+            interpolation_height: certificate.interpolation_height,
+            list_bound: certificate.list_bound,
+            certificate_variant: certificate.variant,
+            queries,
+            grinding_bits: query_grinding_bits,
+            ood_samples,
+            target_security_bits: target_bits,
+        };
+        if !capacity_mca_fold_within_target(&candidate_level, target_bits)?
+            || !ood_within_target(&candidate_level, target_bits)?
+            || !johnson_algebraic_within_target(&candidate_level, prev_queries, target_bits)?
         {
             continue;
         }
-
-        let candidate = OptimizedJohnsonLevel {
+        return Ok(OptimizedJohnsonLevel {
             eta,
             queries,
             ood_samples,
-        };
-        if best.as_ref().is_none_or(|current| candidate.queries < current.queries) {
-            best = Some(candidate);
-        }
+            certificate,
+        });
     }
 
-    best.ok_or_else(|| {
-        format!(
-            "L{level}: no eta candidate satisfies {target_bits}-bit Johnson/OOD soundness at rate 1/2^{log_inv_rate}"
-        )
-    })
+    Err(format!(
+        "L{level}: no capacity MCA candidate satisfies {target_bits}-bit Johnson/OOD soundness at rate 1/2^{log_inv_rate}"
+    ))
 }
 
 impl WhirLevelConfig {
-    /// Proximity-gap and per-query soundness bits this level delivers:
-    ///   eps_pg_bits    = log₂(q/a) under the Johnson threshold-a formula
-    ///   eps_query_bits = Q · log₂(1/(1−γ))
+    /// Combined fold-challenge and per-query soundness bits this level delivers.
     fn paper_predicted_bits(&self) -> (f64, f64) {
-        // Fold row of `thm:rbr`, MCA part: the ℓ-round fold of a
-        // 2^ℓ-interleaved word (ℓ = log_num_interleaved) pays a row-union
-        // factor 2^{ℓ-j} at round j (`lem:fold-list`); the worst round (j=1)
-        // gives 2^{ℓ-1}, on top of the base Thm 4.6 MCA error.
-        let log_a = paper_johnson_log_a(self.log_inv_rate, self.eta, self.log_msg_cols, self.log_num_interleaved);
-        let eps_pg = ANALYSIS_LOG_Q - log_a;
-        // Per-query soundness WITHOUT a list union bound: the OOD binding (see
-        // `paper_ood_bits`) pins the prover to a single codeword of the
-        // interleaved list before queries are drawn.
-        let per_q = paper_per_query_bits(self.log_inv_rate, self.log_msg_cols, self.eta);
-        let eps_query = self.queries as f64 * per_q;
-        (eps_pg, eps_query)
+        (
+            capacity_mca_fold_bits(self).expect("validated capacity MCA certificate"),
+            paper_query_bits(self),
+        )
     }
 
     /// OOD binding bits this level delivers. See `paper_ood_bits`.
     fn paper_predicted_ood_bits(&self) -> f64 {
         let mu = self.log_msg_cols + self.log_num_interleaved;
-        paper_ood_bits(self.log_inv_rate, self.log_msg_cols, self.eta, mu, self.ood_samples)
+        paper_ood_bits(self.list_bound, mu, self.ood_samples)
     }
 }
 
@@ -808,12 +1024,48 @@ impl WhirSecurityConfig {
                 }
             }
 
-            // eta within the Johnson range for this level's (reduced) rate.
-            let max_eta = 1.0 - reduced_rate(lv.log_inv_rate, lv.log_msg_cols).sqrt();
-            if !lv.eta.is_finite() || lv.eta <= 0.0 || lv.eta >= max_eta {
+            if lv.queries == 0 {
+                return Err(format!("L{i}: query count must be positive"));
+            }
+            let block_len = 1usize << (lv.log_msg_cols + lv.log_inv_rate);
+            let query_target = lv.target_security_bits.saturating_sub(lv.grinding_bits).max(1);
+            let expected_agreement = exact_query_agreement(block_len, lv.queries, query_target)?;
+            if lv.agreement != expected_agreement {
                 return Err(format!(
-                    "L{i}: Johnson eta must be finite and in (0, {max_eta}), got {}",
+                    "L{i}: agreement threshold {} is not the exact query threshold {expected_agreement}",
+                    lv.agreement
+                ));
+            }
+
+            // Eta is retained as a readable distance from Johnson, while the
+            // security checks use the exact integer threshold above.
+            let sqrt_rho = reduced_rate(lv.log_inv_rate, lv.log_msg_cols).sqrt();
+            let expected_eta = lv.agreement as f64 / block_len as f64 - sqrt_rho;
+            let max_eta = 1.0 - sqrt_rho;
+            if !lv.eta.is_finite() || lv.eta <= 0.0 || lv.eta >= max_eta || lv.eta.to_bits() != expected_eta.to_bits() {
+                return Err(format!(
+                    "L{i}: Johnson eta must equal A/n - sqrt(D/n) in (0, {max_eta}), got {}",
                     lv.eta
+                ));
+            }
+
+            let expected_certificate =
+                capacity_certificate(lv.log_inv_rate, lv.log_msg_cols, lv.agreement, lv.queries)?;
+            if (
+                lv.interpolation_m,
+                lv.jet_degree,
+                lv.interpolation_height,
+                lv.list_bound,
+                lv.certificate_variant,
+            ) != (
+                expected_certificate.interpolation_m,
+                expected_certificate.jet_degree,
+                expected_certificate.interpolation_height,
+                expected_certificate.list_bound,
+                expected_certificate.variant,
+            ) {
+                return Err(format!(
+                    "L{i}: capacity MCA certificate does not match its exact derived parameters"
                 ));
             }
 
@@ -833,36 +1085,25 @@ impl WhirSecurityConfig {
                 ));
             }
 
-            // OOD binding clears the target.
+            // OOD binding clears the target under an exact integer check.
             let ood_pred = lv.paper_predicted_ood_bits();
-            if ood_pred + 1e-12 < lv.target_security_bits as f64 {
+            if !ood_within_target(lv, lv.target_security_bits)? {
                 return Err(format!(
                     "L{i}: OOD binding ({ood_pred:.2} bits) < target ({})",
                     lv.target_security_bits
                 ));
             }
 
-            let (pg_pred, q_pred) = lv.paper_predicted_bits();
+            let (fold_pred, q_pred) = lv.paper_predicted_bits();
 
-            // Security: queries cover the gap left by grinding.
-            if lv.target_security_bits > lv.grinding_bits
-                && q_pred + 1e-12 < (lv.target_security_bits - lv.grinding_bits) as f64
-            {
-                return Err(format!(
-                    "L{i}: query soundness ({q_pred:.2} bits) < target ({}) - grinding ({}) = {}",
-                    lv.target_security_bits,
-                    lv.grinding_bits,
-                    lv.target_security_bits - lv.grinding_bits
-                ));
-            }
+            // `expected_agreement` was obtained by an exact BigUint comparison,
+            // so the query row clears its target without accepting on `q_pred`.
+            debug_assert!(q_pred + 1e-10 >= query_target as f64);
 
-            // Per-application proximity gap + fold-challenge grinding must
-            // reach target. (The pg bad event lives on the fold challenges,
-            // so only the fold grind (done before each fold challenge)
-            // boosts it; the query-phase grind does not.)
-            if pg_pred + 1e-12 < lv.target_security_bits as f64 {
+            // The fold row is one combined `(E + 2 Lambda)/q` check.
+            if !capacity_mca_fold_within_target(lv, lv.target_security_bits)? {
                 return Err(format!(
-                    "L{i}: proximity-gap soundness ({pg_pred:.2} bits) < target ({})",
+                    "L{i}: fold-challenge soundness ({fold_pred:.2} bits) < target ({})",
                     lv.target_security_bits
                 ));
             }
@@ -871,7 +1112,7 @@ impl WhirSecurityConfig {
             // composed ring-switch batching map) is not grindable and must
             // clear the target.
             let algebraic = johnson_algebraic_bits(lv, prev_queries_at(&self.levels, i));
-            if algebraic + 1e-12 < lv.target_security_bits as f64 {
+            if !johnson_algebraic_within_target(lv, prev_queries_at(&self.levels, i), lv.target_security_bits)? {
                 return Err(format!(
                     "L{i}: list-unioned algebraic soundness ({algebraic:.2} bits) < target ({})",
                     lv.target_security_bits
@@ -906,8 +1147,8 @@ impl WhirSecurityConfig {
     /// Derive the production security config at witness size `m` for an
     /// explicit L0 rate `2^-log_inv_rate`: Johnson list decoding with OOD
     /// binding and [`SECURITY_BITS`] bits per round under **round-by-round
-    /// soundness**, i.e. every verifier-challenge error term (pg + fold
-    /// grinding, query + query grinding, OOD, and algebraic checks) clears the
+    /// soundness**, i.e. every verifier-challenge error term (fold, query plus
+    /// query grinding, OOD, and algebraic checks) clears the
     /// target individually.
     pub fn derive_config_with_log_inv_rate(m: usize, log_inv_rate: usize) -> Result<Self, String> {
         validate_log_inv_rate(log_inv_rate)?;
@@ -924,7 +1165,7 @@ impl WhirSecurityConfig {
         let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate)?;
         let n_levels = shape.log_inv_rates.len();
 
-        // Round-by-round target: every verifier-challenge error term (pg,
+        // Round-by-round target: every verifier-challenge error term (fold,
         // query, OOD, and algebraic checks) must individually clear
         // `target_bits`. We do not add a whole-transcript union-bound margin:
         // this configuration targets 128-bit RBR soundness, as required by the
@@ -944,6 +1185,12 @@ impl WhirSecurityConfig {
                 log_num_interleaved: ilv,
                 k: shape.k_levels[i],
                 eta: optimized.eta,
+                agreement: optimized.certificate.agreement,
+                interpolation_m: optimized.certificate.interpolation_m,
+                jet_degree: optimized.certificate.jet_degree,
+                interpolation_height: optimized.certificate.interpolation_height,
+                list_bound: optimized.certificate.list_bound,
+                certificate_variant: optimized.certificate.variant,
                 queries: optimized.queries,
                 grinding_bits: query_grind,
                 ood_samples: optimized.ood_samples,
@@ -951,7 +1198,7 @@ impl WhirSecurityConfig {
             });
         }
 
-        let analysis_version = "bchks25_thm_4_6_exact_reduced_rate_row_union_optimized_eta";
+        let analysis_version = "rs_capacity_mca_exact_threshold_width_free_rbr";
         let cfg = Self {
             m,
             log_n,
@@ -988,35 +1235,127 @@ mod tests {
     use primitives::pretty_integer;
 
     #[test]
-    fn johnson_bound_uses_theorem_parameter_and_reduced_rate() {
-        // BCHKS25 Thm 4.6 (list correlated agreement) uses
-        // m = ceil(sqrt(rho) / eta). The factor-two-smaller ceil(sqrt(rho) / (2 eta))
-        // belongs to the plain, non-list Thm 1.5; Flock's Thm 8 quotes Thm 4.6
-        // with that non-list parameter, which would overstate eps_pg by ~5 bits.
-        assert_eq!(johnson_m_param(1, 16, 0.02), 36.0);
-
+    fn johnson_bound_uses_exact_threshold_and_reduced_rate() {
         // A message of dimension 16 has maximum degree 15, so the theorem's
         // reduced rate at block length 512 is 15/512, not the nominal 1/32.
         assert_eq!(reduced_rate(5, 4), 15.0 / 512.0);
+
+        // At exact dyadic query boundaries the largest safe outside-list
+        // agreement is retained, rather than lost to floating-point ceil.
+        assert_eq!(exact_query_agreement(131_072, 111, 111).unwrap(), 65_537);
+        assert_eq!(exact_query_agreement(524_288, 37, 111).unwrap(), 65_537);
+
+        let closed = capacity_certificate(2, 15, 65_537, 111).unwrap();
+        assert_eq!(closed.variant, JohnsonCertificateVariant::Closed);
+        assert_eq!(
+            (closed.interpolation_m, closed.jet_degree, closed.interpolation_height),
+            (16_384, 32_769, 357_946_710)
+        );
+
+        let finite = capacity_certificate(1, 16, 92_682, 222).unwrap();
+        assert_eq!(finite.variant, JohnsonCertificateVariant::Finite);
+        assert_eq!(
+            (
+                finite.interpolation_m,
+                finite.jet_degree,
+                finite.interpolation_height,
+                finite.list_bound
+            ),
+            (24_954, 35_290, 606_738_001, 23_784)
+        );
     }
 
     #[test]
     fn production_profile_is_128_bit_johnson_with_query_grinding() {
-        let mut min_pg_bits = f64::INFINITY;
+        let expected = [
+            [
+                "222,55",
+                "222,56,30",
+                "222,56,31",
+                "222,56,32",
+                "222,56,32",
+                "222,56,32,22",
+                "222,56,32,22",
+                "222,56,32,22",
+                "223,56,32,23",
+                "223,56,32,23,17",
+                "223,56,32,23,17",
+                "223,56,32,23,17",
+                "223,56,32,23,18",
+                "223,56,32,23,18,14",
+            ],
+            [
+                "111,44",
+                "111,45,27",
+                "111,45,28",
+                "111,45,28",
+                "111,45,28",
+                "111,45,28,20",
+                "111,45,28,20",
+                "112,45,28,21",
+                "112,45,28,21",
+                "112,45,28,21,16",
+                "112,45,28,21,16",
+                "112,45,28,21,16",
+                "112,45,28,21,16",
+                "112,45,28,21,16,13",
+            ],
+            [
+                "74,37",
+                "74,37,24",
+                "74,37,25",
+                "74,37,25",
+                "74,37,25",
+                "74,37,25,18",
+                "75,37,25,19",
+                "75,37,25,19",
+                "75,37,25,19",
+                "75,38,25,19,15",
+                "75,38,25,19,15",
+                "75,38,25,19,15",
+                "75,38,25,19,15",
+                "75,38,25,19,15,13",
+            ],
+            [
+                "56,32",
+                "56,32,22",
+                "56,32,22",
+                "56,32,22",
+                "56,32,23",
+                "56,32,23,17",
+                "56,32,23,17",
+                "56,32,23,17",
+                "56,32,23,18",
+                "56,32,23,18,14",
+                "56,32,23,18,14",
+                "56,32,23,18,14",
+                "56,32,23,18,14",
+                "56,32,23,18,14,12",
+            ],
+        ];
+        let mut min_fold_bits = f64::INFINITY;
         for log_inv_rate in MIN_LOG_INV_RATE..=MAX_LOG_INV_RATE {
-            for m in 22 + crate::LOG_PACKING..=28 + crate::LOG_PACKING {
-                let cfg = WhirSecurityConfig::derive_config_with_log_inv_rate(m, log_inv_rate).unwrap();
+            for log_n in 15..=28 {
+                let cfg = WhirSecurityConfig::derive_config_with_log_inv_rate(log_n + crate::LOG_PACKING, log_inv_rate)
+                    .unwrap();
                 assert_eq!(cfg.target_security_bits, 128);
                 assert_eq!(cfg.levels[0].log_inv_rate, log_inv_rate);
                 assert_eq!(cfg.levels[0].ood_samples, 0);
+                let queries = cfg
+                    .levels
+                    .iter()
+                    .map(|level| level.queries.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                assert_eq!(queries, expected[log_inv_rate - 1][log_n - 15]);
                 for (i, level) in cfg.levels.iter().enumerate() {
-                    let (pg_bits, query_bits) = level.paper_predicted_bits();
+                    let (fold_bits, query_bits) = level.paper_predicted_bits();
                     let ood_bits = level.paper_predicted_ood_bits();
                     let algebraic_bits = johnson_algebraic_bits(level, prev_queries_at(&cfg.levels, i));
-                    min_pg_bits = min_pg_bits.min(pg_bits);
+                    min_fold_bits = min_fold_bits.min(fold_bits);
                     assert_eq!(level.grinding_bits, QUERY_GRINDING_BITS);
-                    assert!(query_bits + level.grinding_bits as f64 >= 128.0);
-                    assert!(pg_bits >= 128.0);
+                    assert!(query_bits + level.grinding_bits as f64 + 1e-10 >= 128.0);
+                    assert!(fold_bits >= 128.0);
                     assert!(ood_bits >= 128.0);
                     assert!(algebraic_bits >= 128.0);
                     if i > 0 {
@@ -1026,8 +1365,8 @@ mod tests {
             }
         }
         assert!(
-            (128.0..129.0).contains(&min_pg_bits),
-            "eta search should use, but not exceed, the one-bit PG margin: {min_pg_bits}"
+            (128.0..129.0).contains(&min_fold_bits),
+            "query optimization should use the first bit of fold margin: {min_fold_bits}"
         );
     }
 
@@ -1055,11 +1394,15 @@ mod tests {
         for (level, params) in cfg.levels.iter().enumerate() {
             let eta = params.eta;
             println!(
-                "L{}: rate=1/{}, queries={}, eta={eta:.12e}, m={}",
+                "L{}: rate=1/{}, queries={}, eta={eta:.12e}, A={}, m={}, B={}, H={}, list={}",
                 pretty_integer(level),
                 pretty_integer(1usize << params.log_inv_rate),
                 pretty_integer(params.queries),
-                pretty_integer(johnson_m_param(params.log_inv_rate, params.log_msg_cols, eta) as usize),
+                pretty_integer(params.agreement),
+                pretty_integer(params.interpolation_m),
+                pretty_integer(params.jet_degree),
+                pretty_integer(params.interpolation_height),
+                pretty_integer(params.list_bound),
             );
         }
     }

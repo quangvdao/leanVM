@@ -1593,6 +1593,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "fiat_shamir",
+ "num-bigint",
  "parallel",
  "primitives",
  "serde",

@@ -49,6 +49,7 @@ parallel = { path = "crates/parallel" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+num-bigint = "0.4"
 ethereum_ssz = "0.10"
 rand = "0.9"
 tracing = "0.1.26"
