@@ -875,10 +875,23 @@ fn optimize_johnson_level(
 ) -> Result<OptimizedJohnsonLevel, String> {
     let query_target = target_bits.saturating_sub(query_grinding_bits).max(1);
     let block_len = 1usize << (log_msg_cols + log_inv_rate);
+    let degree = (1usize << log_msg_cols) - 1;
     let sqrt_rho = reduced_rate(log_inv_rate, log_msg_cols).sqrt();
-    let query_floor = (query_target as f64 / -sqrt_rho.log2()).ceil() as usize;
+    let beyond_johnson = |agreement: usize| -> Result<bool, String> {
+        Ok(
+            checked_product(&[agreement as u128, agreement as u128], "query Johnson threshold")?
+                > checked_product(&[block_len as u128, degree as u128], "query Johnson threshold")?,
+        )
+    };
+    let mut query_floor = (query_target as f64 / -sqrt_rho.log2()).ceil() as usize;
+    while query_floor > 1 && beyond_johnson(exact_query_agreement(block_len, query_floor - 1, query_target)?)? {
+        query_floor -= 1;
+    }
+    while !beyond_johnson(exact_query_agreement(block_len, query_floor, query_target)?)? {
+        query_floor += 1;
+    }
 
-    for queries in query_floor.saturating_sub(2).max(1)..=block_len {
+    for queries in query_floor..=block_len {
         let agreement = exact_query_agreement(block_len, queries, query_target)?;
         let eta = agreement as f64 / block_len as f64 - sqrt_rho;
         if !eta.is_finite() || eta <= 0.0 || eta >= 1.0 - sqrt_rho {
