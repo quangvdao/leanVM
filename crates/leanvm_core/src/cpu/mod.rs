@@ -454,6 +454,15 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         });
     }
     let cycles = exec.cycles;
+    if std::env::var_os("LEANVM_HOTLINK_R").is_some() {
+        crate::link::measure::run(
+            &exec.trace,
+            program.prog(),
+            crate::log2_strict_usize(exec.mem.len()),
+            cycles,
+        );
+        std::process::exit(0);
+    }
     let mut w = crate::stage!("Build witness", || program.build(&exec, layout, keccak_blocks));
     let mem_used = exec.mem_used;
     drop(exec);

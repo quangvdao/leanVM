@@ -1,8 +1,8 @@
 //! Per-opcode trace rows, emitted during execution and assembled into a [`Trace`].
 //!
 //! A row carries only what the witness fill cannot recover: the step's
-//! `(pc, fp)`, the access counts read at access time, and `DEREF`'s resolved
-//! store index. Everything else is a function of those:
+//! `(pc, fp)`, its step, the access counts read at access time, and `DEREF`'s
+//! resolved store index. Everything else is a function of those:
 //! operands and immediates come from `prog[pc]`, addresses from `fp` plus those
 //! operands, and values from the final memory image, which is write-once and so
 //! still holds what each accessed cell held at the time it was accessed. The
@@ -16,6 +16,8 @@
 pub(crate) struct Xrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32, // frame base: address = fp + offset, operand = g^offset
+    /// The step that executed the row, its Hotlink cycle pointer.
+    pub(crate) step: u32,
     pub(crate) ra: u32,
     pub(crate) rb: u32,
     pub(crate) rc: u32,
@@ -24,12 +26,16 @@ pub(crate) struct Xrow {
 pub(crate) struct Srow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
+    pub(crate) step: u32,
     pub(crate) r: u32,
     pub(crate) bytecode_read: u32,
 }
 pub(crate) struct Drow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
+    pub(crate) step: u32,
+    /// The store target's cell, `log_g(m[fp + o1]) + o2`.
+    pub(crate) store: u32,
     pub(crate) r1: u32,
     pub(crate) r2: u32,
     pub(crate) r3: u32,
@@ -38,6 +44,7 @@ pub(crate) struct Drow {
 pub(crate) struct Jrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
+    pub(crate) step: u32,
     pub(crate) rc: u32,
     pub(crate) rd: u32,
     pub(crate) rf: u32,
@@ -51,6 +58,7 @@ pub(crate) struct Jrow {
 pub(crate) struct Krow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
+    pub(crate) step: u32,
     pub(crate) r: [u32; crate::keccak::ROW_CELLS],
     pub(crate) bytecode_read: u32,
 }

@@ -824,6 +824,7 @@ impl Program {
                     let row = Xrow {
                         pc,
                         fp,
+                        step: steps as u32,
                         ra,
                         rb,
                         rc,
@@ -843,6 +844,7 @@ impl Program {
                     set.push(Srow {
                         pc,
                         fp,
+                        step: steps as u32,
                         r,
                         bytecode_read,
                     });
@@ -888,6 +890,8 @@ impl Program {
                     deref.push(Drow {
                         pc,
                         fp,
+                        step: steps as u32,
+                        store: a2,
                         r1,
                         r2,
                         r3,
@@ -917,6 +921,7 @@ impl Program {
                     jump.push(Jrow {
                         pc,
                         fp,
+                        step: steps as u32,
                         rc,
                         rd,
                         rf,
@@ -975,6 +980,7 @@ impl Program {
                     keccak.push(Krow {
                         pc,
                         fp,
+                        step: steps as u32,
                         r,
                         bytecode_read,
                     });

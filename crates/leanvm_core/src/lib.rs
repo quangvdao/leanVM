@@ -15,6 +15,7 @@
 //! - [`leaf`]: the shared bus: grand-product balance, decomposed to per-column claims (§sec:gp through §sec:leafstack, §sec:omc).
 //! - [`constraints`]: one table sumcheck over all six tables'
 //!   degree-2 identities plus their three bus forms (§sec:air).
+//! - [`link`]: Hotlink, one-hot pointer links checked by sum-checks.
 //! - [`tables`]: the six instruction tables (columns, flushes, constraints).
 //! - [`cpu`]: whole-program assembly, control flow, and the prove/verify entry points.
 //! - [`keccak`]: the `KECCAK` glue: the Keccak GKR reduction over the same commitment.
@@ -25,6 +26,7 @@ pub mod cpu;
 pub mod gkr;
 pub mod keccak;
 pub mod leaf;
+pub mod link;
 pub mod pcs;
 pub mod tables;
 pub mod transcript;
