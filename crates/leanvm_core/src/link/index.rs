@@ -31,58 +31,137 @@ fn at(v: &[F192], i: usize) -> F192 {
     v.get(i).copied().unwrap_or(F192::ZERO)
 }
 
-/// `Σ_k A(2k + X)·B(2k + X)` over the first `pairs` pairs, in coefficients.
-fn product_round(a: &[F192], b: &[F192], pairs: usize) -> [F192; 3] {
-    let [lo, hi, mixed] = parallel::fold_reduce(
-        pairs.div_ceil(TASK_PAIRS),
-        || [F192Unreduced::ZERO; 3],
-        |acc, task| {
-            for k in task * TASK_PAIRS..pairs.min((task + 1) * TASK_PAIRS) {
-                let (a0, a1, b0, b1) = (a[2 * k], at(a, 2 * k + 1), b[2 * k], at(b, 2 * k + 1));
-                acc[0] ^= a0.mul_unreduced(b0);
-                acc[1] ^= a1.mul_unreduced(b1);
-                acc[2] ^= (a0 + a1).mul_unreduced(b0 + b1);
+/// Each term's sums over a task's pairs: `A·B` at `X = 0`, `1` and `∞` for a product (unreduced), `A` at `0` and `1`
+/// for a single.
+struct Sums {
+    products: Vec<[F192Unreduced; 3]>,
+    singles: Vec<[F192; 2]>,
+}
+
+impl Sums {
+    fn new(terms: &[Term]) -> Self {
+        let n_products = terms.iter().filter(|t| matches!(t, Term::Product { .. })).count();
+        Self {
+            products: vec![[F192Unreduced::ZERO; 3]; n_products],
+            singles: vec![[F192::ZERO; 2]; terms.len() - n_products],
+        }
+    }
+
+    /// Add the terms over the pairs `k` in `range` of `arrays`, each array read from index 0.
+    #[inline(always)]
+    fn add(&mut self, terms: &[Term], arrays: &[&[F192]], range: std::ops::Range<usize>) {
+        let (mut p, mut q) = (0, 0);
+        for &term in terms {
+            match term {
+                Term::Product { a, b, .. } => {
+                    let (a, b) = (arrays[a], arrays[b]);
+                    let end = range.end.min(a.len().div_ceil(2)).min(b.len().div_ceil(2));
+                    let acc = &mut self.products[p];
+                    for k in range.start..end.max(range.start) {
+                        let (a0, a1, b0, b1) = (a[2 * k], at(a, 2 * k + 1), b[2 * k], at(b, 2 * k + 1));
+                        acc[0] ^= a0.mul_unreduced(b0);
+                        acc[1] ^= a1.mul_unreduced(b1);
+                        acc[2] ^= (a0 + a1).mul_unreduced(b0 + b1);
+                    }
+                    p += 1;
+                }
+                Term::Single { a, .. } => {
+                    let a = arrays[a];
+                    let end = range.end.min(a.len().div_ceil(2));
+                    let acc = &mut self.singles[q];
+                    for k in range.start..end.max(range.start) {
+                        acc[0] += a[2 * k];
+                        acc[1] += at(a, 2 * k + 1);
+                    }
+                    q += 1;
+                }
             }
-        },
-        |mut x, y| {
+        }
+    }
+
+    fn combine(mut self, other: Self) -> Self {
+        for (x, y) in self.products.iter_mut().zip(other.products) {
             for (x, y) in x.iter_mut().zip(y) {
                 *x ^= y;
             }
-            x
-        },
-    )
-    .map(F192Unreduced::reduce);
-    [lo, hi + lo + mixed, mixed]
-}
-
-/// `Σ_k A(2k + X)` over the array.
-fn single_round(a: &[F192]) -> [F192; 2] {
-    let pairs = a.len().div_ceil(2);
-    let [lo, hi] = parallel::fold_reduce(
-        pairs.div_ceil(TASK_PAIRS),
-        || [F192::ZERO; 2],
-        |acc, task| {
-            for k in task * TASK_PAIRS..pairs.min((task + 1) * TASK_PAIRS) {
-                acc[0] += a[2 * k];
-                acc[1] += at(a, 2 * k + 1);
-            }
-        },
-        |x, y| [x[0] + y[0], x[1] + y[1]],
-    );
-    [lo, lo + hi]
-}
-
-/// Bind the lowest variable at `x`.
-fn fold(a: &[F192], x: F192) -> Vec<F192> {
-    let mut out = vec![F192::ZERO; a.len().div_ceil(2)];
-    parallel::chunks_mut(&mut out, TASK_PAIRS, |task, chunk| {
-        for (j, o) in chunk.iter_mut().enumerate() {
-            let k = task * TASK_PAIRS + j;
-            let (lo, hi) = (a[2 * k], at(a, 2 * k + 1));
-            *o = lo + x * (lo + hi);
         }
-    });
-    out
+        for (x, y) in self.singles.iter_mut().zip(other.singles) {
+            x[0] += y[0];
+            x[1] += y[1];
+        }
+        self
+    }
+
+    /// The round polynomial's coefficients.
+    fn poly(self, terms: &[Term]) -> [F192; 3] {
+        let mut poly = [F192::ZERO; 3];
+        let (mut products, mut singles) = (self.products.into_iter(), self.singles.into_iter());
+        for &term in terms {
+            match term {
+                Term::Product { coef, .. } => {
+                    let [lo, hi, mixed] = products.next().expect("a product's sums").map(F192Unreduced::reduce);
+                    poly[0] += coef * lo;
+                    poly[1] += coef * (hi + lo + mixed);
+                    poly[2] += coef * mixed;
+                }
+                Term::Single { coef, .. } => {
+                    let [lo, hi] = singles.next().expect("a single's sums");
+                    poly[0] += coef * lo;
+                    poly[1] += coef * (lo + hi);
+                }
+            }
+        }
+        poly
+    }
+}
+
+/// The first round's polynomial.
+fn first_round(arrays: &[Vec<F192>], terms: &[Term]) -> [F192; 3] {
+    let views: Vec<&[F192]> = arrays.iter().map(Vec::as_slice).collect();
+    let pairs = arrays.iter().map(|a| a.len().div_ceil(2)).max().unwrap_or(0);
+    parallel::fold_reduce(
+        pairs.div_ceil(TASK_PAIRS),
+        || Sums::new(terms),
+        |acc, task| acc.add(terms, &views, task * TASK_PAIRS..(task + 1) * TASK_PAIRS),
+        Sums::combine,
+    )
+    .poly(terms)
+}
+
+/// Bind the lowest variable of every array at `x`, and sum the next round's polynomial, in one pass: a task folds
+/// its range of every array and sums the terms over it while it is in cache.
+fn fold_round(arrays: &[Vec<F192>], terms: &[Term], x: F192) -> (Vec<Vec<F192>>, [F192; 3]) {
+    let lens: Vec<usize> = arrays.iter().map(|a| a.len().div_ceil(2)).collect();
+    // SAFETY: the tasks below write every entry, each task its own range, before anything reads it.
+    let mut out: Vec<Vec<F192>> = lens.iter().map(|&n| unsafe { primitives::uninit_vec(n) }).collect();
+    let ptrs: Vec<parallel::SendPtr<F192>> = out.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
+    let pairs = lens.iter().map(|n| n.div_ceil(2)).max().unwrap_or(0);
+    let sums = parallel::fold_reduce(
+        pairs.div_ceil(TASK_PAIRS),
+        || Sums::new(terms),
+        |acc, task| {
+            let range = task * TASK_PAIRS..(task + 1) * TASK_PAIRS;
+            let views: Vec<&[F192]> = arrays
+                .iter()
+                .zip(&ptrs)
+                .zip(&lens)
+                .map(|((a, ptr), &n)| {
+                    let (lo, hi) = ((2 * range.start).min(n), (2 * range.end).min(n));
+                    // SAFETY: entries `lo..hi` of this array are this task's alone.
+                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(lo), hi - lo) };
+                    for (j, o) in dst.iter_mut().enumerate() {
+                        let (a0, a1) = (a[2 * (lo + j)], at(a, 2 * (lo + j) + 1));
+                        *o = a0 + x * (a0 + a1);
+                    }
+                    &*dst
+                })
+                .collect();
+            // The views start at the task's first pair.
+            acc.add(terms, &views, 0..TASK_PAIRS);
+        },
+        Sums::combine,
+    );
+    (out, sums.poly(terms))
 }
 
 /// The index side over `n_vars` variables. `round` takes each round polynomial's coefficients and returns the
@@ -99,30 +178,12 @@ pub fn prove(
     );
     let mut point = Vec::with_capacity(n_vars);
     let mut claim = None;
+    let mut poly = first_round(&arrays, terms);
     for _ in 0..n_vars {
-        let mut poly = [F192::ZERO; 3];
-        for &term in terms {
-            match term {
-                Term::Product { coef, a, b } => {
-                    let (a, b) = (&arrays[a], &arrays[b]);
-                    let pairs = a.len().div_ceil(2).min(b.len().div_ceil(2));
-                    for (p, c) in poly.iter_mut().zip(product_round(a, b, pairs)) {
-                        *p += coef * c;
-                    }
-                }
-                Term::Single { coef, a } => {
-                    for (p, c) in poly.iter_mut().zip(single_round(&arrays[a])) {
-                        *p += coef * c;
-                    }
-                }
-            }
-        }
         debug_assert!(claim.is_none_or(|c: F192| c == poly[1] + poly[2]));
         let x = round(&poly);
         claim = Some(primitives::multilinear::poly_eval(&poly, x));
-        for a in &mut arrays {
-            *a = fold(a, x);
-        }
+        (arrays, poly) = fold_round(&arrays, terms, x);
         point.push(x);
     }
     let values: Vec<F192> = arrays.iter().map(|a| at(a, 0)).collect();
@@ -141,22 +202,30 @@ pub fn prove(
     }
 }
 
-/// An array the pointers of many columns add into at once: three `u64` limbs per entry, added by XOR.
+/// An array the pointers of many columns add into at once: three `u64` limbs per entry, added by XOR, laid out
+/// as [`F192`] is so the array becomes one without a copy.
 pub struct Scatter {
-    cells: Vec<[AtomicU64; 3]>,
+    limbs: Vec<AtomicU64>,
 }
 
 impl Scatter {
     pub fn new(len: usize) -> Self {
-        Self {
-            cells: (0..len).map(|_| Default::default()).collect(),
-        }
+        // SAFETY: every limb is zeroed before it is read.
+        let limbs = unsafe {
+            primitives::filled_vec::<u64>(3 * len, |limbs| {
+                parallel::chunks_mut(limbs, 3 * TASK_PAIRS * 16, |_, chunk| chunk.fill(0));
+            })
+        };
+        let mut limbs = std::mem::ManuallyDrop::new(limbs);
+        // SAFETY: `AtomicU64` has the size, alignment and bit validity of `u64`.
+        let limbs = unsafe { Vec::from_raw_parts(limbs.as_mut_ptr().cast(), limbs.len(), limbs.capacity()) };
+        Self { limbs }
     }
 
     #[inline(always)]
     fn add(&self, j: usize, value: F192) {
-        let Some(cell) = self.cells.get(j) else {
-            panic!("Hotlink: index {j} past the array of {}", self.cells.len());
+        let Some(cell) = self.limbs.get(3 * j..3 * j + 3) else {
+            panic!("Hotlink: index {j} past the array of {}", self.limbs.len() / 3);
         };
         for (c, limb) in cell.iter().zip(value.to_limbs()) {
             if limb != 0 {
@@ -194,14 +263,14 @@ impl Scatter {
 
     /// The entries, without the trailing zeros.
     pub fn into_vec(self) -> Vec<F192> {
-        let load = |c: &[AtomicU64; 3]| F192::from_limbs(c.each_ref().map(|l| l.load(Ordering::Relaxed)));
-        let len = self.cells.iter().rposition(|c| !load(c).is_zero()).map_or(0, |j| j + 1);
-        let mut out = vec![F192::ZERO; len];
-        parallel::chunks_mut(&mut out, TASK_PAIRS, |task, chunk| {
-            for (j, o) in chunk.iter_mut().enumerate() {
-                *o = load(&self.cells[task * TASK_PAIRS + j]);
-            }
-        });
+        let mut limbs = std::mem::ManuallyDrop::new(self.limbs);
+        let (len, cap) = (limbs.len() / 3, limbs.capacity());
+        assert_eq!(cap % 3, 0);
+        // SAFETY: `F192` is `repr(C)` over three `u64` limbs in this order, and `AtomicU64` is a `u64`; the
+        // allocation holds `cap / 3` of them at `u64`'s alignment, which is `F192`'s.
+        let mut out: Vec<F192> = unsafe { Vec::from_raw_parts(limbs.as_mut_ptr().cast(), len, cap / 3) };
+        let last = out.iter().rposition(|v| !v.is_zero()).map_or(0, |j| j + 1);
+        out.truncate(last);
         out
     }
 }

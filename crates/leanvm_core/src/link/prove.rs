@@ -340,6 +340,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     };
 
     let index_end = tracing::info_span!("Index side").in_scope(|| {
+        let scatter = tracing::info_span!("Scatter").entered();
         let (w_plus, spine, cover, w_mem, w_bc) = (
             Scatter::new(n),
             Scatter::new(n),
@@ -369,6 +370,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
         }
         spine[cycles] += s_fin;
 
+        drop(scatter);
+        let _tables = tracing::info_span!("Index tables").entered();
         let idx = index_powers(n);
         let gm = ch.gamma_mem;
         let mem = &columns[MEM_LO..=MEM_TOP];
@@ -403,6 +406,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             })
             .sum();
         let eq_zeta = eq_table(&ch.zeta);
+        drop(_tables);
         let arrays = vec![
             w_plus.into_vec(),
             spine,
@@ -443,6 +447,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             },
             Term::Single { coef: F192::ONE, a: 9 },
         ];
+        let _rounds = tracing::info_span!("Index rounds").entered();
         index::prove(width, arrays, &terms, &mut |poly| {
             ps.add_round_poly(poly, false);
             ps.sample()
@@ -483,12 +488,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             let (plan, cols) = (&plans[t], local(t));
             let ex = explicit[t];
             let pad = &padrows[t];
-            let mut aux = vec![(0..ex).map(|u| state_at(t, u)).collect::<Vec<_>>()];
-            aux.extend(
-                plan.gates
-                    .iter()
-                    .map(|&g| cols[g][..ex].iter().map(|&v| F192::from(v)).collect()),
-            );
+            let mut aux = vec![tabulate(ex, |u| state_at(t, u))];
+            aux.extend(plan.gates.iter().map(|&g| tabulate(ex, |u| F192::from(cols[g][u]))));
             let s = &plan.links.state;
             let mut aux_tail = vec![g_pc.mul_base(pad[s.pc]) + g_fp.mul_base(pad[s.fp])];
             aux_tail.extend(plan.gates.iter().map(|&g| F192::from(pad[g])));

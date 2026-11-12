@@ -212,7 +212,11 @@ pub struct ColumnEnd {
 
 /// `Σ_u eq(χ, u)·bit_b(word_u)` for each bit `b`.
 pub fn bit_slices(words: &[u64], chi: &[F192]) -> Vec<F192> {
-    let eq = primitives::multilinear::eq_table(chi);
+    bit_slices_eq(words, &primitives::multilinear::eq_table(chi))
+}
+
+/// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`.
+pub fn bit_slices_eq(words: &[u64], eq: &[F192]) -> Vec<F192> {
     let n = words.len().min(eq.len());
     let slices = parallel::fold_reduce(
         n.div_ceil(TASK_PAIRS * 16),
@@ -546,20 +550,23 @@ impl Strided {
     /// Bind the lowest variable at `x`: `len` explicit rows after.
     fn fold(&self, len: usize, x: F192) -> Vec<F192> {
         let s = self.stride;
-        let mut out = vec![F192::ZERO; len * s];
         if s == 0 {
-            return out;
+            return Vec::new();
         }
-        parallel::chunks_mut(&mut out, s * TASK_PAIRS, |task, chunk| {
-            for (j, row) in chunk.chunks_mut(s).enumerate() {
-                let k = task * TASK_PAIRS + j;
-                let (lo, hi) = (self.row(2 * k), self.row(2 * k + 1));
-                for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
-                    *o = if a == b { a } else { a + x * (a + b) };
-                }
-            }
-        });
-        out
+        // SAFETY: every row writes each of its `s` values.
+        unsafe {
+            primitives::filled_vec(len * s, |out| {
+                parallel::chunks_mut(out, s * TASK_PAIRS, |task, chunk| {
+                    for (j, row) in chunk.chunks_mut(s).enumerate() {
+                        let k = task * TASK_PAIRS + j;
+                        let (lo, hi) = (self.row(2 * k), self.row(2 * k + 1));
+                        for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
+                            *o = if a == b { a } else { a + x * (a + b) };
+                        }
+                    }
+                });
+            })
+        }
     }
 }
 
@@ -625,34 +632,46 @@ impl<'a> Column<'a> {
         let d = chunks.d();
         let s = self.slots.n_values();
         let word = |u: usize| self.words.get(u).copied().unwrap_or(0);
-        let mut values = vec![F192::ZERO; len * s];
         let this = &*self;
-        parallel::chunks_mut(&mut values, s * TASK_PAIRS, |task, chunk| {
-            for (j, row) in chunk.chunks_mut(s).enumerate() {
-                let k = task * TASK_PAIRS + j;
-                let (u0, u1) = (word(2 * k), word(2 * k + 1));
-                for (slot, o) in row.iter_mut().enumerate() {
-                    let i = this.slots.table(slot, points, &this.starts).0;
-                    let e0 = this.eval(chunks, points, u0, slot);
-                    *o = if skip && chunks.bits(u0, i) == chunks.bits(u1, i) {
-                        e0
-                    } else {
-                        e0 + x * (e0 + this.eval(chunks, points, u1, slot))
-                    };
-                }
-            }
-        });
-        let tags = (0..len * d)
-            .map(|j| {
-                let (k, i) = (j / d, j % d);
-                let (b0, b1) = (chunks.bits(word(2 * k), i), chunks.bits(word(2 * k + 1), i));
-                if b0 == b1 && b0.is_power_of_two() {
-                    b0.trailing_zeros() as u8
-                } else {
-                    MIXED
-                }
+        // SAFETY: every row writes each of its `s` values.
+        let values = unsafe {
+            primitives::filled_vec(len * s, |values| {
+                parallel::chunks_mut(values, s * TASK_PAIRS, |task, chunk| {
+                    for (j, row) in chunk.chunks_mut(s).enumerate() {
+                        let k = task * TASK_PAIRS + j;
+                        let (u0, u1) = (word(2 * k), word(2 * k + 1));
+                        for (slot, o) in row.iter_mut().enumerate() {
+                            let (i, table) = this.slots.table(slot, points, &this.starts);
+                            let e0 = eval_chunk(chunks, table, u0, i);
+                            *o = if skip && chunks.bits(u0, i) == chunks.bits(u1, i) {
+                                e0
+                            } else {
+                                e0 + x * (e0 + eval_chunk(chunks, table, u1, i))
+                            };
+                        }
+                    }
+                });
             })
-            .collect();
+        };
+        // SAFETY: every pair writes each of its `d` tags.
+        let tags = unsafe {
+            primitives::filled_vec(len * d, |tags| {
+                parallel::chunks_mut(tags, d * TASK_PAIRS * 16, |task, chunk| {
+                    for (j, row) in chunk.chunks_mut(d).enumerate() {
+                        let k = task * TASK_PAIRS * 16 + j;
+                        let (u0, u1) = (word(2 * k), word(2 * k + 1));
+                        for (i, t) in row.iter_mut().enumerate() {
+                            let (b0, b1) = (chunks.bits(u0, i), chunks.bits(u1, i));
+                            *t = if b0 == b1 && b0.is_power_of_two() {
+                                b0.trailing_zeros() as u8
+                            } else {
+                                MIXED
+                            };
+                        }
+                    }
+                });
+            })
+        };
         self.values = Some(Strided {
             data: values,
             tail: vec![F192::ZERO; s],
@@ -714,10 +733,24 @@ impl<'a> State<'a> {
             table.columns.iter().all(|c| c.shifts.len() <= 4),
             "at most four shift groups a column"
         );
+        let stride = table.aux.len();
+        // SAFETY: every row writes each of its `stride` values.
+        let data = unsafe {
+            primitives::filled_vec(table.explicit * stride, |data| {
+                if stride > 0 {
+                    parallel::chunks_mut(data, stride * TASK_PAIRS * 16, |task, chunk| {
+                        for (j, row) in chunk.chunks_mut(stride).enumerate() {
+                            let u = task * TASK_PAIRS * 16 + j;
+                            for (o, a) in row.iter_mut().zip(&table.aux) {
+                                *o = a[u];
+                            }
+                        }
+                    });
+                }
+            })
+        };
         let aux = Strided {
-            data: (0..table.explicit)
-                .flat_map(|u| table.aux.iter().map(move |a| a[u]))
-                .collect(),
+            data,
             tail: table.aux_tail,
             stride: table.aux.len(),
         };
@@ -915,12 +948,18 @@ impl<'a> State<'a> {
         let support = self.support.div_ceil(2);
         let explicit = self.explicit.div_ceil(2);
         let fold_vec = |v: &[F192], len: usize| -> Vec<F192> {
-            (0..len)
-                .map(|k| {
-                    let (a, b) = (at(v, 2 * k), at(v, 2 * k + 1));
-                    a + x * (a + b)
+            // SAFETY: every entry is written.
+            unsafe {
+                primitives::filled_vec(len, |out| {
+                    parallel::chunks_mut(out, TASK_PAIRS * 16, |task, chunk| {
+                        for (j, o) in chunk.iter_mut().enumerate() {
+                            let k = task * TASK_PAIRS * 16 + j;
+                            let (a, b) = (at(v, 2 * k), at(v, 2 * k + 1));
+                            *o = a + x * (a + b);
+                        }
+                    });
                 })
-                .collect()
+            }
         };
         self.omega = fold_vec(&self.omega, support);
         self.act = fold_vec(&self.act, support);
@@ -934,17 +973,21 @@ impl<'a> State<'a> {
                 None => column.materialize(explicit, x, chunks, points, skip),
                 Some(values) => {
                     values.data = values.fold(explicit, x);
-                    column.tags = (0..explicit * d)
-                        .map(|j| {
-                            let (k, i) = (j / d, j % d);
-                            let t = tag(&column.tags, d, 2 * k, i);
-                            if t == tag(&column.tags, d, 2 * k + 1, i) {
-                                t
-                            } else {
-                                MIXED
-                            }
+                    let old = &column.tags;
+                    // SAFETY: every pair writes each of its `d` tags.
+                    column.tags = unsafe {
+                        primitives::filled_vec(explicit * d, |tags| {
+                            parallel::chunks_mut(tags, d * TASK_PAIRS * 16, |task, chunk| {
+                                for (j, row) in chunk.chunks_mut(d).enumerate() {
+                                    let k = task * TASK_PAIRS * 16 + j;
+                                    for (i, t) in row.iter_mut().enumerate() {
+                                        let a = tag(old, d, 2 * k, i);
+                                        *t = if a == tag(old, d, 2 * k + 1, i) { a } else { MIXED };
+                                    }
+                                }
+                            });
                         })
-                        .collect();
+                    };
                 }
             }
         }
@@ -994,9 +1037,11 @@ pub fn prove(
     let d = chunks.d();
     let n_coeffs = row_coeffs(d);
     let n_rounds = tables.iter().map(|t| t.log_rows).max().unwrap_or(0);
-    let mut states: Vec<State> = tables.into_iter().map(|t| State::new(t, chunks, points)).collect();
+    let mut states: Vec<State> =
+        tracing::info_span!("Setup").in_scope(|| tables.into_iter().map(|t| State::new(t, chunks, points)).collect());
     let mut point = Vec::with_capacity(n_rounds);
     let mut claim = None;
+    let rounds = tracing::info_span!("Row rounds").entered();
     for _ in 0..n_rounds {
         let mut poly = [F192::ZERO; MAX_COEFFS];
         for state in &states {
@@ -1020,14 +1065,18 @@ pub fn prove(
         point.push(x);
     }
 
+    drop(rounds);
+
     // Each column's values at its table's end come from its bit-slices there, as the verifier's do, so the
     // column rounds see every shift's tables of every column.
+    let _ends = tracing::info_span!("Ends").entered();
     let ends: Vec<TableEnd> = states
         .iter()
         .map(|s| {
             let mut end = s.end(s.done.map_or(F192::ONE, |(_, corner)| corner));
+            let eq = primitives::multilinear::eq_table(&point[..s.m]);
             for (column, column_end) in s.columns.iter().zip(&mut end.columns) {
-                let full = ColumnEnd::from_slices(chunks, points, bit_slices(column.words, &point[..s.m]));
+                let full = ColumnEnd::from_slices(chunks, points, bit_slices_eq(column.words, &eq));
                 debug_assert_eq!(column_end.values[..3 * d], full.values[..3 * d]);
                 *column_end = full;
             }
@@ -1044,7 +1093,10 @@ pub fn prove(
         }
     }
     let base = ends.iter().map(|e| e.corner * e.base).sum();
-    let (column_point, claim) = prove_columns(chunks, points, columns, base, claim, round);
+    drop(_ends);
+    tracing::info_span!("Free").in_scope(|| drop(states));
+    let (column_point, claim) = tracing::info_span!("Pointer-column rounds")
+        .in_scope(|| prove_columns(chunks, points, columns, base, claim, round));
     RowEnd {
         point,
         column_point,
