@@ -610,25 +610,32 @@ fn uniform_chunks(chunks: &Chunks, group: &[u64]) -> [Option<u64>; MAX_CHUNKS] {
     out
 }
 
-/// Chunk `i`'s `table` at a folded row: the `weights`-weighted sum over the words of its `group`, one lookup when
-/// the chunk is `uniform` across it.
+/// Chunk `i`'s `table` at a folded row: its values on the words of `group` folded by the bound challenges `r`, the
+/// first for adjacent words. One lookup when the chunk is `uniform` across the group, and no product for a pair of
+/// equal values.
 #[inline(always)]
-fn group_value(
-    chunks: &Chunks,
-    table: &[F192],
-    i: usize,
-    group: &[u64],
-    uniform: Option<u64>,
-    weights: &[F192],
-) -> F192 {
+fn group_value(chunks: &Chunks, table: &[F192], i: usize, group: &[u64], uniform: Option<u64>, r: &[F192]) -> F192 {
     if uniform.is_some() {
         return eval_chunk(chunks, table, group[0], i);
     }
-    group
-        .iter()
-        .zip(weights)
-        .map(|(&u, &w)| w * eval_chunk(chunks, table, u, i))
-        .sum()
+    let mut values = [F192::ZERO; MAX_GROUP];
+    let mut len = group.len() / 2;
+    for (v, pair) in values[..len].iter_mut().zip(group.chunks_exact(2)) {
+        let a = eval_chunk(chunks, table, pair[0], i);
+        *v = if chunks.bits(pair[0], i) == chunks.bits(pair[1], i) {
+            a
+        } else {
+            a + r[0] * (a + eval_chunk(chunks, table, pair[1], i))
+        };
+    }
+    for &x in &r[1..] {
+        len /= 2;
+        for t in 0..len {
+            let (a, b) = (values[2 * t], values[2 * t + 1]);
+            values[t] = if a == b { a } else { a + x * (a + b) };
+        }
+    }
+    values[0]
 }
 
 #[inline(always)]
@@ -688,11 +695,11 @@ impl<'a> Column<'a> {
             .collect()
     }
 
-    /// Write out the values and tags of `len` folded rows, row `k` the `weights`-weighted sum over the words of its
-    /// group `k·n..(k + 1)·n`.
-    fn materialize(&mut self, len: usize, weights: &[F192], chunks: &Chunks, points: &RowPoints) {
+    /// Write out the values and tags of `len` folded rows, row `k` its group of words `k·n..(k + 1)·n` folded by the
+    /// bound challenges `r`.
+    fn materialize(&mut self, len: usize, r: &[F192], chunks: &Chunks, points: &RowPoints) {
         let d = chunks.d();
-        let n = weights.len();
+        let n = 1 << r.len();
         let s = self.slots.n_values();
         let tables = self.tables(points);
         let words = self.words;
@@ -712,7 +719,7 @@ impl<'a> Column<'a> {
                         let group = &group[..n];
                         let uniform = uniform_chunks(chunks, group);
                         for (o, &(i, table)) in row.iter_mut().zip(&tables) {
-                            *o = group_value(chunks, table, i, group, uniform[i], weights);
+                            *o = group_value(chunks, table, i, group, uniform[i], r);
                         }
                         let row_tags = std::slice::from_raw_parts_mut(tags_ptr.0.add(k * d), d);
                         for (t, u) in row_tags.iter_mut().zip(&uniform) {
@@ -847,7 +854,7 @@ impl<'a> State<'a> {
         if state.log_rows == 0 {
             // One row: its values are the table's end from the start.
             for column in &mut state.columns {
-                column.materialize(1, &[F192::ONE], chunks, points);
+                column.materialize(1, &[], chunks, points);
             }
             if let Some(base) = &mut state.base {
                 base.fold(1, F192::ZERO);
@@ -892,7 +899,6 @@ impl<'a> State<'a> {
         } else {
             self.support.div_ceil(2)
         };
-        let weights = primitives::multilinear::eq_table_serial(&self.bound);
         let tables: Vec<Vec<(usize, &[F192])>> = self.columns.iter().map(|c| c.tables(points)).collect();
         parallel::fold_reduce(
             pairs.div_ceil(TASK_PAIRS),
@@ -913,7 +919,7 @@ impl<'a> State<'a> {
                     for (column, tables) in self.columns.iter().zip(&tables) {
                         let sums = (&mut under_omega, &mut under_act);
                         match &column.values {
-                            None => Self::pair_words(column, tables, &weights, k, &aux, chunks, points, skip, sums),
+                            None => Self::pair_words(column, tables, &self.bound, k, &aux, chunks, points, skip, sums),
                             Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
                         }
                     }
@@ -931,13 +937,13 @@ impl<'a> State<'a> {
         )
     }
 
-    /// The first rounds: the pair `(2k, 2k + 1)` straight from the words, each folded row the `weights`-weighted
-    /// sum over its group of words.
+    /// The first rounds: the pair `(2k, 2k + 1)` straight from the words, each folded row its group of words folded
+    /// by the bound challenges `r`.
     #[allow(clippy::too_many_arguments)]
     fn pair_words(
         column: &Column,
         tables: &[(usize, &[F192])],
-        weights: &[F192],
+        r: &[F192],
         k: usize,
         aux: &[(F192, F192)],
         chunks: &Chunks,
@@ -945,7 +951,7 @@ impl<'a> State<'a> {
         skip: bool,
         (omega, act): (&mut Poly, &mut Poly),
     ) {
-        let n = weights.len();
+        let n = 1 << r.len();
         let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
         let (mut lo, mut hi) = ([0u64; MAX_GROUP], [0u64; MAX_GROUP]);
         for t in 0..n {
@@ -960,8 +966,8 @@ impl<'a> State<'a> {
         let pair = |slot: usize| {
             let (i, table) = tables[slot];
             (
-                group_value(chunks, table, i, lo, lo_bits[i], weights),
-                group_value(chunks, table, i, hi, hi_bits[i], weights),
+                group_value(chunks, table, i, lo, lo_bits[i], r),
+                group_value(chunks, table, i, hi, hi_bits[i], r),
             )
         };
         let slots = &column.slots;
@@ -1055,13 +1061,12 @@ impl<'a> State<'a> {
         if words {
             self.bound.push(x);
         }
-        let weights = (words && (self.bound.len() == WORD_ROUNDS || self.log_rows == 1))
-            .then(|| primitives::multilinear::eq_table_serial(&self.bound));
+        let materialize = words && (self.bound.len() == WORD_ROUNDS || self.log_rows == 1);
         for column in &mut self.columns {
             match &mut column.values {
                 None => {
-                    if let Some(weights) = &weights {
-                        column.materialize(explicit, weights, chunks, points);
+                    if materialize {
+                        column.materialize(explicit, &self.bound, chunks, points);
                     }
                 }
                 Some(values) => {
