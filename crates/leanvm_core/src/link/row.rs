@@ -102,6 +102,8 @@ pub struct RowTable<'a> {
     pub explicit: usize,
     /// `ω_F` on the executed rows.
     pub omega: Vec<F192>,
+    /// `τ` when `ω_F = θ·eq(τ, ·)` on the executed rows, which lets each round factor `eq(τ_h, X)` out.
+    pub tau: Option<Vec<F192>>,
     /// The linear forms the coefficients name, each on the explicit rows, and their values on the padrow.
     pub aux: Vec<Vec<F192>>,
     pub aux_tail: Vec<F192>,
@@ -895,6 +897,10 @@ struct State<'a> {
     explicit: usize,
     omega: Vec<F192>,
     act: Vec<F192>,
+    /// `ω`'s point, when it is `θ·eq(τ, ·)` on the executed rows.
+    tau: Option<Vec<F192>>,
+    /// Rows whose whole group of rows is executed: there `act` is one and `ω` is `eq`'s.
+    full: usize,
     aux: Strided,
     columns: Vec<Column<'a>>,
     /// The table's row variables.
@@ -944,6 +950,8 @@ impl<'a> State<'a> {
             explicit: table.explicit,
             omega: table.omega,
             act: vec![F192::ONE; table.rows],
+            tau: table.tau,
+            full: table.rows,
             aux,
             columns: table
                 .columns
@@ -1005,13 +1013,24 @@ impl<'a> State<'a> {
             self.support.div_ceil(2)
         };
         let tables: Vec<Vec<(usize, &[F192])>> = self.columns.iter().map(|c| c.tables(points)).collect();
+        // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
+        // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
+        // `eq(τ_h, X)` multiplies their sum once per task.
+        let (whole, tau) = match &self.tau {
+            Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
+            None => (0, F192::ZERO),
+        };
+        let len = (chunks.d() + 2).max(4);
         // A small round still spreads over the workers.
         let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
         parallel::fold_reduce(
             pairs.div_ceil(per_task),
             || [F192::ZERO; MAX_COEFFS],
             |acc, task| {
-                for k in task * per_task..pairs.min((task + 1) * per_task) {
+                let mut factored = [F192Unreduced::ZERO; MAX_COEFFS];
+                let mut under_one = [F192::ZERO; MAX_COEFFS];
+                let range = task * per_task..pairs.min((task + 1) * per_task);
+                for k in range.clone() {
                     let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
                     // The terms under each weight, summed before the weight multiplies them.
                     let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
@@ -1030,11 +1049,25 @@ impl<'a> State<'a> {
                             Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
                         }
                     }
-                    let len = (chunks.d() + 2).max(4);
-                    add_mul_pair(acc, 0, &under_omega, len, omega);
-                    if self.any_act {
-                        add_mul_pair(acc, 0, &under_act, len, act);
+                    if k < whole {
+                        let scale = omega.0 + omega.1;
+                        for (f, &v) in factored.iter_mut().zip(&under_omega[..len]) {
+                            *f ^= scale.mul_unreduced(v);
+                        }
+                        if self.any_act {
+                            add_into(&mut under_one, &under_act[..len]);
+                        }
+                    } else {
+                        add_mul_pair(acc, 0, &under_omega, len, omega);
+                        if self.any_act {
+                            add_mul_pair(acc, 0, &under_act, len, act);
+                        }
                     }
+                }
+                if range.start < whole {
+                    let factored = factored.map(F192Unreduced::reduce);
+                    add_mul_pair(acc, 0, &factored, len, (F192::ONE + tau, tau));
+                    add_into(acc, &under_one[..len]);
                 }
             },
             |mut a, b| {
@@ -1225,6 +1258,7 @@ impl<'a> State<'a> {
         }
         self.support = support;
         self.explicit = explicit;
+        self.full /= 2;
         self.log_rows -= 1;
         if self.log_rows == 0 {
             self.finish(points);
@@ -1543,11 +1577,16 @@ mod tests {
                     .collect()
             })
             .collect();
+        let tau = rng.ext_vec(log_rows);
+        let theta = rng.ext();
+        let mut omega = eq_table(&tau);
+        omega.truncate(rows);
+        omega.iter_mut().for_each(|x| *x *= theta);
         Raw {
             log_rows,
             rows,
             explicit,
-            omega: rng.ext_vec(rows),
+            omega,
             aux: (0..2).map(|_| rng.ext_vec(explicit)).collect(),
             aux_tail: rng.ext_vec(2),
             words,
@@ -1555,7 +1594,7 @@ mod tests {
             k_columns,
             padrow,
             blocks: random_blocks(rng),
-            tau: rng.ext_vec(log_rows),
+            tau,
         }
     }
 
@@ -1610,6 +1649,7 @@ mod tests {
                     rows: t.rows,
                     explicit: t.explicit,
                     omega: t.omega.clone(),
+                    tau: skip.then(|| t.tau.clone()),
                     aux: t.aux.clone(),
                     aux_tail: t.aux_tail.clone(),
                     columns: t

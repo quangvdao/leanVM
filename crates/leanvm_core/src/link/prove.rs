@@ -532,6 +532,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 rows: rows[t],
                 explicit: ex,
                 omega: omegas[t].clone(),
+                tau: Some(ch.tau[..taus[t]].to_vec()),
                 aux,
                 aux_tail,
                 columns: row_columns,
