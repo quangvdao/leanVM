@@ -900,11 +900,13 @@ impl<'a> State<'a> {
             self.support.div_ceil(2)
         };
         let tables: Vec<Vec<(usize, &[F192])>> = self.columns.iter().map(|c| c.tables(points)).collect();
+        // A small round still spreads over the workers.
+        let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
         parallel::fold_reduce(
-            pairs.div_ceil(TASK_PAIRS),
+            pairs.div_ceil(per_task),
             || [F192::ZERO; MAX_COEFFS],
             |acc, task| {
-                for k in task * TASK_PAIRS..pairs.min((task + 1) * TASK_PAIRS) {
+                for k in task * per_task..pairs.min((task + 1) * per_task) {
                     let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
                     // The terms under each weight, summed before the weight multiplies them.
                     let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
