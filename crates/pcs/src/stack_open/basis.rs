@@ -423,24 +423,40 @@ pub(super) fn initial_basis(
             .map(|h| pattern.claims.iter().any(|&c| gamma(c)[h] != F192::ZERO))
             .collect();
     }
-    // One ring per piece, its lane weights scaled by the piece's scale, and the claim's map on its point.
+    // One ring per piece, its lane weights scaled by the piece's scale, and the claim's map on its point. Pieces of
+    // one claim at one point and one offset inside a lane block weigh every lane block alike, and `Phi` is additive,
+    // so they share one ring whose lane weights are the sum of theirs.
     let mut piece_weights = Vec::new();
     for (claim, weight) in ring.claims.iter().zip(rings) {
+        let first_ring = terms.rings.len();
         for piece in &claim.pieces {
             let factors = point_factors(&piece.point, piece.offset, bits);
             let (low, rest) = factors.split_at(low_vars);
             let (mid, lane) = rest.split_at(lane_vars - low_vars);
-            terms.rings.push(Ring {
-                fold: BitFold::new(&table(low)),
-                e_hi: table(mid),
-                point: piece.point.clone(),
-                x_offset: piece.offset & (block - 1),
-                first: claims.len() + DEGREE_E * piece_weights.len(),
-            });
-            let at = lanes.len();
-            extend_table(&mut lanes, lane);
-            lanes[at..].iter_mut().for_each(|l| *l *= piece.scale);
-            piece_weights.push(weight.at(piece.point.clone()));
+            let x_offset = piece.offset & (block - 1);
+            let mut lane_weights = table(lane);
+            lane_weights.iter_mut().for_each(|l| *l *= piece.scale);
+            let shared = terms.rings[first_ring..]
+                .iter()
+                .position(|r| r.x_offset == x_offset && r.point == piece.point);
+            let at = match shared {
+                Some(k) => (claims.len() + first_ring + k) << lane_bits,
+                None => {
+                    terms.rings.push(Ring {
+                        fold: BitFold::new(&table(low)),
+                        e_hi: table(mid),
+                        point: piece.point.clone(),
+                        x_offset,
+                        first: claims.len() + DEGREE_E * piece_weights.len(),
+                    });
+                    piece_weights.push(weight.at(piece.point.clone()));
+                    lanes.resize(lanes.len() + (1 << lane_bits), F192::ZERO);
+                    lanes.len() - (1 << lane_bits)
+                }
+            };
+            for (l, w) in lanes[at..at + (1 << lane_bits)].iter_mut().zip(&lane_weights) {
+                *l += *w;
+            }
         }
     }
     let n_terms = terms.n_terms();
