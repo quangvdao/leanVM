@@ -34,6 +34,9 @@ pub const MAX_COEFFS: usize = 12;
 /// No one-hot value: a tag for a chunk that is not one value across its group.
 const MIXED: u8 = u8::MAX;
 
+/// A row past the explicit ones: every chunk [`MIXED`].
+const ALL_MIXED: u64 = u64::MAX;
+
 /// No index: a word some chunk of which is not one-hot.
 const NO_INDEX: u32 = u32::MAX;
 
@@ -739,13 +742,23 @@ fn group_value(chunks: &Chunks, table: &[F192], i: usize, group: &[u64], uniform
     values[0]
 }
 
+/// Row `k`'s tags, chunk `i` in byte `i`.
 #[inline(always)]
-fn tag(tags: &[u8], d: usize, k: usize, i: usize) -> u8 {
-    tags.get(k * d + i).copied().unwrap_or(MIXED)
+fn row_tags(tags: &[u64], k: usize) -> u64 {
+    tags.get(k).copied().unwrap_or(ALL_MIXED)
+}
+
+/// The tags of a folded pair: each chunk's tag where the two rows agree, [`MIXED`] where they differ.
+#[inline(always)]
+fn fold_tags(a: u64, b: u64) -> u64 {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let x = a ^ b;
+    let differs = (((x & LOW) + LOW) | x) & !LOW;
+    a | ((differs >> 7) * 0xff)
 }
 
 /// A pointer column: its words, and after round 1 per row its chunk functionals laid out by `slots`, and per chunk a
-/// tag, the one-hot value the whole folded group holds or [`MIXED`].
+/// tag, the one-hot value the whole folded group holds or [`MIXED`], packed one byte a chunk.
 struct Column<'a> {
     words: &'a [u64],
     slots: Slots,
@@ -756,7 +769,7 @@ struct Column<'a> {
     /// Each word's index, or [`NO_INDEX`], while the rounds read words.
     index: Vec<u32>,
     values: Option<Strided>,
-    tags: Vec<u8>,
+    tags: Vec<u64>,
     omega: Coef,
     act: Coef,
     shifts: Vec<ShiftGroup>,
@@ -818,48 +831,55 @@ impl<'a> Column<'a> {
             .collect()
     }
 
-    /// Write out the values and tags of `len` folded rows, row `k` its group of words `k·n..(k + 1)·n` folded by the
-    /// bound challenges `r`.
-    fn materialize(&mut self, len: usize, r: &[F192], chunks: &Chunks, points: &RowPoints) {
-        let d = chunks.d();
+    /// Rows `rows` of the folded values and tags, row `k` its group of words `k·n..(k + 1)·n` folded by the bound
+    /// challenges `r`, with `tables` from [`Self::tables`].
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_rows(
+        &self,
+        tables: &[(usize, &[F192])],
+        rows: std::ops::Range<usize>,
+        values: &mut [F192],
+        tags: &mut [u64],
+        r: &[F192],
+        chunks: &Chunks,
+    ) {
         let n = 1 << r.len();
-        let s = self.slots.n_values();
-        let tables = self.tables(points);
-        let words = self.words;
-        // SAFETY: every row writes each of its `s` values and `d` tags.
-        let (values, tags) = unsafe {
-            let mut tags: Vec<u8> = primitives::uninit_vec(len * d);
-            let tags_ptr = parallel::SendPtr(tags.as_mut_ptr());
-            let values = primitives::filled_vec(len * s, |values| {
-                parallel::chunks_mut(values, s * TASK_PAIRS, |task, chunk| {
-                    let tags_ptr = &tags_ptr;
-                    let mut group = [0u64; 2 * MAX_GROUP];
-                    for (j, row) in chunk.chunks_mut(s).enumerate() {
-                        let k = task * TASK_PAIRS + j;
-                        for (t, u) in group[..n].iter_mut().enumerate() {
-                            *u = words.get(k * n + t).copied().unwrap_or(0);
-                        }
-                        let group = &group[..n];
-                        let uniform = uniform_chunks(chunks, group);
-                        for (o, &(i, table)) in row.iter_mut().zip(&tables) {
-                            *o = group_value(chunks, table, i, group, uniform[i], r);
-                        }
-                        let row_tags = std::slice::from_raw_parts_mut(tags_ptr.0.add(k * d), d);
-                        for (t, u) in row_tags.iter_mut().zip(&uniform) {
-                            *t = match u {
-                                Some(b) if b.is_power_of_two() => b.trailing_zeros() as u8,
-                                _ => MIXED,
-                            };
-                        }
-                    }
-                });
-            });
-            (values, tags)
-        };
+        let mut group = [0u64; 2 * MAX_GROUP];
+        for ((row, t), k) in values.chunks_mut(tables.len()).zip(tags).zip(rows) {
+            for (o, u) in group[..n].iter_mut().enumerate() {
+                *u = self.words.get(k * n + o).copied().unwrap_or(0);
+            }
+            let group = &group[..n];
+            let uniform = uniform_chunks(chunks, group);
+            for (o, &(i, table)) in row.iter_mut().zip(tables) {
+                *o = group_value(chunks, table, i, group, uniform[i], r);
+            }
+            *t = ALL_MIXED;
+            for (i, u) in uniform.iter().enumerate().take(chunks.d()) {
+                if let Some(b) = u.filter(|b| b.is_power_of_two()) {
+                    *t ^= u64::from(MIXED ^ b.trailing_zeros() as u8) << (8 * i);
+                }
+            }
+        }
+    }
+
+    /// Rows `rows` of the values and tags with the lowest variable bound at `x`.
+    fn fold_rows(&self, rows: std::ops::Range<usize>, values: &mut [F192], tags: &mut [u64], x: F192) {
+        let old = self.values.as_ref().expect("the values are written out");
+        for ((row, t), k) in values.chunks_mut(old.stride).zip(tags).zip(rows) {
+            let (lo, hi) = (old.row(2 * k), old.row(2 * k + 1));
+            for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
+                *o = if a == b { a } else { a + x * (a + b) };
+            }
+            *t = fold_tags(row_tags(&self.tags, 2 * k), row_tags(&self.tags, 2 * k + 1));
+        }
+    }
+
+    fn set_values(&mut self, data: Vec<F192>, tags: Vec<u64>, stride: usize) {
         self.values = Some(Strided {
-            data: values,
-            tail: vec![F192::ZERO; s],
-            stride: s,
+            data,
+            tail: vec![F192::ZERO; stride],
+            stride,
         });
         self.tags = tags;
     }
@@ -901,6 +921,39 @@ impl<'a> Column<'a> {
         let certs = self.cert.iter().map(|&e| end.corner * end.omega * e).collect();
         (coef, shifts, certs)
     }
+}
+
+/// Every column's `len` new rows, in rows of `strides[c]` values and one tag word for column `c`: `fill(c, rows,
+/// values, tags)` writes each value and tag of column `c`'s `rows`. One dispatch covers every column.
+fn fill_columns(
+    strides: &[usize],
+    len: usize,
+    fill: impl Fn(usize, std::ops::Range<usize>, &mut [F192], &mut [u64]) + Sync,
+) -> Vec<(Vec<F192>, Vec<u64>)> {
+    // SAFETY: the tasks cover every row of every column once, and `fill` writes each value and tag of its rows.
+    let mut out: Vec<(Vec<F192>, Vec<u64>)> = strides
+        .iter()
+        .map(|&s| unsafe { (primitives::uninit_vec(len * s), primitives::uninit_vec(len)) })
+        .collect();
+    let ptrs: Vec<_> = out
+        .iter_mut()
+        .map(|(v, t)| (parallel::SendPtr(v.as_mut_ptr()), parallel::SendPtr(t.as_mut_ptr())))
+        .collect();
+    let per_column = len.div_ceil(TASK_PAIRS);
+    parallel::for_each(strides.len() * per_column, |task| {
+        let (c, start) = (task / per_column, task % per_column * TASK_PAIRS);
+        let rows = start..len.min(start + TASK_PAIRS);
+        let s = strides[c];
+        // SAFETY: each task's rows are its own, inside column `c`'s `len` rows.
+        let (values, tags) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(ptrs[c].0.0.add(rows.start * s), rows.len() * s),
+                std::slice::from_raw_parts_mut(ptrs[c].1.0.add(rows.start), rows.len()),
+            )
+        };
+        fill(c, rows, values, tags);
+    });
+    out
 }
 
 struct State<'a> {
@@ -980,15 +1033,28 @@ impl<'a> State<'a> {
         state.any_act = state.columns.iter().any(|c| !c.act.is_zero());
         if state.log_rows == 0 {
             // One row: its values are the table's end from the start.
-            for column in &mut state.columns {
-                column.materialize(1, &[], chunks, points);
-            }
+            state.materialize(1, chunks, points);
             if let Some(base) = &mut state.base {
                 base.fold(1, F192::ZERO);
             }
             state.finish(points);
         }
         state
+    }
+
+    /// Write out every column's values and tags at `len` folded rows, from its words and the bound challenges.
+    fn materialize(&mut self, len: usize, chunks: &Chunks, points: &RowPoints) {
+        let tables: Vec<_> = self.columns.iter().map(|c| c.tables(points)).collect();
+        let strides: Vec<usize> = tables.iter().map(Vec::len).collect();
+        let (columns, bound) = (&self.columns, &self.bound);
+        let out = fill_columns(&strides, len, |c, rows, values, tags| {
+            columns[c].materialize_rows(&tables[c], rows, values, tags, bound, chunks);
+        });
+        drop(tables);
+        for ((column, (values, tags)), s) in self.columns.iter_mut().zip(out).zip(strides) {
+            column.set_values(values, tags, s);
+            column.index = Vec::new();
+        }
     }
 
     /// Rows bound: the table's value at its end.
@@ -1300,12 +1366,12 @@ impl<'a> State<'a> {
         (omega, act): (&mut Poly, &mut Poly),
     ) {
         let slots = &column.slots;
-        let d = slots.d;
         let (lo, hi) = (values.row(2 * k), values.row(2 * k + 1));
         let pair = |slot: usize| (lo[slot], hi[slot]);
+        let (lo_tags, hi_tags) = (row_tags(&column.tags, 2 * k), row_tags(&column.tags, 2 * k + 1));
         let clean = |i: usize| {
-            let t = tag(&column.tags, d, 2 * k, i);
-            t != MIXED && t == tag(&column.tags, d, 2 * k + 1, i)
+            let t = (lo_tags >> (8 * i)) as u8;
+            t != MIXED && t == (hi_tags >> (8 * i)) as u8
         };
         let same = |i: usize| lo[slots.eq(i)] == hi[slots.eq(i)] && lo[slots.bar(i)] == hi[slots.bar(i)];
         column.add_terms(
@@ -1343,39 +1409,21 @@ impl<'a> State<'a> {
         if let Some(base) = &mut self.base {
             base.fold(explicit, x);
         }
-        let d = chunks.d();
         let words = self.columns.first().is_some_and(|c| c.values.is_none());
         if words {
             self.bound.push(x);
         }
-        let materialize = words && (self.bound.len() == WORD_ROUNDS || self.log_rows == 1);
-        for column in &mut self.columns {
-            match &mut column.values {
-                None => {
-                    if materialize {
-                        column.materialize(explicit, &self.bound, chunks, points);
-                        column.index = Vec::new();
-                    }
-                }
-                Some(values) => {
-                    values.data = values.fold(explicit, x);
-                    let old = &column.tags;
-                    // SAFETY: every pair writes each of its `d` tags.
-                    column.tags = unsafe {
-                        primitives::filled_vec(explicit * d, |tags| {
-                            parallel::chunks_mut(tags, d * TASK_PAIRS * 16, |task, chunk| {
-                                for (j, row) in chunk.chunks_mut(d).enumerate() {
-                                    let k = task * TASK_PAIRS * 16 + j;
-                                    for (i, t) in row.iter_mut().enumerate() {
-                                        let a = tag(old, d, 2 * k, i);
-                                        *t = if a == tag(old, d, 2 * k + 1, i) { a } else { MIXED };
-                                    }
-                                }
-                            });
-                        })
-                    };
-                }
+        if !words {
+            let strides: Vec<usize> = self.columns.iter().map(|c| c.slots.n_values()).collect();
+            let columns = &self.columns;
+            let out = fill_columns(&strides, explicit, |c, rows, values, tags| {
+                columns[c].fold_rows(rows, values, tags, x);
+            });
+            for ((column, (values, tags)), s) in self.columns.iter_mut().zip(out).zip(strides) {
+                column.set_values(values, tags, s);
             }
+        } else if self.bound.len() == WORD_ROUNDS || self.log_rows == 1 {
+            self.materialize(explicit, chunks, points);
         }
         self.support = support;
         self.explicit = explicit;
@@ -1740,6 +1788,23 @@ mod tests {
                 w * b.gate.map_or(F192::ONE, col) * f
             })
             .sum()
+    }
+
+    /// A folded pair keeps each chunk's tag where the rows agree and is [`MIXED`] where they differ, byte by byte.
+    #[test]
+    fn folded_tags_agree_with_the_bytewise_rule() {
+        let mut rng = Rng::new(0x7a6);
+        for _ in 0..10_000 {
+            let pick = |rng: &mut Rng| -> u64 {
+                (0..8).fold(0, |t, i| t | u64::from([0u8, 1, 3, 15, MIXED][rng.next_u64() as usize % 5]) << (8 * i))
+            };
+            let (a, b) = (pick(&mut rng), pick(&mut rng));
+            let want = (0..8).fold(0, |t, i| {
+                let (x, y) = ((a >> (8 * i)) as u8, (b >> (8 * i)) as u8);
+                t | u64::from(if x == y { x } else { MIXED }) << (8 * i)
+            });
+            assert_eq!(fold_tags(a, b), want);
+        }
     }
 
     #[test]
