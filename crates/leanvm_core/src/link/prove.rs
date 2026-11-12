@@ -265,26 +265,32 @@ fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usiz
 
 /// `g^j` for `j < n`.
 fn index_powers(n: usize) -> Vec<F64> {
-    let mut out = vec![F64::ZERO; n];
-    parallel::chunks_mut(&mut out, TASK, |task, chunk| {
-        let mut g = primitives::field::g_pow(task * TASK);
-        for o in chunk {
-            *o = g;
-            g *= F64::G;
-        }
-    });
-    out
+    // SAFETY: every entry is written.
+    unsafe {
+        primitives::filled_vec(n, |out| {
+            parallel::chunks_mut(out, TASK, |task, chunk| {
+                let mut g = primitives::field::g_pow(task * TASK);
+                for o in chunk {
+                    *o = g;
+                    g *= F64::G;
+                }
+            })
+        })
+    }
 }
 
 /// `f(j)` for `j < n`, in parallel.
 fn tabulate(n: usize, f: impl Fn(usize) -> F192 + Sync) -> Vec<F192> {
-    let mut out = vec![F192::ZERO; n];
-    parallel::chunks_mut(&mut out, TASK, |task, chunk| {
-        for (k, o) in chunk.iter_mut().enumerate() {
-            *o = f(task * TASK + k);
-        }
-    });
-    out
+    // SAFETY: every entry is written.
+    unsafe {
+        primitives::filled_vec(n, |out| {
+            parallel::chunks_mut(out, TASK, |task, chunk| {
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    *o = f(task * TASK + k);
+                }
+            })
+        })
+    }
 }
 
 /// `Π_{h ≥ k} (1 + x_h)`: the multilinear extension of `[j < 2^k]`.
