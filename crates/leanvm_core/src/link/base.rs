@@ -5,11 +5,12 @@
 //! `ω_F(u)·gate(u)·form(u)` for each gate, and for `JUMP` `eq(τ_F, u)·form(u)` with its two identities. A block
 //! is degree 4 in a row variable at most: its weight, its gate and the form's products.
 //!
-//! Round 1 reads the committed `K` columns directly. Later rounds read the columns the blocks name, folded into `E`,
-//! on the explicit rows, with one tail row for the padrow after them.
+//! A form's products mostly share a column (`fp` times an operand, a layout flag times a lane), so each form is kept
+//! as `L(u) + Σ_a col_a(u)·L_a(u)` for linear forms `L`, `L_a`. The prover tabulates every `L` once on the explicit
+//! rows from the committed `K` columns, then folds those and the factor columns instead of every column a form reads.
 
 use crate::leaf::BusForm;
-use primitives::field::{F64, F192};
+use primitives::field::{F64, F192, F192Unreduced};
 
 /// What a block's form is multiplied by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,45 +29,87 @@ pub struct Block {
     pub form: BusForm,
 }
 
-/// A form over the columns a table's blocks read, sparse and renumbered to them.
+/// A linear form over a table's columns, by local index.
 #[derive(Clone, Debug)]
-struct Sparse {
-    weight: Weight,
-    gate: Option<usize>,
+struct Linear {
     constant: F192,
-    linear: Vec<(usize, F192)>,
-    products: Vec<(usize, usize, F192)>,
+    terms: Vec<(usize, F192)>,
 }
 
-impl Sparse {
-    /// The form at one row, from its columns' values.
-    fn at(&self, value: impl Fn(usize) -> F192) -> F192 {
-        let linear = self.linear.iter().map(|&(c, w)| w * value(c)).sum::<F192>();
-        let products = self
-            .products
+impl Linear {
+    #[inline(always)]
+    fn at(&self, column: impl Fn(usize) -> F64) -> F192 {
+        let sum = self
+            .terms
             .iter()
-            .map(|&(a, b, w)| w * value(a) * value(b))
-            .sum::<F192>();
-        self.constant + linear + products
+            .fold(F192Unreduced::ZERO, |acc, &(c, w)| acc ^ w.mul_base_unreduced(column(c)));
+        self.constant + sum.reduce()
     }
+}
+
+/// A block over the tabulated values: its weight, its gate's slot, the slot of its linear part and a
+/// `(factor, linear form)` pair of slots per product.
+#[derive(Clone, Debug)]
+struct Factored {
+    weight: Weight,
+    gate: Option<usize>,
+    linear: usize,
+    products: Vec<(usize, usize)>,
+}
+
+/// The products of a form, grouped by a shared column: `(column, Σ w·other)` per group, greedily by the column the
+/// most remaining products read.
+fn factor(prods: &[(usize, usize, F192)]) -> Vec<(usize, Linear)> {
+    let mut left: Vec<(usize, usize, F192)> = prods.iter().copied().filter(|p| !p.2.is_zero()).collect();
+    let mut out = Vec::new();
+    while !left.is_empty() {
+        let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+        for &(a, b, _) in &left {
+            *counts.entry(a).or_default() += 1;
+            if b != a {
+                *counts.entry(b).or_default() += 1;
+            }
+        }
+        let column = counts.iter().max_by_key(|&(c, n)| (*n, std::cmp::Reverse(*c))).map(|(&c, _)| c).unwrap();
+        let mut terms: Vec<(usize, F192)> = Vec::new();
+        left.retain(|&(a, b, w)| {
+            if a != column && b != column {
+                return true;
+            }
+            let other = if a == column { b } else { a };
+            match terms.iter_mut().find(|(c, _)| *c == other) {
+                Some((_, v)) => *v += w,
+                None => terms.push((other, w)),
+            }
+            false
+        });
+        out.push((column, Linear { constant: F192::ZERO, terms }));
+    }
+    out
 }
 
 /// The base terms of one table.
 pub struct Base<'a> {
-    blocks: Vec<Sparse>,
-    /// The local columns the blocks read, in the numbering the sparse forms use.
-    used: Vec<usize>,
+    blocks: Vec<Factored>,
+    /// The factor and gate columns, by local index, in slot order.
+    factors: Vec<usize>,
+    linears: Vec<Linear>,
     /// Round 1's columns, every row of each, by local index.
     columns: Vec<&'a [F64]>,
+    /// After round 1: the slots' values on the explicit rows, `stride` a row.
+    folded: Option<Vec<F192>>,
+    /// The slots' values on the padrow.
+    tail: Vec<F192>,
+    stride: usize,
     /// `eq(τ_F, u)` on every row, when a block is weighted by it.
     eq: Option<Vec<F192>>,
-    /// After round 1: the used columns on the explicit rows, one row of `used.len()` after another, and the padrow.
-    folded: Option<Vec<F192>>,
-    tail: Vec<F192>,
 }
 
 /// Rows per task of a fold.
 const FOLD_ROWS: usize = 512;
+
+/// The most slots a table's base terms use.
+const MAX_SLOTS: usize = 128;
 
 #[inline(always)]
 fn at(v: &[F192], i: usize) -> F192 {
@@ -82,7 +125,7 @@ fn add_block(acc: &mut [F192], w: (F192, F192), gate: Option<(F192, F192)>, f: [
         let b = a0 + a1;
         p[len] = p[len - 1] * b;
         for j in (1..len).rev() {
-            p[j] = p[j] * a0 + p[j - 1] * b;
+            p[j] = (p[j].mul_unreduced(a0) ^ p[j - 1].mul_unreduced(b)).reduce();
         }
         p[0] *= a0;
         len += 1;
@@ -92,65 +135,118 @@ fn add_block(acc: &mut [F192], w: (F192, F192), gate: Option<(F192, F192)>, f: [
     }
 }
 
+/// A block's gate times its form at a row of slot values, unweighted.
+#[inline(always)]
+fn form_at(b: &Factored, row: &[F192]) -> F192 {
+    let products = b
+        .products
+        .iter()
+        .fold(F192Unreduced::ZERO, |acc, &(f, l)| acc ^ row[f].mul_unreduced(row[l]));
+    let form = row[b.linear] + products.reduce();
+    b.gate.map_or(form, |g| row[g] * form)
+}
+
 impl<'a> Base<'a> {
     /// `columns` holds every local column of the table, every row; `padrow` the table's padding row; `eq` the table
     /// of `eq(τ_F, ·)` when a block is weighted by it.
     pub fn new(blocks: Vec<Block>, columns: Vec<&'a [F64]>, padrow: &[F64], eq: Option<Vec<F192>>) -> Self {
-        let mut used: Vec<usize> = blocks
-            .iter()
-            .flat_map(|b| {
-                let linear = b
-                    .form
-                    .coeffs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| !c.is_zero())
-                    .map(|(i, _)| i);
-                let products = b.form.prods.iter().flat_map(|&(x, y, _)| [x, y]);
-                linear.chain(products).chain(b.gate).collect::<Vec<_>>()
+        let mut factors: Vec<usize> = Vec::new();
+        let mut linears: Vec<Linear> = Vec::new();
+        let slot = |c: usize, factors: &mut Vec<usize>| {
+            factors.iter().position(|&f| f == c).unwrap_or_else(|| {
+                factors.push(c);
+                factors.len() - 1
             })
-            .collect();
-        used.sort_unstable();
-        used.dedup();
-        let index = |c: usize| used.binary_search(&c).expect("a used column");
-        let blocks: Vec<Sparse> = blocks
-            .into_iter()
-            .map(|b| Sparse {
-                weight: b.weight,
-                gate: b.gate.map(index),
+        };
+        let mut shaped = Vec::with_capacity(blocks.len());
+        for b in &blocks {
+            let gate = b.gate.map(|g| slot(g, &mut factors));
+            linears.push(Linear {
                 constant: b.form.constant,
-                linear: b
+                terms: b
                     .form
                     .coeffs
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| !c.is_zero())
-                    .map(|(i, &c)| (index(i), c))
+                    .map(|(i, &c)| (i, c))
                     .collect(),
-                products: b.form.prods.iter().map(|&(x, y, c)| (index(x), index(y), c)).collect(),
+            });
+            let linear = linears.len() - 1;
+            let products: Vec<(usize, usize)> = factor(&b.form.prods)
+                .into_iter()
+                .map(|(column, form)| {
+                    linears.push(form);
+                    (slot(column, &mut factors), linears.len() - 1)
+                })
+                .collect();
+            shaped.push((b.weight, gate, linear, products));
+        }
+        let n = factors.len();
+        let blocks: Vec<Factored> = shaped
+            .into_iter()
+            .map(|(weight, gate, linear, products)| Factored {
+                weight,
+                gate,
+                linear: n + linear,
+                products: products.into_iter().map(|(f, l)| (f, n + l)).collect(),
             })
             .collect();
-        let tail: Vec<F192> = used.iter().map(|&c| F192::from(padrow[c])).collect();
+        let stride = n + linears.len();
+        assert!(stride <= MAX_SLOTS, "a table's base terms use at most {MAX_SLOTS} slots");
+        let mut base = Self {
+            blocks,
+            factors,
+            linears,
+            columns,
+            folded: None,
+            tail: vec![F192::ZERO; stride],
+            stride,
+            eq,
+        };
+        let mut tail = vec![F192::ZERO; stride];
+        base.slots(|c| padrow[c], &mut tail);
+        base.tail = tail;
         assert!(
-            blocks
+            base.blocks
                 .iter()
                 .filter(|b| b.weight == Weight::Eq)
-                .all(|b| (b.gate.map_or(F192::ONE, |g| tail[g]) * b.at(|c| tail[c])).is_zero()),
+                .all(|b| form_at(b, &base.tail).is_zero()),
             "a block weighted on every row vanishes on the padrow"
         );
-        assert_eq!(eq.is_some(), blocks.iter().any(|b| b.weight == Weight::Eq));
-        Self {
-            blocks,
-            used,
-            columns,
-            eq,
-            folded: None,
-            tail,
+        assert_eq!(base.eq.is_some(), base.blocks.iter().any(|b| b.weight == Weight::Eq));
+        base
+    }
+
+    /// The slots' values at a row of `K` values, `column` reading a local column there.
+    #[inline(always)]
+    fn slots(&self, column: impl Fn(usize) -> F64 + Copy, out: &mut [F192]) {
+        let n = self.factors.len();
+        for (o, &c) in out.iter_mut().zip(&self.factors) {
+            *o = F192::from(column(c));
+        }
+        for (o, l) in out[n..].iter_mut().zip(&self.linears) {
+            *o = l.at(column);
         }
     }
 
-    /// `Σ_u ω(u)·gate(u)·form(u)` over the `ω` blocks, `omega` on the executed rows: what the blocks sum to before
-    /// any row is bound.
+    /// Call `f` on the slots' values at row `u`.
+    #[inline(always)]
+    fn with_row<R>(&self, u: usize, f: impl FnOnce(&[F192]) -> R) -> R {
+        let s = self.stride;
+        match &self.folded {
+            Some(rows) => f(rows.get(u * s..(u + 1) * s).unwrap_or(&self.tail)),
+            None if self.columns.first().is_some_and(|c| u < c.len()) => {
+                let mut row = [F192::ZERO; MAX_SLOTS];
+                self.slots(|c| self.columns[c][u], &mut row[..s]);
+                f(&row[..s])
+            }
+            None => f(&self.tail),
+        }
+    }
+
+    /// `Σ_u ω(u)·gate(u)·form(u)` over the `ω` blocks, `omega` on the executed rows: what the blocks sum to
+    /// before any row is bound.
     pub fn omega_sum(&self, omega: &[F192]) -> F192 {
         parallel::fold_reduce(
             omega.len().div_ceil(FOLD_ROWS),
@@ -160,10 +256,14 @@ impl<'a> Base<'a> {
                     if w.is_zero() {
                         continue;
                     }
-                    for b in self.blocks.iter().filter(|b| b.weight == Weight::Omega) {
-                        let gate = b.gate.map_or(F192::ONE, |g| self.value(g, u));
-                        *acc += w * gate * b.at(|c| self.value(c, u));
-                    }
+                    let forms: F192 = self.with_row(u, |row| {
+                        self.blocks
+                            .iter()
+                            .filter(|b| b.weight == Weight::Omega)
+                            .map(|b| form_at(b, row))
+                            .sum()
+                    });
+                    *acc += w * forms;
                 }
             },
             |a, b| a + b,
@@ -175,61 +275,59 @@ impl<'a> Base<'a> {
         self.eq.is_some()
     }
 
-    #[inline(always)]
-    fn value(&self, c: usize, u: usize) -> F192 {
-        match &self.folded {
-            None => self.columns[self.used[c]]
-                .get(u)
-                .map_or(self.tail[c], |&v| F192::from(v)),
-            Some(rows) => {
-                let n = self.used.len();
-                rows.get(u * n + c).copied().unwrap_or(self.tail[c])
-            }
-        }
-    }
-
     /// Add the pair `(2k, 2k + 1)`'s round polynomial, `omega` the table's `ω_F` there.
     #[inline(always)]
     pub fn pair(&self, k: usize, omega: (F192, F192), acc: &mut [F192]) {
-        let (u0, u1) = (2 * k, 2 * k + 1);
-        let pair = |c: usize| (self.value(c, u0), self.value(c, u1));
-        let eq = self.eq.as_ref().map(|e| (at(e, u0), at(e, u1)));
-        for block in &self.blocks {
-            let w = match block.weight {
-                Weight::Omega => omega,
-                Weight::Eq => eq.expect("an eq table"),
-            };
-            if w.0.is_zero() && w.1.is_zero() {
-                continue;
-            }
-            let (f0, f1) = (block.at(|c| pair(c).0), block.at(|c| pair(c).1));
-            let f2: F192 = block
-                .products
-                .iter()
-                .map(|&(a, b, w)| {
-                    let (a, b) = (pair(a), pair(b));
-                    w * (a.0 + a.1) * (b.0 + b.1)
-                })
-                .sum();
-            add_block(acc, w, block.gate.map(pair), [f0, f0 + f1 + f2, f2]);
-        }
+        let eq = self.eq.as_ref().map(|e| (at(e, 2 * k), at(e, 2 * k + 1)));
+        self.with_row(2 * k, |lo| {
+            self.with_row(2 * k + 1, |hi| {
+                for block in &self.blocks {
+                    let w = match block.weight {
+                        Weight::Omega => omega,
+                        Weight::Eq => eq.expect("an eq table"),
+                    };
+                    if w.0.is_zero() && w.1.is_zero() {
+                        continue;
+                    }
+                    let (mut c0, mut c1, mut c2) = (F192Unreduced::ZERO, F192Unreduced::ZERO, F192Unreduced::ZERO);
+                    for &(f, l) in &block.products {
+                        let (a0, a1, b0, b1) = (lo[f], hi[f], lo[l], hi[l]);
+                        c0 ^= a0.mul_unreduced(b0);
+                        c1 ^= a1.mul_unreduced(b1);
+                        c2 ^= (a0 + a1).mul_unreduced(b0 + b1);
+                    }
+                    let f0 = lo[block.linear] + c0.reduce();
+                    let f1 = hi[block.linear] + c1.reduce();
+                    let f2 = c2.reduce();
+                    add_block(acc, w, block.gate.map(|g| (lo[g], hi[g])), [f0, f0 + f1 + f2, f2]);
+                }
+            })
+        });
     }
 
     /// Bind the lowest row variable at `x`: `explicit` rows after.
     pub fn fold(&mut self, explicit: usize, x: F192) {
-        let n = self.used.len();
-        let mut out = vec![F192::ZERO; explicit * n];
-        if n > 0 {
-            parallel::chunks_mut(&mut out, n * FOLD_ROWS, |task, chunk| {
-                for (j, row) in chunk.chunks_mut(n).enumerate() {
-                    let k = task * FOLD_ROWS + j;
-                    for (c, o) in row.iter_mut().enumerate() {
-                        let (a, b) = (self.value(c, 2 * k), self.value(c, 2 * k + 1));
-                        *o = if a == b { a } else { a + x * (a + b) };
-                    }
+        let s = self.stride;
+        // SAFETY: every row writes each of its `s` values.
+        let folded = unsafe {
+            primitives::filled_vec(explicit * s, |out| {
+                if s > 0 {
+                    parallel::chunks_mut(out, s * FOLD_ROWS, |task, chunk| {
+                        for (j, row) in chunk.chunks_mut(s).enumerate() {
+                            let k = task * FOLD_ROWS + j;
+                            self.with_row(2 * k, |lo| {
+                                self.with_row(2 * k + 1, |hi| {
+                                    for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
+                                        *o = if a == b { a } else { a + x * (a + b) };
+                                    }
+                                })
+                            });
+                        }
+                    });
                 }
-            });
-        }
+            })
+        };
+        self.folded = Some(folded);
         if let Some(eq) = &mut self.eq {
             *eq = (0..eq.len().div_ceil(2))
                 .map(|k| {
@@ -238,31 +336,23 @@ impl<'a> Base<'a> {
                 })
                 .collect();
         }
-        self.folded = Some(out);
     }
 
     /// The base terms at the table's end, its rows bound: `omega` is `ω_F` there.
     pub fn end(&self, omega: F192) -> F192 {
         let eq = self.eq.as_ref().map(|e| e[0]);
-        self.blocks
-            .iter()
-            .map(|b| {
-                let w = match b.weight {
-                    Weight::Omega => omega,
-                    Weight::Eq => eq.expect("an eq table"),
-                };
-                let gate = b.gate.map_or(F192::ONE, |g| self.value(g, 0));
-                w * gate * b.at(|c| self.value(c, 0))
-            })
-            .sum()
-    }
-
-    /// The used columns at the table's end, by local index.
-    pub fn values(&self) -> impl Iterator<Item = (usize, F192)> + '_ {
-        self.used
-            .iter()
-            .enumerate()
-            .map(|(c, &local)| (local, self.value(c, 0)))
+        self.with_row(0, |row| {
+            self.blocks
+                .iter()
+                .map(|b| {
+                    let w = match b.weight {
+                        Weight::Omega => omega,
+                        Weight::Eq => eq.expect("an eq table"),
+                    };
+                    w * form_at(b, row)
+                })
+                .sum()
+        })
     }
 }
 
@@ -292,6 +382,8 @@ mod tests {
             f.coeffs[3] = rng.ext();
             f.prods.push((0, 2, rng.ext()));
             f.prods.push((4, 4, rng.ext()));
+            f.prods.push((1, 2, rng.ext()));
+            f.prods.push((2, 2, rng.ext()));
             f
         };
         // The eq block must vanish on the zero padrow: no constant.
@@ -319,11 +411,12 @@ mod tests {
         let omega: Vec<F192> = (0..1 << m)
             .map(|u| if u < rows { rng.ext() } else { F192::ZERO })
             .collect();
-        let row_value = |u: usize, omega_u: F192, eq_u: F192, col: &dyn Fn(usize) -> F192| -> F192 {
-            let _ = u;
+        let scales = [F192::ONE; 3];
+        let row_value = |scales: &[F192], omega_u: F192, eq_u: F192, col: &dyn Fn(usize) -> F192| -> F192 {
             blocks
                 .iter()
-                .map(|b| {
+                .zip(scales)
+                .map(|(b, &scale)| {
                     let w = if b.weight == Weight::Omega { omega_u } else { eq_u };
                     let mut f = b.form.constant;
                     for (i, &c) in b.form.coeffs.iter().enumerate() {
@@ -332,15 +425,20 @@ mod tests {
                     for &(x, y, c) in &b.form.prods {
                         f += c * col(x) * col(y);
                     }
-                    w * b.gate.map_or(F192::ONE, col) * f
+                    scale * w * b.gate.map_or(F192::ONE, col) * f
                 })
                 .sum()
         };
         let mut claim: F192 = (0..1 << m)
-            .map(|u| row_value(u, omega[u], eq[u], &|c| F192::from(columns[c][u])))
+            .map(|u| row_value(&scales, omega[u], eq[u], &|c| F192::from(columns[c][u])))
             .sum();
         let refs: Vec<&[F64]> = columns.iter().map(|c| &c[..]).collect();
         let mut base = Base::new(blocks.clone(), refs, &padrow, Some(eq.clone()));
+        let omega_only = [F192::ONE, F192::ONE, F192::ZERO];
+        let omega_sum: F192 = (0..1 << m)
+            .map(|u| row_value(&omega_only, omega[u], eq[u], &|c| F192::from(columns[c][u])))
+            .sum();
+        assert_eq!(base.omega_sum(&omega[..rows]), omega_sum);
         let mut om = omega.clone();
         let mut point = Vec::new();
         let mut explicit = 1 << m;
@@ -363,7 +461,7 @@ mod tests {
         let eqs = eq_table(&point);
         let mle = |f: &dyn Fn(usize) -> F192| (0..1 << m).map(|u| eqs[u] * f(u)).sum::<F192>();
         let cols: Vec<F192> = (0..n_cols).map(|c| mle(&|u| F192::from(columns[c][u]))).collect();
-        let expected = row_value(0, mle(&|u| omega[u]), eq_eval_at(&tau, &point), &|c| cols[c]);
+        let expected = row_value(&scales, mle(&|u| omega[u]), eq_eval_at(&tau, &point), &|c| cols[c]);
         assert_eq!(claim, expected);
     }
 
