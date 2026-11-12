@@ -364,6 +364,7 @@ fn pointer_pair(
     slots: &Slots,
     coef: &[F192],
     groups: &[[F192; 2]],
+    mut act: Option<(&mut Poly, &[F192])>,
     skip: bool,
     same: impl Fn(usize) -> bool,
     first: impl Fn(usize) -> F192,
@@ -373,10 +374,21 @@ fn pointer_pair(
     let mut p = [F192::ZERO; MAX_COEFFS];
     p[..coef.len()].copy_from_slice(coef);
     let mut len = coef.len();
+    // The pointer's term under the act weight: its coefficient times the same factors, without the shift groups.
+    let mut q = [F192::ZERO; MAX_COEFFS];
+    let mut q_len = 0;
+    if let Some((_, c)) = &act {
+        q[..c.len()].copy_from_slice(c);
+        q_len = c.len();
+    }
     let mut start = 0;
     let live = groups.iter().any(|g| g.iter().any(|c| !c.is_zero()));
     if live {
-        len = mul_pair(&mut p, len, pair(slots.eq(0)));
+        let e = pair(slots.eq(0));
+        len = mul_pair(&mut p, len, e);
+        if q_len > 0 {
+            q_len = mul_pair(&mut q, q_len, e);
+        }
         // The carry states after chunk `start - 1`, carry `c` at `c - 1`, and whether any is nonzero.
         let mut carries = [[F192::ZERO; MAX_COEFFS]; 4];
         let mut carry_len = [0usize; 4];
@@ -401,7 +413,11 @@ fn pointer_pair(
         start = 1;
         while start < d && carry_len.iter().any(|&l| l > 0) {
             let i = start;
-            len = mul_pair(&mut p, len, pair(slots.eq(i)));
+            let e = pair(slots.eq(i));
+            len = mul_pair(&mut p, len, e);
+            if q_len > 0 {
+                q_len = mul_pair(&mut q, q_len, e);
+            }
             let mut out = [F192::ZERO; MAX_COEFFS];
             let mut out_len = 0;
             for c in 1..=slots.carry {
@@ -424,7 +440,9 @@ fn pointer_pair(
             start += 1;
         }
     }
-    if p[..len].iter().all(|c| c.is_zero()) {
+    let p_live = !p[..len].iter().all(|c| c.is_zero());
+    let q_live = !q[..q_len].iter().all(|c| c.is_zero());
+    if !p_live && !q_live {
         return;
     }
     let mut scalar = F192::ONE;
@@ -438,13 +456,27 @@ fn pointer_pair(
             n_linear += 1;
         }
     }
-    if n_linear == 0 {
-        if scalar != F192::ONE {
-            for v in &mut p[..len] {
-                *v *= scalar;
+    let finish = |acc: &mut Poly, p: &[F192]| finish_pointer(acc, p, scalar, &linear[..n_linear]);
+    if p_live {
+        finish(acc, &p[..len]);
+    }
+    if q_live && let Some((act_acc, _)) = &mut act {
+        finish(act_acc, &q[..q_len]);
+    }
+}
+
+/// `acc ← acc + p·scalar·Π_j f_j` for the linear `f_j` through `linear[j]`.
+#[inline(always)]
+fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192, F192)]) {
+    let len = p.len();
+    if linear.is_empty() {
+        if scalar == F192::ONE {
+            add_into(acc, p);
+        } else {
+            for (a, &v) in acc.iter_mut().zip(p) {
+                *a += v * scalar;
             }
         }
-        add_into(acc, &p[..len]);
         return;
     }
     // The remaining factors' product first, the scalar in its first factor, then one product with `p`: cheaper than
@@ -458,7 +490,7 @@ fn pointer_pair(
     r[0] = a;
     r[1] = a + b;
     let mut r_len = 2;
-    for &e in &linear[1..n_linear] {
+    for &e in &linear[1..] {
         r_len = mul_pair(&mut r, r_len, e);
     }
     if len == 1 {
@@ -749,7 +781,7 @@ impl<'a> Column<'a> {
         aux: &[(F192, F192)],
         omega: &mut Poly,
         act: &mut Poly,
-        mut pointer: impl FnMut(&mut Poly, &[F192], &[[F192; 2]]),
+        pointer: impl FnOnce(&mut Poly, &[F192], &[[F192; 2]], Option<(&mut Poly, &[F192])>),
         cert: impl FnOnce(&mut Poly),
     ) {
         let mut groups = [[F192::ZERO; 2]; 4];
@@ -757,11 +789,9 @@ impl<'a> Column<'a> {
             *o = coef_linear(g.coef, aux).0;
         }
         let (coef, len) = coef_linear(self.omega, aux);
-        pointer(omega, &coef[..len], &groups[..self.shifts.len()]);
-        if !self.act.is_zero() {
-            let (coef, len) = coef_linear(self.act, aux);
-            pointer(act, &coef[..len], &[]);
-        }
+        let (act_coef, act_len) = coef_linear(self.act, aux);
+        let act = (!self.act.is_zero()).then_some((act, &act_coef[..act_len]));
+        pointer(omega, &coef[..len], &groups[..self.shifts.len()], act);
         cert(omega);
     }
 
@@ -977,12 +1007,13 @@ impl<'a> State<'a> {
             aux,
             omega,
             act,
-            |acc, coef, groups| {
+            |acc, coef, groups, act| {
                 pointer_pair(
                     acc,
                     slots,
                     coef,
                     groups,
+                    act,
                     skip,
                     same,
                     |i| points.eq.eval(chunks, lo[0], i),
@@ -1029,7 +1060,9 @@ impl<'a> State<'a> {
             aux,
             omega,
             act,
-            |acc, coef, groups| pointer_pair(acc, slots, coef, groups, skip, |i| lo[i] == hi[i], |i| lo[i], pair),
+            |acc, coef, groups, act| {
+                pointer_pair(acc, slots, coef, groups, act, skip, |i| lo[i] == hi[i], |i| lo[i], pair)
+            },
             |acc| cert_pair(acc, slots, &column.cert, &points.mirrors, skip, clean, |_| false, same, pair),
         );
     }
@@ -1253,6 +1286,7 @@ fn prove_columns(
                 &slots,
                 &[lo.0, lo.0 + hi.0],
                 &groups,
+                None,
                 false,
                 |_| false,
                 |_| F192::ZERO,
