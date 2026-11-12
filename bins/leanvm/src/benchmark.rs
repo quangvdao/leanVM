@@ -52,6 +52,12 @@ fn report(label: &str, stats: &leanvm_core::cpu::Stats, sig: &EthereumProof, pro
     );
     println!("    details                   : {}", stats.details());
     crate::report::print_proof_size(sig.proof_bytes().len());
+    let (scalars, vm_bytes) = sig.vm_proof_shape();
+    println!(
+        "  proof stream                : {scalars} F192 scalars ({:.1} KiB), Merkle openings {:.1} KiB",
+        (24 * scalars) as f64 / 1024.0,
+        (vm_bytes - 4 - 24 * scalars) as f64 / 1024.0
+    );
     // The whole `aggregate` call, not just `cpu::prove`: for a node that also
     // covers replaying each child and batching the deferred claims, which are
     // real per-node costs. `--tracing` breaks it down.
