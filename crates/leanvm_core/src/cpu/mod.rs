@@ -10,8 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::constraints;
-use crate::leaf::{self, Block, ColumnClaim, Coord};
+use crate::leaf::{Block, ColumnClaim, Coord};
 use crate::pcs;
 use crate::tables::{
     self, FillCtx, FlushBuilder, OP_DEREF, OP_JUMP, OP_KECCAK, OP_MUL, OP_SET, OP_XOR, SEP_BYTECODE, SEP_MEM, SEP_STATE,
@@ -232,6 +231,8 @@ pub enum ProveError {
     /// The committed witness is `2^log_committed` words, outside the
     /// `2^MIN_STACKED_LOG..=2^MAX_STACKED_LOG` every verifier accepts
     WitnessOutOfRange { log_committed: usize },
+    /// A pointer needs more than the 24 bits one word holds.
+    PointerWidth { width: usize },
 }
 
 impl std::fmt::Display for ProveError {
@@ -250,6 +251,7 @@ impl std::fmt::Display for ProveError {
                 cells.len(),
                 &cells[..cells.len().min(8)]
             ),
+            Self::PointerWidth { width } => write!(f, "a pointer needs {width} bits, more than the 24 one word holds"),
             Self::WitnessOutOfRange { log_committed } => write!(
                 f,
                 "the committed witness would be 2^{log_committed} words, outside the verifiable 2^{}..=2^{}",
@@ -271,76 +273,6 @@ pub enum CpuError {
     Verifier(verifier::VerifierError),
 }
 
-/// Per side, which table (if any) owns each bus block, as `(table, column base)`.
-type BlockOwners = [Vec<Option<(usize, usize)>>; 3];
-/// Each table's `(column base, committed column count)` in the global schema.
-type TableSpans = Vec<(usize, usize)>;
-
-/// Blocks sourced from a table's height belong to it; the boundary, memory and
-/// bytecode blocks belong to none and keep their own column claims at ζ.
-fn block_owners(log_bytecode: usize, sides: [usize; 3]) -> BlockOwners {
-    let sch = schema();
-    let src = block_kappa_sources(log_bytecode);
-    let mut it = src
-        .into_iter()
-        .map(|(source, _)| source.checked_sub(2).map(|t| (t, sch.base[t])));
-    sides.map(|n| it.by_ref().take(n).collect())
-}
-
-/// The bus's public wiring: per side which table owns each block, and each table's
-/// column span. Derived from the program and the announced layout alone, so a
-/// verifier builds the same one.
-fn bus_wiring(program: &Program, l: &Layout) -> (BlockOwners, TableSpans) {
-    let owners = block_owners(
-        crate::log2_strict_usize(program.prog.len()),
-        [l.push.len(), l.pull.len(), l.count.len()],
-    );
-    (owners, table_spans())
-}
-
-/// The table sumcheck carries every committed column of a table, because its bus
-/// forms reference the flushed ones and its constraint the rest.
-fn table_spans() -> TableSpans {
-    let sch = schema();
-    tables::tables()
-        .iter()
-        .enumerate()
-        .map(|(t, tb)| (sch.base[t], tb.n_committed_columns()))
-        .collect()
-}
-
-/// The per-table inputs to the table sumcheck (§constraints), in schema order: each
-/// table's committed columns, its summand as one form over them (its identities
-/// weighted by its own `ξ`-range, its three bus forms by the shared powers at
-/// [`xi_form_base`]), and what that summand sums to, its bus forms' `ξ`-weighted
-/// shares, since its identities vanish.
-fn airs<'a>(
-    taus: &[usize; tables::N_TABLES],
-    bus: &leaf::BusProof,
-    cols: &'a [&'a [F64]],
-    spans: &[(usize, usize)],
-    xi: F192,
-) -> Vec<constraints::Air<'a>> {
-    let base = xi_form_base();
-    let pows = primitives::field::powers(xi, base + 3);
-    let offsets = constraints::xi_offsets(tables::tables().iter().map(|t| t.n_constraints()));
-    tables::tables()
-        .iter()
-        .zip(taus.iter().zip(spans))
-        .enumerate()
-        .map(|(t, (&table, (&tau, &(start, n))))| {
-            let identities = table.constraint(&pows[offsets[t]..][..table.n_constraints()]);
-            let bus_forms = (0..3).map(|s| bus.forms[s][t].scaled(pows[base + s]));
-            constraints::Air {
-                tau,
-                cols: &cols[start..start + n],
-                form: leaf::BusForm::sum(bus_forms.chain([identities])),
-                sigma: (0..3).map(|s| pows[base + s] * bus.sigmas[s][t]).sum(),
-            }
-        })
-        .collect()
-}
-
 /// Where the three bus forms sit in the batch's `ξ`-powers: the last three, AFTER
 /// every table's identity range, and shared by all tables rather than one triple
 /// per table. That sharing is what keeps the batch tied to the bus: with a common
@@ -352,16 +284,6 @@ fn airs<'a>(
 /// the bus.
 pub fn xi_form_base() -> usize {
     tables::tables().iter().map(|t| t.n_constraints()).sum()
-}
-
-/// The KECCAK table's claims on its output lanes, which are the Keccak reduction's claim on
-/// the permutation's output: the batch claims every column of the table at one point.
-fn keccak_output_claim(table_claims: &[constraints::Claims]) -> keccak_gkr::OutputClaim {
-    let claims = &table_claims[tables::KECCAK_TABLE];
-    keccak_gkr::OutputClaim {
-        instance: claims.chi.clone(),
-        lanes: std::array::from_fn(|l| claims.evals[tables::keccakt::V_OUT + l]),
-    }
 }
 
 /// Run statistics returned alongside the proof: the cycle count (total executed
@@ -423,8 +345,19 @@ impl Stats {
 /// run [`Stats`], or why no proof was made ([`ProveError`]). `log_inv_rate`
 /// selects the PCS rate and is announced in the Fiat-Shamir transcript before
 /// the commitment.
-#[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
 pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) -> Result<(Proof, Stats), ProveError> {
+    prove_tampered(program, public_input, log_inv_rate, |_| {})
+}
+
+/// [`prove`], with `tamper` changing the witness after it is built and before it is committed: the negative tests'
+/// way to give the honest prover a bad witness.
+#[tracing::instrument(name = "Prove", skip_all, fields(log_inv_rate))]
+pub(crate) fn prove_tampered(
+    program: &Program,
+    public_input: [F192; 2],
+    log_inv_rate: usize,
+    tamper: impl FnOnce(&mut Witness),
+) -> Result<(Proof, Stats), ProveError> {
     if ::pcs::whir::validate_log_inv_rate(log_inv_rate).is_err() {
         return Err(ProveError::InvalidRate { log_inv_rate });
     }
@@ -453,17 +386,14 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             log_committed: layout.shape.mu,
         });
     }
-    let cycles = exec.cycles;
-    if std::env::var_os("LEANVM_HOTLINK_R").is_some() {
-        crate::link::measure::run(
-            &exec.trace,
-            program.prog(),
-            crate::log2_strict_usize(exec.mem.len()),
-            cycles,
-        );
-        std::process::exit(0);
+    if layout.pointer_width > crate::link::pointer::MAX_WIDTH {
+        return Err(ProveError::PointerWidth {
+            width: layout.pointer_width,
+        });
     }
+    let cycles = exec.cycles;
     let mut w = crate::stage!("Build witness", || program.build(&exec, layout, keccak_blocks));
+    tamper(&mut w);
     let mem_used = exec.mem_used;
     drop(exec);
     let committed_size = w.committed_size();
@@ -480,33 +410,17 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
         pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
     });
 
-    // KECCAK (§keccak), single PCS: q_keccak is ALWAYS a column in `w.q` (the
-    // KECCAK table is filled to the reduction's floor, so the proof shape is uniform
-    // and there is no has/hasn't-KECCAK fork). The Keccak reduction's claims and
-    // EVERY leanVM point claim are discharged together by ONE
-    // WHIR over this commitment (below). Input and output lanes bind through the
-    // memory bus: their virtual value columns route to q_keccak (inputs) and to the
-    // reduction's output claim (outputs), so no separate pin claims are needed.
-    let (owners, spans) = bus_wiring(program, &w.layout);
-    // The columns are windows into `w.q`, so both stages read them in place: the
-    // table sumcheck builds a table's few `E` state columns from them on the round
-    // it joins and never writes the K-columns back.
-    let (bus, table_claims) = {
-        let l = &w.layout;
+    // Hotlink (§link): the pointer links in place of the bus, and JUMP's identities with them. Its claims, the public
+    // input's and the Keccak reduction's are discharged together by ONE WHIR over this commitment (below). The KECCAK
+    // value columns are virtual: the input lanes are q_keccak's slots, and the output lanes' values at the row point
+    // are the reduction's claim on the permutation's output.
+    let link = {
         let cols = w.columns();
-        let bus = crate::stage!("Prove bus", || {
-            leaf::prove_balance(&l.push, &l.pull, &l.count, &cols, &owners, &spans, &mut ps)
-        });
-        let table_claims = crate::stage!("Prove constraints", || {
-            // One sumcheck for all six tables (§constraints).
-            // The eq point is the bus GKR's ζ, not a fresh one: that is what lets the
-            // batch settle the bus forms alongside the constraints.
-            let xi = ps.sample();
-            constraints::prove(&airs(&l.taus, &bus, &cols, &spans, xi), &bus.point, &mut ps)
-        });
-        (bus, table_claims)
+        crate::stage!("Prove link", || {
+            crate::link::prove::prove(&mut ps, &w.layout, &cols, &program.bytecode_columns)
+        })
     };
-    // The bus and the constraints were the output lanes' last readers.
+    // The link was the output lanes' last reader.
     drop(std::mem::take(&mut w.virt));
     let l = &w.layout;
 
@@ -515,11 +429,9 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     // is still a challenge, squeezed after the commitment so the memory cannot
     // be chosen to fit it.
     let r_pi = ps.sample();
-    // Memory binds every step's input and output words. Their value columns are
-    // virtual: the inputs route to q_keccak through `slot_claims`, the outputs are
-    // the reduction's claim on the permutation's output.
-    let mut slots = finish_claims(l, bus.claims, &table_claims, r_pi);
-    let output = keccak_output_claim(&table_claims);
+    let mut slots = vec![link.memory];
+    slots.extend(slot_claims(l, link.columns));
+    slots.extend(slot_claims(l, bind_pi_claim(r_pi, l).into()));
 
     // Run the Keccak reduction over the witness rebuilt from q_keccak's input
     // states; it returns two claims on the committed `q_keccak`, discharged by the
@@ -529,9 +441,10 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     let witness::Placement { offset, n_vars } = w.layout.placements[QKECCAK];
     let q_keccak = &w.q[offset..][..1 << n_vars];
     let openings = crate::stage!("Keccak reduction", || {
-        keccak_reduction.prove(&mut ps, q_keccak, &output)
+        keccak_reduction.prove(&mut ps, q_keccak, &link.output)
     });
-    let (ring, outputs) = openings.into_pcs_claims(offset);
+    let (mut ring, outputs) = openings.into_pcs_claims(offset);
+    ring.claims.push(link.ring);
     slots.extend(outputs);
     crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, &slots, &ring) });
     Ok((
@@ -545,37 +458,6 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
             bytecode: program.code_len(),
         },
     ))
-}
-
-/// Everything the PCS has to open, in the ORDER that feeds the batch's weights:
-/// the bus's framework claims, then the table sumcheck's per-table column claims (less the
-/// `KECCAK` output lanes', which go to the reduction), then the three public-input limb
-/// claims, each located in its committed slot. Every verifier assembles the same list in
-/// the same order.
-fn finish_claims(
-    l: &Layout,
-    bus_claims: Vec<ColumnClaim>,
-    table_claims: &[constraints::Claims],
-    r_pi: F192,
-) -> Vec<pcs::SlotClaim> {
-    let mut claims = bus_claims;
-    let sch = schema();
-    claims.reserve(sch.n - N_SHARED);
-    for (t, table) in tables::tables().iter().enumerate() {
-        for c in 0..table.n_committed_columns() {
-            let col = sch.base[t] + c;
-            if let Some(KeccakLane::Output(_)) = keccak_value(col) {
-                continue; // the Keccak reduction's claim on the output (`keccak_output_claim`)
-            }
-            claims.push(ColumnClaim {
-                col,
-                point: table_claims[t].chi.clone(),
-                value: table_claims[t].evals[c],
-            });
-        }
-    }
-    claims.extend(bind_pi_claim(r_pi, l));
-    slot_claims(l, claims)
 }
 
 /// The public-input binding (§sec:e2e-pi): each committed `MEM` limb at

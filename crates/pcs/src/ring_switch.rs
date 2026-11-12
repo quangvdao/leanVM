@@ -275,8 +275,12 @@ impl RingWeight {
         }
     }
 
-    pub(crate) fn point(&self) -> &[F192] {
-        &self.point
+    /// The same map on another point: a piece of a claim.
+    pub(crate) fn at(&self, point: Vec<F192>) -> Self {
+        Self {
+            weights: self.weights,
+            point,
+        }
     }
 
     /// `Phi(value)`.
@@ -433,6 +437,29 @@ pub fn prove_prepare(
     RingSwitchProveState {
         s_hat_v,
         point: suffix_point.to_vec(),
+    }
+}
+
+/// The prover state of a claim whose `s_hat_v` the caller already holds (and bound).
+pub(crate) fn prepared(s_hat_v: &[F192]) -> RingSwitchProveState {
+    RingSwitchProveState {
+        s_hat_v: s_hat_v.try_into().expect("one slice per packing bit"),
+        point: Vec::new(),
+    }
+}
+
+/// The prover state of a claim over several pieces: `sum_p scale_p * s_hat_v_p`. The pieces' points stay with the
+/// caller, which places each piece's weight.
+pub(crate) fn combine(pieces: impl Iterator<Item = (RingSwitchProveState, F192)>) -> RingSwitchProveState {
+    let mut s_hat_v = [F192::ZERO; PACKING_WIDTH];
+    for (state, scale) in pieces {
+        for (acc, v) in s_hat_v.iter_mut().zip(state.s_hat_v) {
+            *acc += scale * v;
+        }
+    }
+    RingSwitchProveState {
+        s_hat_v,
+        point: Vec::new(),
     }
 }
 

@@ -1,7 +1,7 @@
 //! Per-instruction tables (`doc/leanvm/body/07-instruction-tables.tex`). Each opcode is one [`Table`] impl that declares,
-//! in one place, its committed columns, how to fill them from the trace, its bus
-//! interactions (flushes), the read-count columns that feed the count channel,
-//! and its degree-2 constraint. Column indices here are *local* (`0..n_committed_columns`);
+//! in one place, its committed columns, how to fill them from the trace, its links (Hotlink, [`crate::link`]): the
+//! state it steps, the instruction it executes and the memory cells it touches, each named by a one-hot pointer
+//! column, and its degree-2 constraint. Column indices here are *local* (`0..n_committed_columns`);
 //! `cpu`'s schema offsets them to global witness columns.
 //!
 //! Columns are `K`-valued (`F64`). The pc/fp, operands, counts, opcodes and
@@ -16,6 +16,7 @@
 
 use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::BusForm;
+use crate::link::pointer::Chunks;
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
 use primitives::field::{F64, F192, mul_by_g};
 
@@ -71,15 +72,78 @@ pub(crate) const OP_DEREF: F64 = g_pow(3);
 pub(crate) const OP_JUMP: F64 = g_pow(4);
 pub(crate) const OP_KECCAK: F64 = g_pow(5);
 
+// ---- links -------------------------------------------------------------------
+
+/// A row's step of the state chain: its cycle pointer, its `(pc, fp)`, and the successor state it derives.
+#[derive(Clone, Debug)]
+pub struct StateLink {
+    pub cycle: usize,
+    pub pc: usize,
+    pub fp: usize,
+    pub next: [Coord; 2],
+}
+
+/// A row's read of the program: its pointer, its `pc`, and the tuple it reads there (opcode, then twelve operand
+/// slots).
+#[derive(Clone, Debug)]
+pub struct BytecodeLink {
+    pub pointer: usize,
+    pub pc: usize,
+    pub opcode: F64,
+    pub operands: Vec<Coord>,
+}
+
+/// A row's memory access: its pointer, the column gating it if any, the address `g^σ` it names as a form, and the
+/// word's three limbs.
+#[derive(Clone, Debug)]
+pub struct Access {
+    pub pointer: usize,
+    pub gate: Option<usize>,
+    pub addr: Coord,
+    pub vals: [Coord; 3],
+}
+
+/// Everything a table links, in local column indices.
+#[derive(Clone, Debug)]
+pub struct Links {
+    pub state: StateLink,
+    pub bytecode: BytecodeLink,
+    pub memory: Vec<Access>,
+}
+
+impl Links {
+    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access.
+    pub fn pointers(&self) -> Vec<usize> {
+        [self.state.cycle, self.bytecode.pointer]
+            .into_iter()
+            .chain(self.memory.iter().map(|a| a.pointer))
+            .collect()
+    }
+}
+
+/// A table's links.
+pub fn links(table: &dyn Table) -> Links {
+    let mut f = FlushBuilder::new();
+    table.flushes(&mut f);
+    Links {
+        state: f.state.expect("every table steps the state"),
+        bytecode: f.bytecode.expect("every table reads the program"),
+        memory: f.memory,
+    }
+}
+
 // ---- flush builder -----------------------------------------------------------
 
-/// Collects a table's push/pull bus interactions in *local* column indices. The
-/// push/pull of a memory-checked entry differ only by one coordinate carrying the
-/// post-increment `g·count` (`GCol`) instead of the pre-increment (`Col`); these
-/// helpers encode that pairing so each table reads declaratively.
+/// Collects a table's links in *local* column indices, and with them the push/pull tuples the bus
+/// carried, which the recursion guest's layout still reads. The push/pull of a memory-checked entry
+/// differ only by one coordinate carrying the post-increment `g·count` (`GCol`) instead of the
+/// pre-increment (`Col`), the count column now being the access's pointer.
 pub struct FlushBuilder {
     pub(crate) push: Vec<Vec<Coord>>,
     pub(crate) pull: Vec<Vec<Coord>>,
+    state: Option<StateLink>,
+    bytecode: Option<BytecodeLink>,
+    memory: Vec<Access>,
 }
 
 impl FlushBuilder {
@@ -87,6 +151,9 @@ impl FlushBuilder {
         Self {
             push: Vec::new(),
             pull: Vec::new(),
+            state: None,
+            bytecode: None,
+            memory: Vec::new(),
         }
     }
 
@@ -96,55 +163,67 @@ impl FlushBuilder {
     }
 
     /// Fall-through state step: the next pc is `g·pc`, fp unchanged.
-    pub(crate) fn state_step(&mut self, pc: usize, fp: usize) {
-        self.pair(
-            vec![Const(SEP_STATE), GCol(pc, 1), Col(fp)],
-            vec![Const(SEP_STATE), Col(pc), Col(fp)],
-        );
+    pub(crate) fn state_step(&mut self, cycle: usize, pc: usize, fp: usize) {
+        self.state_derived(cycle, pc, fp, GCol(pc, 1), Col(fp));
     }
 
-    /// Explicit state transition (JUMP): push the next state, which the row
-    /// DERIVES from its columns rather than committing, and pull `(pc, fp)`.
-    pub(crate) fn state_derived(&mut self, pc: usize, fp: usize, npc: Coord, nfp: Coord) {
+    /// Explicit state transition (JUMP): the next state, which the row DERIVES from its columns rather than
+    /// committing, after `(pc, fp)`.
+    pub(crate) fn state_derived(&mut self, cycle: usize, pc: usize, fp: usize, npc: Coord, nfp: Coord) {
         self.pair(
-            vec![Const(SEP_STATE), npc, nfp],
+            vec![Const(SEP_STATE), npc.clone(), nfp.clone()],
             vec![Const(SEP_STATE), Col(pc), Col(fp)],
         );
+        self.state = Some(StateLink {
+            cycle,
+            pc,
+            fp,
+            next: [npc, nfp],
+        });
     }
 
-    /// Bytecode read at `pc`: the program tuple (opcode + twelve operand slots),
-    /// with the per-pc execution count advanced by ×g on the push side.
-    pub(crate) fn bytecode(&mut self, pc: usize, count: usize, opcode: F64, operands: &[Coord]) {
-        let mut push = vec![Const(SEP_BYTECODE), Col(pc), GCol(count, 1), Const(opcode)];
-        let mut pull = vec![Const(SEP_BYTECODE), Col(pc), Col(count), Const(opcode)];
+    /// Bytecode read at `pc`, by the pointer column `pointer`: the program tuple (opcode + twelve operand slots).
+    pub(crate) fn bytecode(&mut self, pc: usize, pointer: usize, opcode: F64, operands: &[Coord]) {
+        let mut push = vec![Const(SEP_BYTECODE), Col(pc), GCol(pointer, 1), Const(opcode)];
+        let mut pull = vec![Const(SEP_BYTECODE), Col(pc), Col(pointer), Const(opcode)];
         push.extend_from_slice(operands);
         pull.extend_from_slice(operands);
         self.pair(push, pull);
+        self.bytecode = Some(BytecodeLink {
+            pointer,
+            pc,
+            opcode,
+            operands: operands.to_vec(),
+        });
     }
 
-    /// The shape every memory interaction shares: the word at `addr` carried as
-    /// three value coordinates, with the cell's access count advanced by ×g on the
-    /// push side. A value the row DERIVES rather than commits (an `XOR`/`MUL`
-    /// result, a `DEREF` store) is passed here as its form: the cell then holds
-    /// whatever the form says, which removes both the value columns and the
-    /// identity that used to tie them (§sec:m3).
-    pub(crate) fn memory_coords(&mut self, addr: Coord, count: usize, vals: [Coord; 3]) {
-        self.memory_pushing(GCol(count, 1), addr, count, vals);
+    /// The shape every memory access shares: the word at `addr` carried as three value
+    /// coordinates, the cell named by the pointer column `pointer`. A value the row DERIVES
+    /// rather than commits (an `XOR`/`MUL` result, a `DEREF` store) is passed here as its
+    /// form: the cell then holds whatever the form says, which removes both the value
+    /// columns and the identity that used to tie them (§sec:m3).
+    pub(crate) fn memory_coords(&mut self, addr: Coord, pointer: usize, vals: [Coord; 3]) {
+        self.memory_pushing(GCol(pointer, 1), None, addr, pointer, vals);
     }
 
-    /// [`Self::memory_coords`] when the column `flag` is 1. The push's counter is `count·(1 + flag·(g + 1))`:
-    /// `g·count` at 1, and the pull's `count` at 0, so the pair cancels and touches no cell.
-    pub(crate) fn memory_coords_if(&mut self, flag: usize, addr: Coord, count: usize, vals: [Coord; 3]) {
-        let counter = Coord::Sum(vec![Col(count), Prod(flag, count, 1), Prod(flag, count, 0)]);
-        self.memory_pushing(counter, addr, count, vals);
+    /// [`Self::memory_coords`] when the column `flag` is 1; at 0 the access takes part in no link.
+    pub(crate) fn memory_coords_if(&mut self, flag: usize, addr: Coord, pointer: usize, vals: [Coord; 3]) {
+        let counter = Coord::Sum(vec![Col(pointer), Prod(flag, pointer, 1), Prod(flag, pointer, 0)]);
+        self.memory_pushing(counter, Some(flag), addr, pointer, vals);
     }
 
-    fn memory_pushing(&mut self, counter: Coord, addr: Coord, count: usize, vals: [Coord; 3]) {
+    fn memory_pushing(&mut self, counter: Coord, gate: Option<usize>, addr: Coord, pointer: usize, vals: [Coord; 3]) {
         let mut push = vec![Const(SEP_MEM), addr.clone(), counter];
-        let mut pull = vec![Const(SEP_MEM), addr, Col(count)];
+        let mut pull = vec![Const(SEP_MEM), addr.clone(), Col(pointer)];
         push.extend_from_slice(&vals);
-        pull.extend(vals);
+        pull.extend(vals.clone());
         self.pair(push, pull);
+        self.memory.push(Access {
+            pointer,
+            gate,
+            addr,
+            vals,
+        });
     }
 
     /// Memory access: read the three-limb word at `addr`.
@@ -169,6 +248,8 @@ pub struct FillCtx<'a> {
     pub(crate) mem: &'a Memory,
     pub(crate) gpow: &'a [F64],
     pub(crate) prog: &'a [Op],
+    /// The pointer layout every pointer column is written in.
+    chunks: &'a Chunks,
     /// This table's height `2^tau`, the length of every window in `out`. Rows past the
     /// trace's are padding rows, each holding `padding` ([`Table::padding`]).
     height: usize,
@@ -189,6 +270,7 @@ impl<'a> FillCtx<'a> {
         mem: &'a Memory,
         gpow: &'a [F64],
         prog: &'a [Op],
+        chunks: &'a Chunks,
         height: usize,
         padding: Vec<F64>,
     ) -> Self {
@@ -197,6 +279,7 @@ impl<'a> FillCtx<'a> {
             mem,
             gpow,
             prog,
+            chunks,
             height,
             padding,
             written: Default::default(),
@@ -205,6 +288,11 @@ impl<'a> FillCtx<'a> {
 
     fn g_at(&self, i: u32) -> F64 {
         self.gpow[i as usize]
+    }
+
+    /// The one-hot word of pointer `sigma`.
+    fn ptr(&self, sigma: u32) -> F64 {
+        F64(self.chunks.encode(sigma as usize))
     }
 
     /// The three frame offsets of an `XOR`/`MUL` row. A row records
@@ -309,18 +397,17 @@ pub(crate) fn fill_table(table: &dyn Table, ctx: &FillCtx, out: &mut [ColumnOut]
 
 /// One instruction table. Indices in [`flushes`](Table::flushes) and
 /// [`count_columns`](Table::count_columns) are local to this table.
+///
+/// Every table's last column is its cycle pointer, `CYC`.
 pub trait Table: Sync {
     /// Number of committed columns (local indices `0..n_committed_columns`).
     fn n_committed_columns(&self) -> usize;
-    /// Local indices of this table's read-count columns: the `g^{count}` values
-    /// recording how many times each accessed cell (and the pc) was read. The
-    /// framework treats them specially: each gets its own single-column "count"
-    /// bus block.
+    /// Local indices of this table's memory and bytecode pointer columns, which hold the
+    /// count columns' places. The recursion guest's layout still gives each a count block.
     fn count_columns(&self) -> &'static [usize];
     /// The row a padding row holds, past the rows the program executed
-    /// (§sec:e2e-pad). Public, since every verifier evaluates the table's bus forms
-    /// at it, and it has to satisfy the table's constraint. All zeros by default,
-    /// which satisfies `JUMP`'s.
+    /// (§sec:e2e-pad). Public, and it has to satisfy the table's constraint. All
+    /// zeros by default, which satisfies `JUMP`'s; its pointer words are zero.
     fn padding(&self) -> Vec<F64> {
         vec![F64::ZERO; self.n_committed_columns()]
     }
@@ -342,7 +429,7 @@ pub trait Table: Sync {
         assert!(pows.is_empty(), "a table with constraints must state them");
         BusForm::new(self.n_committed_columns())
     }
-    /// Declare the table's bus interactions.
+    /// Declare the table's links ([`links`]).
     fn flushes(&self, f: &mut FlushBuilder);
     /// Fill this table's columns from the trace: `out[i]` is local column `i`'s
     /// window, already at its padded length. Every window must be written in full;
@@ -479,11 +566,13 @@ mod arith {
     pub const VB_LO: usize = 8;
     pub const VB_HI: usize = 9;
     pub const VB_TOP: usize = 10;
+    // The pointers: the three cells, the instruction and the cycle.
     pub const RA: usize = 11;
     pub const RB: usize = 12;
     pub const RC: usize = 13;
     pub const RBC: usize = 14;
-    pub const N: usize = 15;
+    pub const CYC: usize = 15;
+    pub const N: usize = 16;
 }
 
 /// The result word's three K-lanes as forms over the operand lanes. For `XOR`
@@ -513,7 +602,7 @@ impl Table for Arith {
     }
     fn flushes(&self, f: &mut FlushBuilder) {
         use arith::*;
-        f.state_step(PC, FP);
+        f.state_step(CYC, PC, FP);
         f.bytecode(
             PC,
             RBC,
@@ -546,8 +635,11 @@ impl Table for Arith {
                 vb[2],
             ]
         });
-        ctx.cols(out, rows, RA, |r| [r.ra, r.rb, r.rc].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, RA, |r| {
+            let (a, b, c) = ctx.ternary_operands(r.pc);
+            [a, b, c].map(|o| ctx.ptr(r.fp + o))
+        });
+        ctx.cols(out, rows, RBC, |r| [ctx.ptr(r.pc), ctx.ptr(r.step)]);
     }
 }
 
@@ -565,7 +657,8 @@ mod set {
     pub const K_TOP: usize = 5;
     pub const R: usize = 6;
     pub const RBC: usize = 7;
-    pub const N: usize = 8;
+    pub const CYC: usize = 8;
+    pub const N: usize = 9;
 }
 
 impl Table for SetTable {
@@ -578,7 +671,7 @@ impl Table for SetTable {
     }
     fn flushes(&self, f: &mut FlushBuilder) {
         use set::*;
-        f.state_step(PC, FP);
+        f.state_step(CYC, PC, FP);
         // The immediate's three limbs occupy bytecode operand slots o2..o4
         // (matching layout::operands for SET).
         f.bytecode(
@@ -605,8 +698,7 @@ impl Table for SetTable {
             let k = imm(r).1;
             k.to_limbs().map(F64)
         });
-        ctx.col(out, rows, R, |r| ctx.g_at(r.r));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, R, |r| [ctx.ptr(r.fp + imm(r).0), ctx.ptr(r.pc), ctx.ptr(r.step)]);
     }
 }
 
@@ -636,7 +728,8 @@ mod deref {
     pub const R2: usize = 12;
     pub const R3: usize = 13;
     pub const RBC: usize = 14;
-    pub const N: usize = 15;
+    pub const CYC: usize = 15;
+    pub const N: usize = 16;
 }
 
 /// The stored word's three K-lanes as forms:
@@ -663,7 +756,7 @@ impl Table for DerefTable {
     }
     fn flushes(&self, f: &mut FlushBuilder) {
         use deref::*;
-        f.state_step(PC, FP);
+        f.state_step(CYC, PC, FP);
         f.bytecode(PC, RBC, OP_DEREF, &[Col(O1), Col(O2), Col(O3), Col(FPC), Col(FFP)]);
         // The pointer cell and the local cell are frame-relative; the store target
         // is pointer-relative, so its address is `p·obe`, and its value is the
@@ -705,8 +798,10 @@ impl Table for DerefTable {
                 v3[2],
             ]
         });
-        ctx.cols(out, rows, R1, |r| [r.r1, r.r2, r.r3].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, R1, |r| {
+            let (o1, _, o3, _) = ins(r);
+            [r.fp + o1, r.store, r.fp + o3, r.pc, r.step].map(|sigma| ctx.ptr(sigma))
+        });
     }
 }
 
@@ -737,7 +832,8 @@ mod jump {
     // `doc/leanvm/body/07-instruction-tables.tex`). Both are single K lanes.
     pub const W: usize = 12;
     pub const B: usize = 13;
-    pub const N: usize = 14;
+    pub const CYC: usize = 14;
+    pub const N: usize = 15;
 }
 
 impl Table for JumpTable {
@@ -775,6 +871,7 @@ impl Table for JumpTable {
         // each degree 2 in K columns, so neither successor is committed. Written
         // out in characteristic 2 as `b·d + b·(g·pc) + g·pc`.
         f.state_derived(
+            CYC,
             PC,
             FP,
             Coord::Sum(vec![Prod(B, V_PC, 0), Prod(B, PC, 1), GCol(PC, 1)]),
@@ -850,8 +947,11 @@ impl Table for JumpTable {
             (w, b)
         };
         ctx.cols_at(out, rows.len(), W, |i| [w[i], b[i]]);
-        ctx.cols(out, rows, RC, |r| [r.rc, r.rd, r.rf].map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        ctx.cols(out, rows, RC, |r| {
+            let (oc, od, of) = ins(r);
+            [r.fp + oc, r.fp + od, r.fp + of, r.pc].map(|sigma| ctx.ptr(sigma))
+        });
+        ctx.col(out, rows, CYC, |r| ctx.ptr(r.step));
     }
 }
 
@@ -891,9 +991,10 @@ pub(crate) mod keccakt {
     pub const FREE: usize = OUT_ALL + 1; // the read limb that holds no lane
     pub const V_IN: usize = FREE + 1; // the 25 input lanes, in lane order …
     pub const V_OUT: usize = V_IN + STATE_LANES; // … and the 25 output lanes
-    pub const R0: usize = V_OUT + STATE_LANES; // one read count per cell, in flush order
+    pub const R0: usize = V_OUT + STATE_LANES; // one pointer per cell, in flush order
     pub const RBC: usize = R0 + ROW_CELLS;
-    pub const N: usize = RBC + 1;
+    pub const CYC: usize = RBC + 1;
+    pub const N: usize = CYC + 1;
 }
 
 /// A cell limb holding lane `even` in the even layout and `odd` in the odd one, as `flag`
@@ -943,7 +1044,7 @@ impl Table for KeccakTable {
     fn flushes(&self, f: &mut FlushBuilder) {
         use crate::keccak::{STATE_CELLS, cell_lanes};
         use keccakt::*;
-        f.state_step(PC, FP);
+        f.state_step(CYC, PC, FP);
         let operands: Vec<Coord> = (O_M0..=OUT_ALL).map(Col).collect();
         f.bytecode(PC, RBC, OP_KECCAK, &operands);
         // Thirteen cells read, then up to thirteen written: output cell 0 always, cell 1 as `OUT_TWO` says, the
@@ -1004,8 +1105,13 @@ impl Table for KeccakTable {
             primitives::hash::keccak_f(&mut lanes);
             lanes.map(F64)
         });
-        ctx.cols(out, rows, R0, |r| r.r.map(|k| ctx.g_at(k)));
-        ctx.col(out, rows, RBC, |r| ctx.g_at(r.bytecode_read));
+        // A cell the row does not write takes part in no link, and points at cell 0.
+        ctx.cols(out, rows, R0, |r| {
+            let k = op(r);
+            let written = crate::keccak::STATE_CELLS + k.out_cells.cells();
+            std::array::from_fn::<_, { crate::keccak::ROW_CELLS }, _>(|c| ctx.ptr(if c < written { k.cell(r.fp, c) } else { 0 }))
+        });
+        ctx.cols(out, rows, RBC, |r| [ctx.ptr(r.pc), ctx.ptr(r.step)]);
     }
 }
 

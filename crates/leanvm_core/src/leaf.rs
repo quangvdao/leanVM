@@ -569,7 +569,7 @@ impl BusForm {
 /// Accumulate one coordinate of a table's block into that table's form, at
 /// coefficient `w`. A [`Coord::Sum`]'s children share `w`, so a derived value
 /// lands as the several coefficients and products it is made of.
-fn accumulate_form(c: &Coord, w: F192, base: usize, form: &mut BusForm) {
+pub(crate) fn accumulate_form(c: &Coord, w: F192, base: usize, form: &mut BusForm) {
     match c {
         Coord::Const(v) => form.constant += w.mul_base(*v),
         Coord::Col(i) => form.coeffs[*i - base] += w,

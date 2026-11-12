@@ -53,10 +53,7 @@ fn main() {
         low_point: point,
         value: target,
     }];
-    let ring = RingSwitchOpen {
-        offset: 0,
-        claims: Vec::new(),
-    };
+    let ring = RingSwitchOpen::default();
 
     let (mut commit_t, mut open_t) = (Timing::default(), Timing::default());
     plan.warm_then_measure(|last| {

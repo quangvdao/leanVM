@@ -1,6 +1,6 @@
-//! The public column schema and bus layout: the committed-column indices, and
-//! the flush/count blocks the verifier reconstructs from the program + announced
-//! sizes and public input. Plus the prover-side witness build.
+//! The public column schema and layout: the committed-column indices, the pointer width,
+//! and the flush/count blocks the recursion guest still reconstructs from the program +
+//! announced sizes and public input. Plus the prover-side witness build.
 
 use super::*;
 use std::sync::Arc;
@@ -8,14 +8,11 @@ use std::sync::Arc;
 // ---- column schema -----------------------------------------------------------
 
 // Shared committed columns (indices `0..N_SHARED`). The program (opcode +
-// operands) is PUBLIC, not committed: it rides the bytecode seed/finalize blocks
-// as `Coord::Public`; only the witness-dependent finalize counts are committed.
-// The data-memory image, a 192-bit word per cell committed as three K-lane columns.
+// operands) is PUBLIC, not committed. The data-memory image, a 192-bit word per
+// cell committed as three K-lane columns.
 pub const MEM_LO: usize = 0;
 pub const MEM_HI: usize = 1;
 pub const MEM_TOP: usize = 2;
-pub(crate) const MFCNT: usize = 3; // per-cell memory access count, g^{A[i]}
-pub(crate) const BFCNT: usize = 4; // per-pc bytecode execution count, g^{A[pc]}
 // The Keccak reduction's committed states `q_keccak`, in the SAME stack as every
 // other column (single PCS). Size `2^(SLOT_LOG + tau)` F64 words for `2^tau`
 // KECCAK steps, never fewer than `MIN_STEPS`. It is the
@@ -24,8 +21,8 @@ pub(crate) const BFCNT: usize = 4; // per-pc bytecode execution count, g^{A[pc]}
 // output lanes' becoming the reduction's claim on the output, which is not
 // committed. The reduction's two claims are discharged by the single stacked
 // WHIR opening over this commitment.
-pub const QKECCAK: usize = 5;
-pub(crate) const N_SHARED: usize = 6;
+pub const QKECCAK: usize = 3;
+pub(crate) const N_SHARED: usize = 4;
 
 /// Global column indexing: the shared columns occupy `0..N_SHARED`, then each
 /// table `t` (in [`tables::tables`] order) owns the contiguous block `[base[t],
@@ -68,7 +65,7 @@ pub enum KeccakLane {
 pub const QKECCAK_SPARE: usize = (1 << crate::keccak::SLOT_LOG) - crate::keccak::SLOTS;
 
 /// The local KECCAK column riding spare slot `k`: its committed columns in local order, which
-/// are the ones before the value lanes, then the read counts after them.
+/// are the ones before the value lanes, then the pointers after them.
 const fn spare_local(k: usize) -> usize {
     if k < tables::keccakt::V_IN {
         k
@@ -135,7 +132,7 @@ fn offset_coord(base: usize, c: Coord) -> Coord {
 pub struct Layout {
     pub push: Vec<Block>,
     pub pull: Vec<Block>,
-    /// Count channel: read-count columns whose product must be nonzero (§sec:memchan).
+    /// One single-column block per pointer column that took a count column's place.
     pub count: Vec<Block>,
     /// Per-column placement (offset + n_vars) in the stacked witness; from the
     /// columns' log-sizes alone, so reconstructable by the verifier.
@@ -150,6 +147,9 @@ pub struct Layout {
     /// Rows per table the program executed, at most `2^taus[t]`: the rest are padding
     /// rows (§sec:e2e-pad).
     pub rows: [usize; tables::N_TABLES],
+    /// The bits of every Hotlink pointer ([`crate::link`]): enough for the cycles `0..=T`, the
+    /// memory and the program.
+    pub pointer_width: usize,
 }
 
 /// The prover's witness: the stacked multilinear `q`, which holds every committed
@@ -157,8 +157,8 @@ pub struct Layout {
 /// announce it).
 pub(crate) struct Witness {
     pub(crate) q: Vec<F64>,
-    /// The KECCAK output lanes' values as `(global column index, values)`. They carry
-    /// data for the bus but are not committed, so they are not in `q`.
+    /// The KECCAK output lanes' values as `(global column index, values)`. The links read
+    /// them but they are not committed, so they are not in `q`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
     pub(crate) layout: Layout,
     pub(crate) log_mem: usize,
@@ -209,14 +209,12 @@ impl Witness {
 /// which the caller passes as `log_bytecode`), source 1 is log_mem, and
 /// source 2 + t is tau_t. `None` = virtual (never committed). `col_kappas`
 /// is derived from this, so the two cannot drift apart.
-pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
+pub fn col_kappa_sources(_log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     let sch = schema();
     let mut k = vec![Some((0usize, 0usize)); sch.n];
     k[MEM_LO] = Some((1, 0));
     k[MEM_HI] = Some((1, 0));
     k[MEM_TOP] = Some((1, 0));
-    k[MFCNT] = Some((1, 0));
-    k[BFCNT] = Some((0, log_bytecode));
     // q_keccak is `2^(SLOT_LOG + n_steps_log)` F64 words, and tau_5 IS
     // n_steps_log (the announced-size certification uses the same floor), so this
     // reproduces `qkeccak_kappa`.
@@ -227,10 +225,9 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     }
     // The columns `q_keccak` carries are ALWAYS virtual: it already holds the input words at
     // fixed slots and the KECCAK columns riding its spare ones, and the output words are the
-    // reduction's to prove. A slot column's bus claims route directly to the matching
-    // `q_keccak` slot evaluation (`slot_claims`), the output lanes' to the reduction's output
-    // claim, which binds both to the proven witness with no separate value-binding
-    // sub-protocol.
+    // reduction's to prove. A slot column's claims route directly to the matching `q_keccak`
+    // slot evaluation (`slot_claims`), the output lanes' to the reduction's output claim, which
+    // binds both to the proven witness with no separate value-binding sub-protocol.
     for (col, k) in k.iter_mut().enumerate() {
         if keccak_value(col).is_some() {
             *k = None;
@@ -439,7 +436,7 @@ pub(crate) fn layout_of(
         vec![
             Const(SEP_MEM),
             Index,
-            Col(MFCNT),
+            Const(one),
             Col(MEM_LO),
             Col(MEM_HI),
             Col(MEM_TOP),
@@ -457,7 +454,7 @@ pub(crate) fn layout_of(
         )
     };
     push.push(bytecode_block(Const(one)));
-    pull.push(bytecode_block(Col(BFCNT)));
+    pull.push(bytecode_block(Const(one)));
 
     // Per-table blocks: each table declares its flushes and read-count columns in
     // local indices; offset them to the table's global columns.
@@ -489,7 +486,15 @@ pub(crate) fn layout_of(
         pi,
         taus,
         rows,
+        pointer_width: pointer_width(log_mem, log_bytecode, rows.iter().sum()),
     }
+}
+
+/// The bits of every Hotlink pointer: `W = max(t, κ, k_bc)` with `t = ⌈log2(T + 1)⌉`, so the cycles `0..=T`,
+/// every memory cell and every instruction have an index below `2^W`.
+pub fn pointer_width(log_mem: usize, log_bytecode: usize, cycles: usize) -> usize {
+    let t = (usize::BITS - cycles.leading_zeros()) as usize;
+    t.max(log_mem).max(log_bytecode).max(1)
 }
 
 /// Every table's log height: the least that holds its rows, at least its floor.
@@ -514,10 +519,9 @@ impl Program {
         let log_mem = crate::log2_strict_usize(cells);
 
         let sch = schema();
-        // g^0..g^{span-1}, so every pc/frame/operand/count fill is an O(1) lookup instead
-        // of an O(log) power: a frame base or an operand is below the cells the run used.
-        // The run's own table covers them unless a count outgrew it.
-        let span = exec.mem_used.max(bytecode_size).max(tr.counts);
+        // g^0..g^{span-1}, so every pc/frame/operand fill is an O(1) lookup instead of an
+        // O(log) power: a frame base or an operand is below the cells the run used.
+        let span = exec.mem_used.max(bytecode_size);
         let gpow = match exec.gpow.get(..span) {
             Some(gpow) => std::borrow::Cow::Borrowed(gpow),
             None => std::borrow::Cow::Owned(primitives::field::g_powers(span)),
@@ -563,31 +567,39 @@ impl Program {
 
         // Each table fills its own columns from the trace (local indices, offset
         // into its global block).
+        let chunks = crate::link::pointer::Chunks::new(l.pointer_width);
         crate::stage!("Fill columns", || {
             for (t, table) in tables::tables().iter().enumerate() {
                 let (base, n) = (sch.base[t], table.n_committed_columns());
-                let ctx = FillCtx::new(tr, &exec.mem, &gpow, &self.prog, 1 << l.taus[t], table.padding());
+                let ctx = FillCtx::new(
+                    tr,
+                    &exec.mem,
+                    &gpow,
+                    &self.prog,
+                    &chunks,
+                    1 << l.taus[t],
+                    table.padding(),
+                );
                 tables::fill_table(*table, &ctx, &mut windows[base..base + n]);
             }
             // Shared columns. The 192-bit memory image splits into three K-limbs.
-            // These five plus `QKECCAK` below are every shared column, and each has to
+            // These three plus `QKECCAK` below are every shared column, and each has to
             // be written: the stack is uninitialized, so one left out would be read
             // as indeterminate bytes rather than caught by a length mismatch.
-            const _: () = assert!(N_SHARED == 6, "a new shared column needs a fill here");
-            // One pass over the image fills all four of its columns, streamed out a
+            const _: () = assert!(N_SHARED == 4, "a new shared column needs a fill here");
+            // One pass over the image fills all three of its columns, streamed out a
             // cache line of each at a time: nothing reads them before the commitment.
             const LINE: usize = 8;
             const BLOCK: usize = 1 << 10;
             let page_log = Memory::page_log();
-            let image = [MEM_LO, MEM_HI, MEM_TOP, MFCNT].map(|c| {
+            let image = [MEM_LO, MEM_HI, MEM_TOP].map(|c| {
                 assert_eq!(windows[c].len(), cells, "a memory column spans the image");
                 parallel::SendPtr(windows[c].as_mut_ptr())
             });
-            // Cell `i`'s three limbs and its count, which ended at g^{A[i]}.
+            // Cell `i`'s three limbs.
             let values = |page: Option<&[Cell]>, i: usize| {
                 let cell = page.map_or(&Cell::UNWRITTEN, |p| &p[i & ((1 << page_log) - 1)]);
-                let limbs = cell.word.to_limbs().map(F64);
-                [limbs[0], limbs[1], limbs[2], gpow[cell.count as usize]]
+                cell.word.to_limbs().map(F64)
             };
             if cells < BLOCK {
                 // A memory smaller than a block, cell by cell.
@@ -605,13 +617,12 @@ impl Program {
                         let at = b * BLOCK;
                         let page = exec.mem.page(at >> page_log);
                         for line in (at..at + BLOCK).step_by(LINE) {
-                            let mut buf = [[F64::ZERO; LINE]; 4];
+                            let mut buf = [[F64::ZERO; LINE]; 3];
                             for j in 0..LINE {
-                                let [lo, hi, top, count] = values(page, line + j);
+                                let [lo, hi, top] = values(page, line + j);
                                 buf[0][j] = lo;
                                 buf[1][j] = hi;
                                 buf[2][j] = top;
-                                buf[3][j] = count;
                             }
                             for (column, values) in image.iter().zip(&buf) {
                                 // SAFETY: block `b` owns cells `b·BLOCK..(b+1)·BLOCK` of every
@@ -622,7 +633,6 @@ impl Program {
                     }
                 });
             }
-            parallel::fill(windows[BFCNT], |i| gpow[tr.bytecode_count[i] as usize]); // … at g^{A[pc]}
         });
         // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
         // the executed KECCAK rows in order (row j = step j).

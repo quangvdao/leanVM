@@ -9,6 +9,10 @@
 //! carry matrices of Binary Jolt's precompile link.
 
 pub mod index;
-pub(crate) mod measure;
+pub mod base;
+pub(crate) mod prove;
 pub mod pointer;
 pub mod row;
+
+#[cfg(test)]
+mod negative;

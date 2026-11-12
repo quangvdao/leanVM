@@ -1308,10 +1308,7 @@ mod tests {
                         value: rng.ext(),
                     })
                     .collect();
-                let ring = RingSwitchOpen {
-                    offset: 0,
-                    claims: Vec::new(),
-                };
+                let ring = RingSwitchOpen::default();
 
                 let prove = |msg: &[F64]| {
                     let (cm, pd) = commit(msg, log_n, pc.initial_k, pc.log_inv_rates[0]);

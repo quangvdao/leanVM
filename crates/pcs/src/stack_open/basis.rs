@@ -356,6 +356,10 @@ pub(super) fn initial_basis(
     assert_eq!(claims.len(), lambdas.len());
     assert_eq!(rings.len(), ring.claims.len());
     assert!(
+        claims.iter().all(|claim| matches!(claim, StackClaim::Point { .. })),
+        "sums are flattened into points first"
+    );
+    assert!(
         lane_vars >= ROWS.ilog2() as usize,
         "a lane block holds at least one row of bits"
     );
@@ -386,7 +390,9 @@ pub(super) fn initial_basis(
     // The claims' lane weights, then the rings', each `1 << lane_bits` long.
     let mut lanes: Vec<F192> = Vec::new();
     for (c, claim) in claims.iter().enumerate() {
-        let StackClaim::Point { offset, low_point, .. } = claim;
+        let StackClaim::Point { offset, low_point, .. } = claim else {
+            unreachable!("sums are flattened into points first")
+        };
         let factors = point_factors(low_point, *offset, bits);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);
@@ -417,20 +423,26 @@ pub(super) fn initial_basis(
             .map(|h| pattern.claims.iter().any(|&c| gamma(c)[h] != F192::ZERO))
             .collect();
     }
-    for (i, weight) in rings.iter().enumerate() {
-        let factors = point_factors(weight.point(), ring.offset, bits);
-        let (low, rest) = factors.split_at(low_vars);
-        let (mid, lane) = rest.split_at(lane_vars - low_vars);
-        terms.rings.push(Ring {
-            fold: BitFold::new(&table(low)),
-            e_hi: table(mid),
-            point: weight.point().to_vec(),
-            x_offset: ring.offset & (block - 1),
-            first: claims.len() + DEGREE_E * i,
-        });
-        extend_table(&mut lanes, lane);
+    // One ring per piece, its lane weights scaled by the piece's scale, and the claim's map on its point.
+    let mut piece_weights = Vec::new();
+    for (claim, weight) in ring.claims.iter().zip(rings) {
+        for piece in &claim.pieces {
+            let factors = point_factors(&piece.point, piece.offset, bits);
+            let (low, rest) = factors.split_at(low_vars);
+            let (mid, lane) = rest.split_at(lane_vars - low_vars);
+            terms.rings.push(Ring {
+                fold: BitFold::new(&table(low)),
+                e_hi: table(mid),
+                point: piece.point.clone(),
+                x_offset: piece.offset & (block - 1),
+                first: claims.len() + DEGREE_E * piece_weights.len(),
+            });
+            let at = lanes.len();
+            extend_table(&mut lanes, lane);
+            lanes[at..].iter_mut().for_each(|l| *l *= piece.scale);
+            piece_weights.push(weight.at(piece.point.clone()));
+        }
     }
-
     let n_terms = terms.n_terms();
     let mut a = vec![F192::ZERO; n_lanes * n_terms];
     for (l, row) in a.chunks_exact_mut(n_terms).enumerate() {
@@ -438,7 +450,7 @@ pub(super) fn initial_basis(
         for (c, slot) in row[..claims.len()].iter_mut().enumerate() {
             *slot = weight_of(c);
         }
-        for (i, (weight, ring)) in rings.iter().zip(&terms.rings).enumerate() {
+        for (i, (weight, ring)) in piece_weights.iter().zip(&terms.rings).enumerate() {
             let s = weight_of(claims.len() + i);
             if s != F192::ZERO {
                 for (w, slot) in row[ring.first..ring.first + DEGREE_E].iter_mut().enumerate() {
