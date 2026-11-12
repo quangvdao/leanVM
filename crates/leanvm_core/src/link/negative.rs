@@ -333,6 +333,69 @@ fn a_keccak_pointer_past_memory_is_rejected() {
     });
 }
 
+/// The loop's asserts: `XOR` of frame cell 1 with itself into cell 7, the same instruction at each of these pcs.
+const ASSERT_PCS: std::ops::Range<usize> = LOOP_PC + 7..LOOP_PC + 8 + ASSERTS;
+
+/// The first `XOR` row that runs the assert at `pc`.
+fn assert_row(w: &mut Witness, pc: usize) -> usize {
+    let (chunks, pointer) = (chunks(w), plan(XOR).links.bytecode.pointer);
+    let words = column(w, XOR, pointer);
+    words
+        .iter()
+        .position(|v| chunks.decode(v.0) == Some(pc))
+        .expect("an XOR row runs the assert")
+}
+
+/// An assert reads operand `a` from frame cell 9 rather than 1: its operand column says 9 and its pointer names that
+/// cell. Cell 9 is the next frame's cell 1, written earlier in the iteration with the same `g^8`, so the row agrees
+/// with memory and its state; only its read of the program is wrong.
+#[test]
+fn a_wrong_instruction_is_rejected() {
+    rejected(|w| {
+        let (chunks, links) = (chunks(w), plan(XOR).links);
+        let row = assert_row(w, ASSERT_PCS.start);
+        let o_a = match links.bytecode.operands[0] {
+            Coord::Col(c) => c,
+            _ => panic!("XOR's operand a is a column"),
+        };
+        assert_eq!(column(w, XOR, o_a)[row], g_pow(1));
+        column(w, XOR, o_a)[row] = g_pow(9);
+        let word = &mut column(w, XOR, links.memory[0].pointer)[row];
+        let cell = chunks.decode(word.0).expect("one-hot");
+        let memory = program().execute(PI).expect("the program runs").mem;
+        assert_eq!(memory.word(cell + 8), memory.word(cell));
+        *word = F64(chunks.encode(cell + 8));
+    });
+}
+
+/// An assert row claims the pc of the next assert, the same instruction: its program read and its memory accesses
+/// agree, but the state it starts from is not the successor its predecessor produced, and the successor it produces
+/// is not the state the next row starts from.
+#[test]
+fn a_wrong_successor_state_is_rejected() {
+    rejected(|w| {
+        let (chunks, links) = (chunks(w), plan(XOR).links);
+        let pc = ASSERT_PCS.start + 1;
+        let row = assert_row(w, pc);
+        assert_eq!(links.bytecode.pc, links.state.pc);
+        column(w, XOR, links.state.pc)[row] = g_pow(pc + 1);
+        column(w, XOR, links.bytecode.pointer)[row] = F64(chunks.encode(pc + 1));
+    });
+}
+
+/// The last `SET` row claims the cycle just past the run, so its own cycle is missing from the cycle pointers and the
+/// cycle past the run, which only the final state may claim, is claimed twice.
+#[test]
+fn a_missing_cycle_is_rejected() {
+    rejected(|w| {
+        let (chunks, cycle) = (chunks(w), plan(SET).links.state.cycle);
+        let cycles: usize = w.layout.rows.iter().sum();
+        assert!(cycles < 1 << chunks.width, "the cycle past the run has a pointer");
+        let row = w.layout.rows[SET] - 1;
+        column(w, SET, cycle)[row] = F64(chunks.encode(cycles));
+    });
+}
+
 #[test]
 fn a_wrong_memory_term_is_rejected() {
     rejected(|_| cheat::MEMORY_TERM.set(F192::ONE));

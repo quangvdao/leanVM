@@ -252,6 +252,9 @@ pub struct LinkEnd {
     /// The pointer columns' 64 bit-slices, one piece per pointer column.
     pub ring: RingClaim,
     pub bytecode_point: Vec<E>,
+    /// The stream positions of the index side's values at `r` and of the bit-slices.
+    pub values_at_r: std::ops::Range<usize>,
+    pub bit_slices: std::ops::Range<usize>,
 }
 
 /// The pointer width every execution of these sizes takes: the cycle count's bits, the memory's and the program's.
@@ -293,7 +296,9 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     // The index side, then the values at `r` and the fresh coefficients.
     let claim = eta_cover * less_than(&zeta, cycles) + eta_start * s_init;
     let (r, claim) = sumcheck(transcript, claim, 3, &vec![None; width])?;
+    let values_start = transcript.stream_offset();
     let sent = transcript.next_scalars(3)?;
+    let values_at_r = values_start..transcript.stream_offset();
     let (w_plus, spine, m1) = (sent[0], sent[1], sent[2]);
     let [plus, spine_coef, cert, jump_0, jump_1] = [0; 5].map(|_| transcript.sample());
     let below = |k: usize| product(r[k.min(width)..].iter().map(|&x| ONE + x));
@@ -406,7 +411,9 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
         }
         columns.push((point, sent));
     }
+    let slices_start = transcript.stream_offset();
     let slices = transcript.next_scalars(K_BITS)?;
+    let bit_slices = slices_start..transcript.stream_offset();
     if transcript.checked() {
         let functionals = Functionals::new(&chunks, &r, &rho, max_shift);
         let values = functionals.values(&chunks, &slices);
@@ -428,5 +435,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
         columns,
         ring: RingClaim { pieces, slices },
         bytecode_point,
+        values_at_r,
+        bit_slices,
     })
 }

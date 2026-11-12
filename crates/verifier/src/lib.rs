@@ -162,6 +162,10 @@ pub struct Summary {
     pub bytecode_point: Vec<E>,
     /// The stream positions the Keccak reduction reads.
     pub keccak_scalars: Range<usize>,
+    /// The stream positions of the link's index-side values at `r` (`w⁺`, the spine and the memory term) and of the
+    /// pointer columns' bit-slices.
+    pub values_at_r: Range<usize>,
+    pub bit_slices: Range<usize>,
 }
 
 /// Verify that `proof` shows an execution of `bytecode` (the stacked bytecode multilinear) on the 256-bit `public_input`.
@@ -350,5 +354,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         log_inv_rate: log_inverse_rate as usize,
         bytecode_point: link.bytecode_point,
         keccak_scalars,
+        values_at_r: link.values_at_r,
+        bit_slices: link.bit_slices,
     })
 }

@@ -77,3 +77,22 @@ fn tampers_fail_their_check() {
         );
     }
 }
+
+/// Each of the index side's values at `r` (`w⁺`, the spine and the memory term) and each of the pointer columns'
+/// bit-slices, tampered, fails the link's terminal check.
+#[test]
+fn tampered_link_values_fail_the_link() {
+    let fixture = fixture();
+    let summary = &fixture.summary;
+    assert_eq!(summary.values_at_r.len(), 3);
+    assert_eq!(summary.bit_slices.len(), 64);
+    for position in summary.values_at_r.clone().chain(summary.bit_slices.clone()) {
+        let mut proof = scalar_proof(&fixture.proof);
+        proof.stream[position] += E::new(0, 0, 1);
+        assert_eq!(
+            verify_execution(&fixture.bytecode, &fixture.public_input_bytes, &proof).map(|_| ()),
+            Err(VerifierError::LinkTerminal),
+            "scalar {position}"
+        );
+    }
+}
