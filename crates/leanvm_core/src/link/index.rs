@@ -7,7 +7,7 @@
 
 use super::pointer::Chunks;
 use primitives::field::{F192, F192Unreduced};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Pairs per task of a round.
 const TASK_PAIRS: usize = 1 << 12;
@@ -203,9 +203,11 @@ pub fn prove(
 }
 
 /// An array the pointers of many columns add into at once: three `u64` limbs per entry, added by XOR, laid out
-/// as [`F192`] is so the array becomes one without a copy.
+/// as [`F192`] is so the array becomes one without a copy. An index past its length sets `overflow` and adds
+/// nothing, so a caller that sized it for the honest indices can redo it at full size.
 pub struct Scatter {
     limbs: Vec<AtomicU64>,
+    overflow: AtomicBool,
 }
 
 impl Scatter {
@@ -219,13 +221,22 @@ impl Scatter {
         let mut limbs = std::mem::ManuallyDrop::new(limbs);
         // SAFETY: `AtomicU64` has the size, alignment and bit validity of `u64`.
         let limbs = unsafe { Vec::from_raw_parts(limbs.as_mut_ptr().cast(), limbs.len(), limbs.capacity()) };
-        Self { limbs }
+        Self {
+            limbs,
+            overflow: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether an index fell past the array.
+    pub fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
     fn add(&self, j: usize, value: F192) {
         let Some(cell) = self.limbs.get(3 * j..3 * j + 3) else {
-            panic!("Hotlink: index {j} past the array of {}", self.limbs.len() / 3);
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
         };
         for (c, limb) in cell.iter().zip(value.to_limbs()) {
             if limb != 0 {
@@ -284,6 +295,19 @@ mod tests {
 
     fn mle(a: &[F192], point: &[F192]) -> F192 {
         eq_table(point).iter().zip(a).map(|(&e, &v)| e * v).sum()
+    }
+
+    #[test]
+    fn a_scatter_flags_an_index_past_its_length() {
+        let chunks = Chunks::new(9);
+        let words: Vec<u64> = [3, 7, 2].iter().map(|&s| chunks.encode(s)).collect();
+        let fits = Scatter::new(8);
+        fits.add_words(&chunks, &words, 0, |_| F192::ONE);
+        assert!(!fits.overflowed());
+        let short = Scatter::new(7);
+        short.add_words(&chunks, &words, 0, |_| F192::ONE);
+        assert!(short.overflowed());
+        assert_eq!(short.into_vec(), [0, 0, 1, 1].map(|b| F192::new(b, 0, 0)));
     }
 
     #[test]

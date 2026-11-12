@@ -347,29 +347,34 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
 
     let index_end = tracing::info_span!("Index side").in_scope(|| {
         let scatter = tracing::info_span!("Scatter").entered();
-        let (w_plus, spine, cover, w_mem, w_bc) = (
-            Scatter::new(n),
-            Scatter::new(n),
-            Scatter::new(n),
-            Scatter::new(n),
-            Scatter::new(n),
-        );
-        for t in 0..tables::N_TABLES {
-            let (plan, cols, omega, n_t) = (&plans[t], local(t), &omegas[t], rows[t]);
-            let pointer = |c: usize| index_words(t, c, &words(cols[c])[..n_t]);
-            let cycle = pointer(plan.links.state.cycle);
-            w_plus.add_words(&chunks, &cycle, 1, |u| omega[u]);
-            spine.add_words(&chunks, &cycle, 0, |u| state_at(t, u));
-            cover.add_words(&chunks, &cycle, 0, |_| F192::ONE);
-            for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
-                let (words, s) = (pointer(access.pointer), access.shift);
-                match access.gate {
-                    None => w_mem.add_words(&chunks, &words, s, |u| mu * omega[u]),
-                    Some(g) => w_mem.add_words(&chunks, &words, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
+        let fill = |lens: [usize; 5]| {
+            let arrays = lens.map(Scatter::new);
+            let [w_plus, spine, cover, w_mem, w_bc] = &arrays;
+            for t in 0..tables::N_TABLES {
+                let (plan, cols, omega, n_t) = (&plans[t], local(t), &omegas[t], rows[t]);
+                let pointer = |c: usize| index_words(t, c, &words(cols[c])[..n_t]);
+                let cycle = pointer(plan.links.state.cycle);
+                w_plus.add_words(&chunks, &cycle, 1, |u| omega[u]);
+                spine.add_words(&chunks, &cycle, 0, |u| state_at(t, u));
+                cover.add_words(&chunks, &cycle, 0, |_| F192::ONE);
+                for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
+                    let (words, s) = (pointer(access.pointer), access.shift);
+                    match access.gate {
+                        None => w_mem.add_words(&chunks, &words, s, |u| mu * omega[u]),
+                        Some(g) => w_mem.add_words(&chunks, &words, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
+                    }
                 }
+                w_bc.add_words(&chunks, &pointer(plan.links.bytecode.pointer), 0, |u| omega[u]);
             }
-            w_bc.add_words(&chunks, &pointer(plan.links.bytecode.pointer), 0, |u| omega[u]);
+            arrays
+        };
+        // Sized for an honest execution's indices: cycles and their successors, memory cells and bytecode
+        // entries. An index past these makes the arrays again at the full `2^W`.
+        let mut arrays = fill([cycles + 1, cycles + 1, cycles + 1, 1 << log_mem, bytecode_size].map(|l| l.min(n)));
+        if arrays.iter().any(Scatter::overflowed) {
+            arrays = fill([n; 5]);
         }
+        let [w_plus, spine, cover, w_mem, w_bc] = arrays;
         let mut spine = spine.into_vec();
         if spine.len() <= cycles {
             spine.resize(cycles + 1, F192::ZERO);
