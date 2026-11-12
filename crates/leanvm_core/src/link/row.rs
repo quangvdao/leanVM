@@ -352,7 +352,7 @@ fn is_zero_pair(p: (F192, F192)) -> bool {
 }
 
 /// `c(X)·Φ_0(X) + Σ_g c_g(X)·Φ_g(X)` for one column at one pair, added to `acc`: the pointer under its coefficient
-/// and each shift group under its own. `pair(k)` is value slot `k` at the two rows; with `skip`, a chunk whose
+/// and each shift group under its own, each coefficient linear and given by its coefficients. `pair(k)` is value slot `k` at the two rows; with `skip`, a chunk whose
 /// `same(i)` holds is a constant factor `first(i)`.
 ///
 /// A group's chain starts at chunk 0 with one state per carry passed on. Once no carry is left, every group's value
@@ -362,8 +362,8 @@ fn is_zero_pair(p: (F192, F192)) -> bool {
 fn pointer_pair(
     acc: &mut Poly,
     slots: &Slots,
-    coef: [F192; 3],
-    groups: &[[F192; 3]],
+    coef: &[F192],
+    groups: &[[F192; 2]],
     skip: bool,
     same: impl Fn(usize) -> bool,
     first: impl Fn(usize) -> F192,
@@ -371,8 +371,8 @@ fn pointer_pair(
 ) {
     let d = slots.d;
     let mut p = [F192::ZERO; MAX_COEFFS];
-    p[..3].copy_from_slice(&coef);
-    let mut len = 3;
+    p[..coef.len()].copy_from_slice(coef);
+    let mut len = coef.len();
     let mut start = 0;
     let live = groups.iter().any(|g| g.iter().any(|c| !c.is_zero()));
     if live {
@@ -385,16 +385,16 @@ fn pointer_pair(
                 continue;
             }
             let mut gp = [F192::ZERO; MAX_COEFFS];
-            gp[..3].copy_from_slice(gc);
+            gp[..2].copy_from_slice(gc);
             for c in 0..=slots.carry {
                 let e = pair(slots.start(g, c));
                 if is_zero_pair(e) {
                     continue;
                 }
                 if c == 0 {
-                    len = add_mul_pair(&mut p, len, &gp, 3, e);
+                    len = add_mul_pair(&mut p, len, &gp, 2, e);
                 } else {
-                    carry_len[c - 1] = add_mul_pair(&mut carries[c - 1], carry_len[c - 1], &gp, 3, e);
+                    carry_len[c - 1] = add_mul_pair(&mut carries[c - 1], carry_len[c - 1], &gp, 2, e);
                 }
             }
         }
@@ -446,7 +446,7 @@ fn pointer_pair(
     add_into(acc, &p[..len]);
 }
 
-/// `ω(X)·Σ_i ε_i·(D_i(ρ)·D_i(1 + ρ) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
+/// `Σ_i ε_i·(D_i(ρ)·D_i(1 + ρ) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
 /// that is one one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds
 /// `b·b̄·(X + X²)`, and one whose values agree (`same`) a constant.
 #[inline(always)]
@@ -454,7 +454,6 @@ fn pointer_pair(
 fn cert_pair(
     acc: &mut Poly,
     slots: &Slots,
-    omega: (F192, F192),
     cert: &[F192],
     mirrors: &[F192],
     skip: bool,
@@ -464,12 +463,10 @@ fn cert_pair(
     pair: impl Fn(usize) -> (F192, F192),
 ) {
     let mut m = [F192::ZERO; 3];
-    let mut any = false;
     for i in 0..slots.d {
         if skip && clean(i) {
             continue;
         }
-        any = true;
         let (x, y, eps) = (pair(slots.rho(i)), pair(slots.rho_bar(i)), cert[i]);
         if skip && one_hot(i) {
             let t = eps * (x.0 + x.1) * (y.0 + y.1);
@@ -484,9 +481,7 @@ fn cert_pair(
             m[2] += eps * q[2];
         }
     }
-    if any {
-        add_weighted(acc, omega, m);
-    }
+    add_into(acc, &m);
 }
 
 /// `ω(X)·m(X)` added to `acc`, `m` of three coefficients.
@@ -499,24 +494,17 @@ fn add_weighted(acc: &mut Poly, omega: (F192, F192), m: [F192; 3]) {
     acc[3] += w1 * m[2];
 }
 
-/// The coefficient of a column at a pair of rows: `ω(X)·(constant + aux(X)) + act(X)·(constant + aux(X))`.
+/// A coefficient at a pair of rows, `constant + aux(X)`, by its coefficients in `X`: one when it is constant.
 #[inline(always)]
-fn coef_poly(omega: (F192, F192), act: (F192, F192), aux: &[(F192, F192)], c_omega: Coef, c_act: Coef) -> [F192; 3] {
-    let weight = |c: Coef| match c.aux {
-        None => (c.constant, c.constant),
-        Some((a, s)) => (c.constant + s * aux[a].0, c.constant + s * aux[a].1),
-    };
-    let mut out = [F192::ZERO; 3];
-    for (w, c) in [(omega, c_omega), (act, c_act)] {
-        if is_zero_pair(w) || c.is_zero() {
-            continue;
-        }
-        let p = pair_product(w, weight(c));
-        for (o, v) in out.iter_mut().zip(p) {
-            *o += v;
+fn coef_linear(c: Coef, aux: &[(F192, F192)]) -> ([F192; 2], usize) {
+    match c.aux {
+        None => ([c.constant, F192::ZERO], 1),
+        Some((a, s)) => {
+            let (a0, a1) = aux[a];
+            let lo = c.constant + s * a0;
+            ([lo, s * (a0 + a1)], 2)
         }
     }
-    out
 }
 
 /// The summand at one bound point from a column's values laid out by `slots`: `c·Φ_0 + Σ_g c_g·Φ_g +
@@ -720,15 +708,28 @@ impl<'a> Column<'a> {
         self.tags = tags;
     }
 
-    /// The coefficient polynomials of `Φ_0` and of each group at a pair.
+    /// Add the column's terms at a pair: those under `ω` to `omega`, those under `act` to `act`, each without its
+    /// weight. `pointer(acc, coef, groups)` adds a pointer term, `cert(acc)` the certificate's.
     #[inline(always)]
-    fn coefs(&self, omega: (F192, F192), act: (F192, F192), aux: &[(F192, F192)]) -> ([F192; 3], [[F192; 3]; 4]) {
-        let coef = coef_poly(omega, act, aux, self.omega, self.act);
-        let mut groups = [[F192::ZERO; 3]; 4];
+    fn add_terms(
+        &self,
+        aux: &[(F192, F192)],
+        omega: &mut Poly,
+        act: &mut Poly,
+        mut pointer: impl FnMut(&mut Poly, &[F192], &[[F192; 2]]),
+        cert: impl FnOnce(&mut Poly),
+    ) {
+        let mut groups = [[F192::ZERO; 2]; 4];
         for (o, g) in groups.iter_mut().zip(&self.shifts) {
-            *o = coef_poly(omega, (F192::ZERO, F192::ZERO), aux, g.coef, Coef::ZERO);
+            *o = coef_linear(g.coef, aux).0;
         }
-        (coef, groups)
+        let (coef, len) = coef_linear(self.omega, aux);
+        pointer(omega, &coef[..len], &groups[..self.shifts.len()]);
+        if !self.act.is_zero() {
+            let (coef, len) = coef_linear(self.act, aux);
+            pointer(act, &coef[..len], &[]);
+        }
+        cert(omega);
     }
 
     /// The coefficient of `Φ_0`, of each shift `s` (at `s - 1`), and the certificate weights at a table's end, times
@@ -765,6 +766,8 @@ struct State<'a> {
     /// The table's value once its rows are bound, and the corner factor since.
     done: Option<(F192, F192)>,
     base: Option<Base<'a>>,
+    /// Whether a column has a term under `act_F`.
+    any_act: bool,
 }
 
 impl<'a> State<'a> {
@@ -812,7 +815,9 @@ impl<'a> State<'a> {
             bound: Vec::new(),
             done: None,
             base: table.base,
+            any_act: false,
         };
+        state.any_act = state.columns.iter().any(|c| !c.act.is_zero());
         if state.log_rows == 0 {
             // One row: its values are the table's end from the start.
             for column in &mut state.columns {
@@ -877,13 +882,19 @@ impl<'a> State<'a> {
                     }
                     let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
                     let aux = self.aux_pair(k);
+                    // The columns' terms under each weight, summed before the weight multiplies them.
+                    let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
                     for (column, tables) in self.columns.iter().zip(&tables) {
+                        let sums = (&mut under_omega, &mut under_act);
                         match &column.values {
-                            None => Self::pair_words(
-                                column, tables, &weights, k, omega, act, &aux, chunks, points, skip, acc,
-                            ),
-                            Some(values) => Self::pair_folded(column, values, k, omega, act, &aux, points, skip, acc),
+                            None => Self::pair_words(column, tables, &weights, k, &aux, chunks, points, skip, sums),
+                            Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
                         }
+                    }
+                    let len = chunks.d() + 2;
+                    add_mul_pair(acc, 0, &under_omega, len, omega);
+                    if self.any_act {
+                        add_mul_pair(acc, 0, &under_act, len, act);
                     }
                 }
             },
@@ -902,13 +913,11 @@ impl<'a> State<'a> {
         tables: &[(usize, &[F192])],
         weights: &[F192],
         k: usize,
-        omega: (F192, F192),
-        act: (F192, F192),
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
         skip: bool,
-        acc: &mut Poly,
+        (omega, act): (&mut Poly, &mut Poly),
     ) {
         let n = weights.len();
         let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
@@ -929,29 +938,36 @@ impl<'a> State<'a> {
                 group_value(chunks, table, i, hi, hi_bits[i], weights),
             )
         };
-        let (coef, groups) = column.coefs(omega, act, aux);
         let slots = &column.slots;
-        pointer_pair(
-            acc,
-            slots,
-            coef,
-            &groups[..column.shifts.len()],
-            skip,
-            same,
-            |i| points.eq.eval(chunks, lo[0], i),
-            pair,
-        );
-        cert_pair(
-            acc,
-            slots,
+        column.add_terms(
+            aux,
             omega,
-            &column.cert,
-            &points.mirrors,
-            skip,
-            |i| same(i) && lo_bits[i].is_some_and(u64::is_power_of_two),
-            one_hot,
-            same,
-            pair,
+            act,
+            |acc, coef, groups| {
+                pointer_pair(
+                    acc,
+                    slots,
+                    coef,
+                    groups,
+                    skip,
+                    same,
+                    |i| points.eq.eval(chunks, lo[0], i),
+                    pair,
+                )
+            },
+            |acc| {
+                cert_pair(
+                    acc,
+                    slots,
+                    &column.cert,
+                    &points.mirrors,
+                    skip,
+                    |i| same(i) && lo_bits[i].is_some_and(u64::is_power_of_two),
+                    one_hot,
+                    same,
+                    pair,
+                )
+            },
         );
     }
 
@@ -961,44 +977,26 @@ impl<'a> State<'a> {
         column: &Column,
         values: &Strided,
         k: usize,
-        omega: (F192, F192),
-        act: (F192, F192),
         aux: &[(F192, F192)],
         points: &RowPoints,
         skip: bool,
-        acc: &mut Poly,
+        (omega, act): (&mut Poly, &mut Poly),
     ) {
         let slots = &column.slots;
         let d = slots.d;
         let (lo, hi) = (values.row(2 * k), values.row(2 * k + 1));
         let pair = |slot: usize| (lo[slot], hi[slot]);
-        let (coef, groups) = column.coefs(omega, act, aux);
-        pointer_pair(
-            acc,
-            slots,
-            coef,
-            &groups[..column.shifts.len()],
-            skip,
-            |i| lo[i] == hi[i],
-            |i| lo[i],
-            pair,
-        );
         let clean = |i: usize| {
             let t = tag(&column.tags, d, 2 * k, i);
             t != MIXED && t == tag(&column.tags, d, 2 * k + 1, i)
         };
         let same = |i: usize| lo[slots.rho(i)] == hi[slots.rho(i)] && lo[slots.rho_bar(i)] == hi[slots.rho_bar(i)];
-        cert_pair(
-            acc,
-            slots,
+        column.add_terms(
+            aux,
             omega,
-            &column.cert,
-            &points.mirrors,
-            skip,
-            clean,
-            |_| false,
-            same,
-            pair,
+            act,
+            |acc, coef, groups| pointer_pair(acc, slots, coef, groups, skip, |i| lo[i] == hi[i], |i| lo[i], pair),
+            |acc| cert_pair(acc, slots, &column.cert, &points.mirrors, skip, clean, |_| false, same, pair),
         );
     }
 
@@ -1216,13 +1214,11 @@ fn prove_columns(
         for k in 0..columns.len() / 2 {
             let (lo, hi) = (&columns[2 * k], &columns[2 * k + 1]);
             let pair = |slot: usize| (lo.2[slot], hi.2[slot]);
-            let groups: Vec<[F192; 3]> = (0..n_shifts)
-                .map(|s| [lo.1[s], lo.1[s] + hi.1[s], F192::ZERO])
-                .collect();
+            let groups: Vec<[F192; 2]> = (0..n_shifts).map(|s| [lo.1[s], lo.1[s] + hi.1[s]]).collect();
             pointer_pair(
                 &mut poly,
                 &slots,
-                [lo.0, lo.0 + hi.0, F192::ZERO],
+                &[lo.0, lo.0 + hi.0],
                 &groups,
                 false,
                 |_| false,
