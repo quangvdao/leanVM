@@ -874,16 +874,16 @@ impl<'a> State<'a> {
             |acc, task| {
                 for k in task * TASK_PAIRS..pairs.min((task + 1) * TASK_PAIRS) {
                     let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
+                    // The terms under each weight, summed before the weight multiplies them.
+                    let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
                     if let Some(base) = &self.base {
-                        base.pair(k, omega, acc);
+                        base.pair(k, !is_zero_pair(omega), &mut under_omega, acc);
                     }
                     if is_zero_pair(omega) && 2 * k >= self.act.len() {
                         continue;
                     }
                     let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
                     let aux = self.aux_pair(k);
-                    // The columns' terms under each weight, summed before the weight multiplies them.
-                    let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
                     for (column, tables) in self.columns.iter().zip(&tables) {
                         let sums = (&mut under_omega, &mut under_act);
                         match &column.values {
@@ -891,7 +891,7 @@ impl<'a> State<'a> {
                             Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
                         }
                     }
-                    let len = chunks.d() + 2;
+                    let len = (chunks.d() + 2).max(4);
                     add_mul_pair(acc, 0, &under_omega, len, omega);
                     if self.any_act {
                         add_mul_pair(acc, 0, &under_act, len, act);

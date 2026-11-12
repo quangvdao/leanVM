@@ -116,12 +116,13 @@ fn at(v: &[F192], i: usize) -> F192 {
     v.get(i).copied().unwrap_or(F192::ZERO)
 }
 
-/// `p ← p + w(X)·g(X)·f(X)` for linear `w`, `g` given at 0 and 1 and the quadratic `f` in coefficients.
+/// `p ← p + w(X)·g(X)·f(X)` for linear `w`, `g` given at 0 and 1, `w` one when absent, and the quadratic `f` in
+/// coefficients.
 #[inline(always)]
-fn add_block(acc: &mut [F192], w: (F192, F192), gate: Option<(F192, F192)>, f: [F192; 3]) {
+fn add_block(acc: &mut [F192], w: Option<(F192, F192)>, gate: Option<(F192, F192)>, f: [F192; 3]) {
     let mut p = [f[0], f[1], f[2], F192::ZERO, F192::ZERO];
     let mut len = 3;
-    for (a0, a1) in gate.into_iter().chain([w]) {
+    for (a0, a1) in gate.into_iter().chain(w) {
         let b = a0 + a1;
         p[len] = p[len - 1] * b;
         for j in (1..len).rev() {
@@ -275,18 +276,20 @@ impl<'a> Base<'a> {
         self.eq.is_some()
     }
 
-    /// Add the pair `(2k, 2k + 1)`'s round polynomial, `omega` the table's `ω_F` there.
+    /// Add the pair `(2k, 2k + 1)`'s round polynomial: the `ω` blocks without their weight to `omega` when
+    /// `with_omega`, the others to `acc`.
     #[inline(always)]
-    pub fn pair(&self, k: usize, omega: (F192, F192), acc: &mut [F192]) {
+    pub fn pair(&self, k: usize, with_omega: bool, omega: &mut [F192], acc: &mut [F192]) {
         let eq = self.eq.as_ref().map(|e| (at(e, 2 * k), at(e, 2 * k + 1)));
         self.with_row(2 * k, |lo| {
             self.with_row(2 * k + 1, |hi| {
                 for block in &self.blocks {
-                    let w = match block.weight {
-                        Weight::Omega => omega,
-                        Weight::Eq => eq.expect("an eq table"),
+                    let (out, w) = match block.weight {
+                        Weight::Omega if with_omega => (&mut *omega, None),
+                        Weight::Omega => continue,
+                        Weight::Eq => (&mut *acc, eq),
                     };
-                    if w.0.is_zero() && w.1.is_zero() {
+                    if w.is_some_and(|w| w.0.is_zero() && w.1.is_zero()) {
                         continue;
                     }
                     let (mut c0, mut c1, mut c2) = (F192Unreduced::ZERO, F192Unreduced::ZERO, F192Unreduced::ZERO);
@@ -299,7 +302,7 @@ impl<'a> Base<'a> {
                     let f0 = lo[block.linear] + c0.reduce();
                     let f1 = hi[block.linear] + c1.reduce();
                     let f2 = c2.reduce();
-                    add_block(acc, w, block.gate.map(|g| (lo[g], hi[g])), [f0, f0 + f1 + f2, f2]);
+                    add_block(out, w, block.gate.map(|g| (lo[g], hi[g])), [f0, f0 + f1 + f2, f2]);
                 }
             })
         });
@@ -445,7 +448,12 @@ mod tests {
         for _ in 0..m {
             let mut poly = [F192::ZERO; 5];
             for k in 0..explicit / 2 {
-                base.pair(k, (om[2 * k], om[2 * k + 1]), &mut poly);
+                let mut under = [F192::ZERO; 4];
+                base.pair(k, true, &mut under, &mut poly);
+                let (w0, w1) = (om[2 * k], om[2 * k] + om[2 * k + 1]);
+                for j in 0..5 {
+                    poly[j] += at(&under, j) * w0 + if j > 0 { under[j - 1] * w1 } else { F192::ZERO };
+                }
             }
             assert_eq!(claim, poly[1..].iter().copied().sum::<F192>());
             let x = rng.ext();
