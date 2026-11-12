@@ -28,21 +28,6 @@ fn words(column: &[F64]) -> &[u64] {
     unsafe { std::slice::from_raw_parts(column.as_ptr().cast(), column.len()) }
 }
 
-/// Test-only ways for the prover to cheat past its witness, for the negative tests: the word the index side scatters
-/// for one row of one pointer column, and a change to the memory term it sends.
-#[cfg(test)]
-pub(crate) mod cheat {
-    use primitives::field::F192;
-    use std::cell::Cell;
-
-    thread_local! {
-        /// `(table, local column, row, word)`: the index side scatters `word` for that row instead of its own.
-        pub(crate) static INDEX_WORD: Cell<Option<(usize, usize, usize, u64)>> = const { Cell::new(None) };
-        /// Added to `M_1` before it is sent.
-        pub(crate) static MEMORY_TERM: Cell<F192> = const { Cell::new(F192::ZERO) };
-    }
-}
-
 /// The words of a table's pointer column that the index side scatters: the column's own.
 #[cfg(not(test))]
 fn index_words(_: usize, _: usize, words: &[u64]) -> std::borrow::Cow<'_, [u64]> {
@@ -632,4 +617,19 @@ fn index_mle(point: &[F192]) -> F192 {
         g *= g;
     }
     out
+}
+
+/// Test-only ways for the prover to cheat past its witness, for the negative tests: the word the index side scatters
+/// for one row of one pointer column, and a change to the memory term it sends.
+#[cfg(test)]
+pub(crate) mod cheat {
+    use primitives::field::F192;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `(table, local column, row, word)`: the index side scatters `word` for that row instead of its own.
+        pub(crate) static INDEX_WORD: Cell<Option<(usize, usize, usize, u64)>> = const { Cell::new(None) };
+        /// Added to `M_1` before it is sent.
+        pub(crate) static MEMORY_TERM: Cell<F192> = const { Cell::new(F192::ZERO) };
+    }
 }

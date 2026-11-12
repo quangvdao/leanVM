@@ -144,7 +144,7 @@ impl Slots {
         Self { d, groups, carry }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn n_values(&self) -> usize {
         if self.groups == 0 {
             3 * self.d
         } else {
@@ -246,7 +246,7 @@ impl ColumnEnd {
         let starts: Vec<Vec<F192>> = (1..=points.shifts.max_shift)
             .flat_map(|s| points.shifts.start[s].clone())
             .collect();
-        let values = (0..slots.len())
+        let values = (0..slots.n_values())
             .map(|k| {
                 let (i, table) = slots.table(k, points, &starts);
                 from_slices(chunks, &slices, i, table)
@@ -623,7 +623,7 @@ impl<'a> Column<'a> {
     /// The column after round 1, folded at `x` straight from its words.
     fn materialize(&mut self, len: usize, x: F192, chunks: &Chunks, points: &RowPoints, skip: bool) {
         let d = chunks.d();
-        let s = self.slots.len();
+        let s = self.slots.n_values();
         let word = |u: usize| self.words.get(u).copied().unwrap_or(0);
         let mut values = vec![F192::ZERO; len * s];
         let this = &*self;
@@ -1082,7 +1082,7 @@ fn prove_columns(
         (
             F192::ZERO,
             vec![F192::ZERO; n_shifts],
-            vec![F192::ZERO; slots.len()],
+            vec![F192::ZERO; slots.n_values()],
             vec![F192::ZERO; d],
         )
     };
@@ -1214,16 +1214,16 @@ mod tests {
                     if u >= explicit {
                         return 0;
                     }
-                    if rng.next_u32() % 3 == 0 {
+                    if rng.next_u32().is_multiple_of(3) {
                         sigma = (sigma + rng.next_u32() as usize % 5) & mask;
                     }
-                    if rng.next_u32() % 7 == 0 {
+                    if rng.next_u32().is_multiple_of(7) {
                         // All ones in the low chunks, so the shift carries.
                         sigma |= (1 << (chunks.widths[0] + chunks.widths.get(1).copied().unwrap_or(0))) - 1;
                         sigma &= mask;
                     }
                     let word = chunks.encode(sigma);
-                    if rng.next_u32() % 11 == 0 {
+                    if rng.next_u32().is_multiple_of(11) {
                         word ^ 1 << (rng.next_u32() % 64)
                     } else {
                         word
@@ -1377,7 +1377,7 @@ mod tests {
                 let w = t.words[column][u];
                 let (co, ca, groups, _) = &t.coefs[column];
                 let weight = |c: &Coef| c.constant + c.aux.map_or(F192::ZERO, |(a, s)| s * aux(a));
-                let vals = (0..slots.len())
+                let vals = (0..slots.n_values())
                     .map(|k| {
                         let (i, table) = slots.table(k, &points, &starts);
                         eval_chunk(chunks_ref, table, w, i)
@@ -1441,7 +1441,7 @@ mod tests {
                 assert_eq!(table_end.base, table_base);
                 base += corner * table_base;
                 for column in 0..3 {
-                    let mut vals = vec![F192::ZERO; slots.len()];
+                    let mut vals = vec![F192::ZERO; slots.n_values()];
                     for (u, &e) in eqs.iter().enumerate() {
                         let (_, _, _, g) = row_value(t, u, column);
                         for (v, g) in vals.iter_mut().zip(g) {
@@ -1466,7 +1466,7 @@ mod tests {
             let mle = |f: &dyn Fn(usize) -> F192| (0..columns.len()).map(|q| eqq[q] * f(q)).sum::<F192>();
             let coef = mle(&|q| columns[q].0);
             let shifts: Vec<F192> = (0..max_shift).map(|s| mle(&|q| columns[q].1[s])).collect();
-            let vals: Vec<F192> = (0..slots.len()).map(|j| mle(&|q| columns[q].2[j])).collect();
+            let vals: Vec<F192> = (0..slots.n_values()).map(|j| mle(&|q| columns[q].2[j])).collect();
             let certs: Vec<F192> = (0..d).map(|i| mle(&|q| columns[q].3[i])).collect();
             let base_q: F192 = end.column_point.iter().map(|&x| F192::ONE + x).product();
             let last = summand(&slots, &points.mirrors, coef, &shifts, &vals, &certs);
