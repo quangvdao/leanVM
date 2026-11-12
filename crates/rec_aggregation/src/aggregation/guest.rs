@@ -46,6 +46,9 @@ fn frozen_placeholder_map() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// The guest compiled from the current layout's constants: the self-referential compile the port to Hotlink will
+/// restore in [`unified_guest`].
+#[allow(dead_code, reason = "unused until the guest verifies Hotlink proofs")]
 pub(super) fn compile_guest(kbc: usize) -> Program {
     compile_with(&placeholder_map(kbc))
 }
