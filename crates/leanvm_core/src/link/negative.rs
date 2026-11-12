@@ -71,13 +71,19 @@ fn program() -> Program {
         Op::Xor { a: 13, b: 16, c: 17 },
     ]);
     let frame = FIRST_FRAME as u32;
-    for (k, o) in [gw(FIRST_FRAME), gw(8), gw(0) + gw(n), gw(LOOP_PC), k_const, gw(1)].into_iter().zip(0..) {
+    for (k, o) in [gw(FIRST_FRAME), gw(8), gw(0) + gw(n), gw(LOOP_PC), k_const, gw(1)]
+        .into_iter()
+        .zip(0..)
+    {
         prog.push(Op::Set { o: frame + o, k });
     }
     prog.extend([
         Op::Set { o: 22, k: F192::ONE },
         Op::Set { o: 23, k: gw(LOOP_PC) },
-        Op::Set { o: 24, k: gw(FIRST_FRAME) },
+        Op::Set {
+            o: 24,
+            k: gw(FIRST_FRAME),
+        },
         Op::Jump { oc: 22, od: 23, of: 24 },
     ]);
     assert_eq!(prog.len(), LOOP_PC);
@@ -95,7 +101,10 @@ fn program() -> Program {
     prog.push(Op::Jump { oc: 2, od: 3, of: 8 });
     prog.extend([
         Op::Set { o: 16, k: F192::ONE },
-        Op::Set { o: 17, k: gw(PROGRAM_LEN - 1) },
+        Op::Set {
+            o: 17,
+            k: gw(PROGRAM_LEN - 1),
+        },
         Op::Jump { oc: 16, od: 17, of: 16 },
     ]);
     prog.resize(PROGRAM_LEN, Op::Xor { a: 0, b: 0, c: 0 });
@@ -143,11 +152,18 @@ fn other_bit(chunks: &Chunks, word: u64, i: usize) -> u64 {
 fn honest_proof_verifies() {
     let exec = program().execute(PI).expect("the program runs");
     assert!(exec.rows().iter().all(|&n| n > 0), "{:?}", exec.rows());
-    assert_eq!(outcome(|w| {
-        let width = w.layout.pointer_width;
-        assert!(width > w.log_mem && 1 << width > PROGRAM_LEN, "width {width}, memory 2^{}", w.log_mem);
-        assert!(chunks(w).d() > 1);
-    }), Ok(()));
+    assert_eq!(
+        outcome(|w| {
+            let width = w.layout.pointer_width;
+            assert!(
+                width > w.log_mem && 1 << width > PROGRAM_LEN,
+                "width {width}, memory 2^{}",
+                w.log_mem
+            );
+            assert!(chunks(w).d() > 1);
+        }),
+        Ok(())
+    );
 }
 
 #[test]
@@ -205,7 +221,10 @@ fn a_read_of_another_cell_with_the_same_value_is_rejected() {
     rejected(|w| {
         let (chunks, pointer) = (chunks(w), plan(SET).links.memory[0].pointer);
         let words = column(w, SET, pointer);
-        let row = words.iter().position(|v| chunks.decode(v.0) == Some(10)).expect("a SET writes cell 10");
+        let row = words
+            .iter()
+            .position(|v| chunks.decode(v.0) == Some(10))
+            .expect("a SET writes cell 10");
         words[row] = F64(chunks.encode(11));
     });
 }
@@ -226,7 +245,10 @@ fn a_non_one_hot_pointer_counts_on_executed_rows_only() {
         assert!(w.layout.rows[SET] < 1 << w.layout.taus[SET], "SET has padding rows");
         w.layout.rows[SET]
     };
-    assert_eq!(outcome(tamper(executed)), Err(CpuError::Verifier(VerifierError::LinkTerminal)));
+    assert_eq!(
+        outcome(tamper(executed)),
+        Err(CpuError::Verifier(VerifierError::LinkTerminal))
+    );
     assert_eq!(outcome(tamper(padding)), Ok(()));
 }
 
@@ -335,12 +357,19 @@ fn rows_of_two_tables_at_the_same_index_with_swapped_cycles_are_rejected() {
         let (x, m) = (plan(XOR).links, plan(MUL).links);
         let fp = column(w, XOR, x.state.fp)[0];
         assert_eq!(fp, column(w, MUL, m.state.fp)[0]);
-        for (cx, cm) in [(x.state.cycle, m.state.cycle), (x.state.pc, m.state.pc), (x.bytecode.pointer, m.bytecode.pointer)] {
+        for (cx, cm) in [
+            (x.state.cycle, m.state.cycle),
+            (x.state.pc, m.state.pc),
+            (x.bytecode.pointer, m.bytecode.pointer),
+        ] {
             let (a, b) = (column(w, XOR, cx)[0], column(w, MUL, cm)[0]);
             column(w, XOR, cx)[0] = b;
             column(w, MUL, cm)[0] = a;
         }
     };
     let (proof, _) = prove_tampered(&program, PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
-    assert_eq!(verify(&program, &PI, &proof).map(|_| ()), Err(CpuError::Verifier(VerifierError::LinkTerminal)));
+    assert_eq!(
+        verify(&program, &PI, &proof).map(|_| ()),
+        Err(CpuError::Verifier(VerifierError::LinkTerminal))
+    );
 }

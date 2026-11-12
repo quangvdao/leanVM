@@ -208,7 +208,10 @@ pub fn open_batch_mixed_whir_stacked(
             piece.offset.is_multiple_of(len),
             "a ring piece's offset must be 2^|point|-aligned"
         );
-        assert!(piece.offset + len <= stack.len(), "a ring piece must fit inside the stack");
+        assert!(
+            piece.offset + len <= stack.len(),
+            "a ring piece must fit inside the stack"
+        );
     }
     assert!(
         point_claims.iter().all(|c| c.end() <= stack.len()),
@@ -263,8 +266,8 @@ pub fn open_batch_mixed_whir_stacked(
     let lane_vars = log_n - config.initial_k;
     let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
     let (points, scales) = flatten(point_claims, lambdas_pd);
-    let initial_basis =
-        tracing::info_span!("Basis").in_scope(|| basis::initial_basis(&stack, lane_vars, &points, &scales, ring, &rings));
+    let initial_basis = tracing::info_span!("Basis")
+        .in_scope(|| basis::initial_basis(&stack, lane_vars, &points, &scales, ring, &rings));
 
     // 4. One WHIR over the full stack against the combined claim (the
     //    prover takes the stack; no copy).

@@ -42,7 +42,11 @@ impl Sparse {
     /// The form at one row, from its columns' values.
     fn at(&self, value: impl Fn(usize) -> F192) -> F192 {
         let linear = self.linear.iter().map(|&(c, w)| w * value(c)).sum::<F192>();
-        let products = self.products.iter().map(|&(a, b, w)| w * value(a) * value(b)).sum::<F192>();
+        let products = self
+            .products
+            .iter()
+            .map(|&(a, b, w)| w * value(a) * value(b))
+            .sum::<F192>();
         self.constant + linear + products
     }
 }
@@ -95,7 +99,13 @@ impl<'a> Base<'a> {
         let mut used: Vec<usize> = blocks
             .iter()
             .flat_map(|b| {
-                let linear = b.form.coeffs.iter().enumerate().filter(|(_, c)| !c.is_zero()).map(|(i, _)| i);
+                let linear = b
+                    .form
+                    .coeffs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.is_zero())
+                    .map(|(i, _)| i);
                 let products = b.form.prods.iter().flat_map(|&(x, y, _)| [x, y]);
                 linear.chain(products).chain(b.gate).collect::<Vec<_>>()
             })
@@ -168,7 +178,9 @@ impl<'a> Base<'a> {
     #[inline(always)]
     fn value(&self, c: usize, u: usize) -> F192 {
         match &self.folded {
-            None => self.columns[self.used[c]].get(u).map_or(self.tail[c], |&v| F192::from(v)),
+            None => self.columns[self.used[c]]
+                .get(u)
+                .map_or(self.tail[c], |&v| F192::from(v)),
             Some(rows) => {
                 let n = self.used.len();
                 rows.get(u * n + c).copied().unwrap_or(self.tail[c])
@@ -247,7 +259,10 @@ impl<'a> Base<'a> {
 
     /// The used columns at the table's end, by local index.
     pub fn values(&self) -> impl Iterator<Item = (usize, F192)> + '_ {
-        self.used.iter().enumerate().map(|(c, &local)| (local, self.value(c, 0)))
+        self.used
+            .iter()
+            .enumerate()
+            .map(|(c, &local)| (local, self.value(c, 0)))
     }
 }
 
@@ -264,7 +279,11 @@ mod tests {
         let (m, rows, n_cols) = (4usize, 11usize, 5usize);
         let padrow: Vec<F64> = vec![F64::ZERO; n_cols];
         let columns: Vec<Vec<F64>> = (0..n_cols)
-            .map(|_| (0..1 << m).map(|u| if u < 13 { F64(rng.next_u64()) } else { F64::ZERO }).collect())
+            .map(|_| {
+                (0..1 << m)
+                    .map(|u| if u < 13 { F64(rng.next_u64()) } else { F64::ZERO })
+                    .collect()
+            })
             .collect();
         let form = |rng: &mut Rng| {
             let mut f = BusForm::new(n_cols);
@@ -279,13 +298,27 @@ mod tests {
         let mut eq_form = form(&mut rng);
         eq_form.constant = F192::ZERO;
         let blocks = vec![
-            Block { weight: Weight::Omega, gate: None, form: form(&mut rng) },
-            Block { weight: Weight::Omega, gate: Some(3), form: form(&mut rng) },
-            Block { weight: Weight::Eq, gate: None, form: eq_form },
+            Block {
+                weight: Weight::Omega,
+                gate: None,
+                form: form(&mut rng),
+            },
+            Block {
+                weight: Weight::Omega,
+                gate: Some(3),
+                form: form(&mut rng),
+            },
+            Block {
+                weight: Weight::Eq,
+                gate: None,
+                form: eq_form,
+            },
         ];
         let tau = rng.ext_vec(m);
         let eq = eq_table(&tau);
-        let omega: Vec<F192> = (0..1 << m).map(|u| if u < rows { rng.ext() } else { F192::ZERO }).collect();
+        let omega: Vec<F192> = (0..1 << m)
+            .map(|u| if u < rows { rng.ext() } else { F192::ZERO })
+            .collect();
         let row_value = |u: usize, omega_u: F192, eq_u: F192, col: &dyn Fn(usize) -> F192| -> F192 {
             let _ = u;
             blocks
@@ -319,7 +352,9 @@ mod tests {
             assert_eq!(claim, poly[1..].iter().copied().sum::<F192>());
             let x = rng.ext();
             claim = poly_eval(&poly, x);
-            om = (0..om.len() / 2).map(|k| om[2 * k] + x * (om[2 * k] + om[2 * k + 1])).collect();
+            om = (0..om.len() / 2)
+                .map(|k| om[2 * k] + x * (om[2 * k] + om[2 * k + 1]))
+                .collect();
             explicit /= 2;
             base.fold(explicit, x);
             point.push(x);

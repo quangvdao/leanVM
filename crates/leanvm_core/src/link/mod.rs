@@ -8,10 +8,10 @@
 //! one-hot; one-hot addressing follows Shout (Setty and Thaler); the shift by one of the cycle pointer uses the
 //! carry matrices of Binary Jolt's precompile link.
 
-pub mod index;
 pub mod base;
-pub(crate) mod prove;
+pub mod index;
 pub mod pointer;
+pub(crate) mod prove;
 pub mod row;
 
 #[cfg(test)]

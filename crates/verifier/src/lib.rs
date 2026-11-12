@@ -290,7 +290,12 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     // the permutation's output: they leave the batch, their columns having no placement.
     let (point, values) = &link.columns[OP_KECCAK];
     let lanes: Vec<E> = (KECCAK_OUT..KECCAK_OUT + STATE_LANES)
-        .map(|lane| values.iter().find(|&&(local, _)| local == lane).map(|&(_, value)| value))
+        .map(|lane| {
+            values
+                .iter()
+                .find(|&&(local, _)| local == lane)
+                .map(|&(_, value)| value)
+        })
         .collect::<Option<_>>()
         .expect("the output lanes are no pointers");
     let keccak_start = transcript.stream_offset();
