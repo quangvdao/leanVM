@@ -1,6 +1,6 @@
 //! Ring switching: the 64 slice claims a reduction leaves become one claim on the committed columns.
 
-use crate::field::{E, GEN, ONE, ZERO};
+use crate::field::{E, GEN, ONE};
 use crate::layout::K_BITS;
 use crate::multilinear::{Placement, poly_eval};
 use crate::transcript::Transcript;
@@ -16,23 +16,41 @@ fn ring_map(mut value: E, challenges: &[E]) -> E {
     value
 }
 
-/// The weight `W(u) = Phi(a eq(r, u))`, extended and evaluated by the opening at `r_prime`:
-/// `sum_k c_k a^(2^k) prod_n (1 + r_n^(2^k) + r'_n)`.
-fn ring_weight(r: &[E], scale: E, r_prime: &[E], coefficients: &[E]) -> E {
-    assert_eq!(r.len(), r_prime.len());
-    let mut total = ZERO;
-    let mut frobenius = r.to_vec();
-    let mut scale = scale;
-    for &c in coefficients {
-        let mut product = c * scale;
-        for (value, &challenge) in frobenius.iter_mut().zip(r_prime) {
-            product *= ONE + *value + challenge;
-            *value = value.square();
-        }
-        total += product;
-        scale = scale.square();
-    }
-    total
+/// The Frobenius powers `x^(2^k)` for `k < 64`.
+fn frobenius(mut x: E) -> Vec<E> {
+    (0..K_BITS)
+        .map(|_| {
+            let power = x;
+            x = x.square();
+            power
+        })
+        .collect()
+}
+
+/// The pieces at one point: the point's Frobenius powers, coordinate by coordinate, and each piece's placement and
+/// the Frobenius powers of its scale.
+struct PointGroup {
+    point: Vec<Vec<E>>,
+    pieces: Vec<(Option<Placement>, Vec<E>)>,
+}
+
+/// The weight `W(u) = sum_p Phi(scale_p eq(r_p, u))`, extended and evaluated by the opening at `x`:
+/// `sum_k c_k prod_n (1 + r_n^(2^k) + x_n) sum_p above_p(x) scale_p^(2^k)`, the product shared by the pieces at
+/// one point.
+fn ring_weight(groups: &[PointGroup], x: &[E], coefficients: &[E]) -> E {
+    E::sum(groups.iter().map(|group| {
+        let n = group.point.len();
+        let aboves: Vec<E> = group
+            .pieces
+            .iter()
+            .map(|(placement, _)| placement.map_or(ONE, |placement| placement.eq_above(x)))
+            .collect();
+        E::sum(coefficients.iter().enumerate().map(|(k, &c)| {
+            let product = group.point.iter().zip(&x[..n]).fold(c, |acc, (powers, &x)| acc * (ONE + powers[k] + x));
+            let scales = E::sum(group.pieces.iter().zip(&aboves).map(|((_, powers), &above)| above * powers[k]));
+            product * scales
+        }))
+    }))
 }
 
 /// One piece of a ring-switched claim: the slices of the columns at `placement` (the whole stack for `None`) at
@@ -72,14 +90,23 @@ pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Vec<R
         .map(|claim| {
             let images: Vec<E> = claim.slices.iter().map(|&value| ring_map(value, &challenges)).collect();
             let target = poly_eval(&images, GEN);
+            let mut groups: Vec<PointGroup> = Vec::new();
+            let mut points: Vec<Vec<E>> = Vec::new();
+            for piece in claim.pieces {
+                let scale = frobenius(piece.scale);
+                match points.iter().position(|p| *p == piece.point) {
+                    Some(g) => groups[g].pieces.push((piece.placement, scale)),
+                    None => {
+                        groups.push(PointGroup {
+                            point: piece.point.iter().map(|&r| frobenius(r)).collect(),
+                            pieces: vec![(piece.placement, scale)],
+                        });
+                        points.push(piece.point);
+                    }
+                }
+            }
             let coefficients = coefficients.clone();
-            let weight = move |x: &[E]| {
-                E::sum(claim.pieces.iter().map(|piece| {
-                    let n = piece.point.len();
-                    let above = piece.placement.map_or(ONE, |placement| placement.eq_above(x));
-                    above * ring_weight(&piece.point, piece.scale, &x[..n], &coefficients)
-                }))
-            };
+            let weight = move |x: &[E]| ring_weight(&groups, x, &coefficients);
             (Box::new(weight) as Box<dyn Fn(&[E]) -> E>, target)
         })
         .collect()
