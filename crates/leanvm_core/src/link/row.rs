@@ -1416,26 +1416,31 @@ pub fn prove(
     let mut point = Vec::with_capacity(n_rounds);
     let mut claim = None;
     let rounds = tracing::info_span!("Row rounds").entered();
-    for _ in 0..n_rounds {
+    for h in 0..n_rounds {
+        let _round = tracing::info_span!("Row round", round = h).entered();
         let mut poly = [F192::ZERO; MAX_COEFFS];
-        for state in &states {
-            match state.done {
-                None => add_into(&mut poly, &state.round(chunks, points, skip)),
-                Some((value, corner)) => {
-                    poly[0] += value * corner;
-                    poly[1] += value * corner;
+        tracing::info_span!("Sum").in_scope(|| {
+            for state in &states {
+                match state.done {
+                    None => add_into(&mut poly, &state.round(chunks, points, skip)),
+                    Some((value, corner)) => {
+                        poly[0] += value * corner;
+                        poly[1] += value * corner;
+                    }
                 }
             }
-        }
+        });
         debug_assert!(claim.is_none_or(|c: F192| c == poly[1..].iter().copied().sum::<F192>()));
         let x = round(&poly[..n_coeffs]);
         claim = Some(primitives::multilinear::poly_eval(&poly[..n_coeffs], x));
-        for state in &mut states {
-            match &mut state.done {
-                None => state.fold(x, chunks, points),
-                Some((_, corner)) => *corner *= F192::ONE + x,
+        tracing::info_span!("Fold").in_scope(|| {
+            for state in &mut states {
+                match &mut state.done {
+                    None => state.fold(x, chunks, points),
+                    Some((_, corner)) => *corner *= F192::ONE + x,
+                }
             }
-        }
+        });
         point.push(x);
     }
 
