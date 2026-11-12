@@ -7,12 +7,13 @@
 //!
 //! A pointer column `q` of table `F` contributes, at row `u`,
 //!
-//! `c_q(u)·Φ_0(u; r) + c⁺_q(u)·Φ_1(u; r) + ω_F(u)·Σ_i ε_{q,i}·(D_i(u; ρ_i)·D_i(u; 1 + ρ_i) + π_{w_i}(ρ_i))`,
+//! `c_q(u)·Φ_0(u; r) + c⁺_q(u)·Φ_1(u; r) + ω_F(u)·Σ_i ε_{q,i}·(D_i(u; r_i)·D_i(u; 1 + r_i) + π_{w_i}(r_i))`,
 //!
 //! the column's coefficient `c_q = ω_F·(constant + aux) + act_F·(constant + aux)` times the pointer at the index
 //! point `r`, the cycle pointer's `c⁺_q = α_+·ω_F` times the pointer shifted by one (carry matrices, from Binary
 //! Jolt's precompile link), plus the mirror certificate (the mirror test of Emile Wambsgans), which vanishes on every executed row whose chunks
-//! are one-hot. Two rows whose chunk agrees make that chunk's factor constant in the round that pairs them, and
+//! are one-hot. The certificate reads chunk `i` at the same coordinates `r_i` as the pointer, so the two share
+//! `D_i(r_i)`. Two rows whose chunk agrees make that chunk's factor constant in the round that pairs them, and
 //! leave its certificate term zero: the prover skips both (equal-value skipping), and a chunk that agrees across a
 //! whole folded group keeps a tag saying so.
 //!
@@ -116,32 +117,28 @@ pub struct RowTable<'a> {
 }
 
 /// The functionals the row side evaluates pointers with: `D_i` at the index point `r`, the shift tables there, and
-/// `D_i` at the certificate point `ρ` and at `1 + ρ`.
+/// `D_i` at `1 + r` for the certificate.
 pub struct RowPoints {
     pub eq: ChunkEq,
-    pub cert: ChunkEq,
-    pub cert_bar: ChunkEq,
+    pub bar: ChunkEq,
     pub shifts: Shifts,
-    /// `π_{w_i}(ρ)` per chunk.
+    /// `π_{w_i}(r_i)` per chunk.
     pub mirrors: Vec<F192>,
-    /// Per chunk, `D_i(ρ)·D_i(1 + ρ)` over a pair of one-hot values `v ≠ v'` in `X + X²`: entry `v·2^{w_i} + v'`
-    /// is `e_v·ē_{v'} + e_{v'}·ē_v` for the certificate tables `e` and `ē`.
+    /// Per chunk, `D_i(r_i)·D_i(1 + r_i)` over a pair of one-hot values `v ≠ v'` in `X + X²`: entry
+    /// `v·2^{w_i} + v'` is `e_v·ē_{v'} + e_{v'}·ē_v` for the tables `e` at `r_i` and `ē` at `1 + r_i`.
     pub cert_pairs: Vec<Vec<F192>>,
     /// `eq(r, ·)` over whole pointers.
     pub split: SplitEq,
 }
 
 impl RowPoints {
-    pub fn new(chunks: &Chunks, r: &[F192], rho: &[F192], max_shift: usize) -> Self {
+    pub fn new(chunks: &Chunks, r: &[F192], max_shift: usize) -> Self {
         let eq = ChunkEq::at(chunks, r);
-        let (cert, cert_bar) = (
-            ChunkEq::certificate(chunks, rho, false),
-            ChunkEq::certificate(chunks, rho, true),
-        );
-        let cert_pairs = cert
+        let bar = ChunkEq::mirrored(chunks, r);
+        let cert_pairs = eq
             .tables
             .iter()
-            .zip(&cert_bar.tables)
+            .zip(&bar.tables)
             .map(|(e, f)| {
                 let n = e.len();
                 (0..n * n)
@@ -154,11 +151,10 @@ impl RowPoints {
             .collect();
         Self {
             shifts: Shifts::new(chunks, &eq, max_shift),
+            mirrors: (0..chunks.d()).map(|i| mirror(chunks.part(r, i))).collect(),
             eq,
-            cert,
-            cert_bar,
+            bar,
             cert_pairs,
-            mirrors: chunks.widths.iter().map(|&w| mirror(&rho[..w])).collect(),
             split: SplitEq::new(r, max_shift),
         }
     }
@@ -170,7 +166,7 @@ impl RowPoints {
     }
 }
 
-/// Where a column's chunk functionals sit among its values: `D_i` at `r`, at `ρ` and at `1 + ρ` (`d` each), then
+/// Where a column's chunk functionals sit among its values: `D_i` at `r` and at `1 + r` (`d` each), then
 /// per shift group chunk 0's table for each carry it passes on, then per later chunk its carry tables.
 #[derive(Clone, Copy, Debug)]
 pub struct Slots {
@@ -186,7 +182,7 @@ impl Slots {
 
     pub fn n_values(&self) -> usize {
         if self.groups == 0 {
-            3 * self.d
+            2 * self.d
         } else {
             self.links(1) + 2 * self.carry * (self.d - 1)
         }
@@ -198,24 +194,19 @@ impl Slots {
     }
 
     #[inline(always)]
-    fn rho(&self, i: usize) -> usize {
+    fn bar(&self, i: usize) -> usize {
         self.d + i
     }
 
     #[inline(always)]
-    fn rho_bar(&self, i: usize) -> usize {
-        2 * self.d + i
-    }
-
-    #[inline(always)]
     fn start(&self, g: usize, c: usize) -> usize {
-        3 * self.d + g * (self.carry + 1) + c
+        2 * self.d + g * (self.carry + 1) + c
     }
 
     /// The first carry table of chunk `i ≥ 1`; carry `c ≥ 1` in and `out` on is `2·(c − 1) + out` past it.
     #[inline(always)]
     fn links(&self, i: usize) -> usize {
-        3 * self.d + self.groups * (self.carry + 1) + (i - 1) * 2 * self.carry
+        2 * self.d + self.groups * (self.carry + 1) + (i - 1) * 2 * self.carry
     }
 
     #[inline(always)]
@@ -227,11 +218,11 @@ impl Slots {
     #[inline(always)]
     fn table<'b>(&self, k: usize, points: &'b RowPoints, starts: &'b [Vec<F192>]) -> (usize, &'b [F192]) {
         let d = self.d;
-        if k < 3 * d {
-            let t = [&points.eq, &points.cert, &points.cert_bar][k / d];
+        if k < 2 * d {
+            let t = [&points.eq, &points.bar][k / d];
             return (k % d, &t.tables[k % d]);
         }
-        let k = k - 3 * d;
+        let k = k - 2 * d;
         let n_starts = self.groups * (self.carry + 1);
         if k < n_starts {
             return (0, &starts[k]);
@@ -587,7 +578,7 @@ fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192,
     }
 }
 
-/// `Σ_i ε_i·(D_i(ρ)·D_i(1 + ρ) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
+/// `Σ_i ε_i·(D_i(r_i)·D_i(1 + r_i) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
 /// that is one one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds
 /// `b·b̄·(X + X²)`, and one whose values agree (`same`) a constant.
 #[inline(always)]
@@ -608,7 +599,7 @@ fn cert_pair(
         if skip && clean(i) {
             continue;
         }
-        let (x, y, eps) = (pair(slots.rho(i)), pair(slots.rho_bar(i)), cert[i]);
+        let (x, y, eps) = (pair(slots.eq(i)), pair(slots.bar(i)), cert[i]);
         if skip && one_hot(i) {
             let t = eps.mul_unreduced((x.0 + x.1) * (y.0 + y.1));
             m[1] ^= t;
@@ -649,7 +640,7 @@ fn coef_linear(c: Coef, aux: &[(F192, F192)]) -> ([F192; 2], usize) {
 }
 
 /// The summand at one bound point from a column's values laid out by `slots`: `c·Φ_0 + Σ_g c_g·Φ_g +
-/// Σ_i e_i·(D_i(ρ)·D_i(1 + ρ) + π_i)`.
+/// Σ_i e_i·(D_i(r_i)·D_i(1 + r_i) + π_i)`.
 pub fn summand(slots: &Slots, mirrors: &[F192], coef: F192, groups: &[F192], values: &[F192], certs: &[F192]) -> F192 {
     let d = slots.d;
     let pointer: F192 = (0..d).map(|i| values[slots.eq(i)]).product();
@@ -668,7 +659,7 @@ pub fn summand(slots: &Slots, mirrors: &[F192], coef: F192, groups: &[F192], val
         })
         .sum();
     let cert: F192 = (0..d)
-        .map(|i| certs[i] * (values[slots.rho(i)] * values[slots.rho_bar(i)] + mirrors[i]))
+        .map(|i| certs[i] * (values[slots.eq(i)] * values[slots.bar(i)] + mirrors[i]))
         .sum();
     coef * pointer + shifted + cert
 }
@@ -1273,7 +1264,7 @@ impl<'a> State<'a> {
                         m[1] ^= t;
                         m[2] ^= t;
                     } else {
-                        let q = pair_product(pair(slots.rho(i)), pair(slots.rho_bar(i)));
+                        let q = pair_product(pair(slots.eq(i)), pair(slots.bar(i)));
                         m[0] ^= eps.mul_unreduced(q[0] + points.mirrors[i]);
                         m[1] ^= eps.mul_unreduced(q[1]);
                         m[2] ^= eps.mul_unreduced(q[2]);
@@ -1303,7 +1294,7 @@ impl<'a> State<'a> {
             let t = tag(&column.tags, d, 2 * k, i);
             t != MIXED && t == tag(&column.tags, d, 2 * k + 1, i)
         };
-        let same = |i: usize| lo[slots.rho(i)] == hi[slots.rho(i)] && lo[slots.rho_bar(i)] == hi[slots.rho_bar(i)];
+        let same = |i: usize| lo[slots.eq(i)] == hi[slots.eq(i)] && lo[slots.bar(i)] == hi[slots.bar(i)];
         column.add_terms(
             aux,
             omega,
@@ -1460,7 +1451,7 @@ pub fn prove(
             let eq = primitives::multilinear::eq_table(&point[..s.m]);
             for (column, column_end) in s.columns.iter().zip(&mut end.columns) {
                 let full = ColumnEnd::from_slices(chunks, points, bit_slices_eq(column.words, &eq));
-                debug_assert_eq!(column_end.values[..3 * d], full.values[..3 * d]);
+                debug_assert_eq!(column_end.values[..2 * d], full.values[..2 * d]);
                 *column_end = full;
             }
             end
@@ -1543,7 +1534,7 @@ fn prove_columns(
                 pair,
             );
             for i in 0..d {
-                let m = pair_product(pair(slots.rho(i)), pair(slots.rho_bar(i)));
+                let m = pair_product(pair(slots.eq(i)), pair(slots.bar(i)));
                 add_weighted(&mut poly, (lo.3[i], hi.3[i]), [m[0] + points.mirrors[i], m[1], m[2]]);
             }
         }
@@ -1746,12 +1737,7 @@ mod tests {
         ] {
             let chunks = Chunks::new(width);
             let d = chunks.d();
-            let points = RowPoints::new(
-                &chunks,
-                &rng.ext_vec(width),
-                &rng.ext_vec(chunks.max_width()),
-                max_shift,
-            );
+            let points = RowPoints::new(&chunks, &rng.ext_vec(width), max_shift);
             let raw: Vec<Raw> = shapes
                 .iter()
                 .map(|&s| random_table(&mut rng, &chunks, max_shift, s))

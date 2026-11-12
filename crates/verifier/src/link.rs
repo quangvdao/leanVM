@@ -63,10 +63,6 @@ impl Chunks {
         self.widths.len()
     }
 
-    pub fn max_width(&self) -> usize {
-        self.widths[0]
-    }
-
     fn part<'a>(&self, point: &'a [E], i: usize) -> &'a [E] {
         &point[self.index_shifts[i]..self.index_shifts[i] + self.widths[i]]
     }
@@ -81,8 +77,8 @@ fn carry_table(e: &[E], a: usize, out: usize) -> Vec<E> {
         .collect()
 }
 
-/// The functionals a pointer word is read with, as tables over each chunk's values: `D_i` at the index point `r`,
-/// at the certificate point `ρ` and at `1 + ρ`; then per shift `s` from 1 to `max_shift`, chunk 0's table under
+/// The functionals a pointer word is read with, as tables over each chunk's values: `D_i` at the index point `r`
+/// and at `1 + r`; then per shift `s` from 1 to `max_shift`, chunk 0's table under
 /// `s` for each carry `c ≤ carry` it passes on; then per later chunk its table for each carry `c ≥ 1` in and `out ≤ 1`
 /// on. A pointer shifted by `s` is the chain of these over the chunks (Binary Jolt's carry matrices, for any shift).
 pub struct Functionals {
@@ -91,35 +87,22 @@ pub struct Functionals {
     d: usize,
     max_shift: usize,
     carry: usize,
-    /// `π_{w_i}(ρ) = Π_h ρ_h·(1 + ρ_h)` per chunk.
+    /// `π_{w_i}(r_i) = Π_h r_h·(1 + r_h)` over chunk `i`'s coordinates of `r`.
     pub mirrors: Vec<E>,
 }
 
 impl Functionals {
-    pub fn new(chunks: &Chunks, r: &[E], rho: &[E], max_shift: usize) -> Self {
+    pub fn new(chunks: &Chunks, r: &[E], max_shift: usize) -> Self {
         let d = chunks.d();
         let eq: Vec<Vec<E>> = (0..d).map(|i| eq_kernel(chunks.part(r, i))).collect();
-        let bar: Vec<E> = rho.iter().map(|&x| ONE + x).collect();
         let carry = if d == 1 {
             0
         } else {
             ((1 << chunks.widths[0]) - 1 + max_shift) >> chunks.widths[0]
         };
         let mut tables: Vec<(usize, Vec<E>)> = eq.iter().cloned().enumerate().collect();
-        tables.extend(
-            chunks
-                .widths
-                .iter()
-                .enumerate()
-                .map(|(i, &w)| (i, eq_kernel(&rho[..w]))),
-        );
-        tables.extend(
-            chunks
-                .widths
-                .iter()
-                .enumerate()
-                .map(|(i, &w)| (i, eq_kernel(&bar[..w]))),
-        );
+        // `eq(1 + r_i, v) = eq(r_i, v')` for `v'` the value `v` with its bits flipped.
+        tables.extend(eq.iter().enumerate().map(|(i, e)| (i, e.iter().rev().copied().collect())));
         for s in 1..=max_shift {
             tables.extend((0..=carry).map(|c| (0, carry_table(&eq[0], s, c))));
         }
@@ -128,10 +111,8 @@ impl Functionals {
                 tables.extend((0..2).map(|out| (i, carry_table(e, c, out))));
             }
         }
-        let mirrors = chunks
-            .widths
-            .iter()
-            .map(|&w| rho[..w].iter().map(|&x| x * (ONE + x)).fold(ONE, |a, b| a * b))
+        let mirrors = (0..d)
+            .map(|i| chunks.part(r, i).iter().map(|&x| x * (ONE + x)).fold(ONE, |a, b| a * b))
             .collect();
         Self {
             tables,
@@ -157,17 +138,17 @@ impl Functionals {
             .collect()
     }
 
-    /// `c·Φ_0 + Σ_s c_s·Φ_s + Σ_i e_i·(D_i(ρ)·D_i(1 + ρ) + π_i)` from a word's values: the pointer at `r`, the
+    /// `c·Φ_0 + Σ_s c_s·Φ_s + Σ_i e_i·(D_i(r_i)·D_i(1 + r_i) + π_i)` from a word's values: the pointer at `r`, the
     /// pointer plus `s` at `r` (the carry chain over the chunks, a carry out of the top chunk dropped), and the
     /// mirror certificate. `shifts[s − 1]` is `c_s`.
     pub fn summand(&self, coef: E, shifts: &[E], values: &[E], certs: &[E]) -> E {
         let (d, carry) = (self.d, self.carry);
         let pointer = values[..d].iter().fold(ONE, |a, &b| a * b);
-        let links = 3 * d + self.max_shift * (carry + 1);
+        let links = 2 * d + self.max_shift * (carry + 1);
         let link = |i: usize, c: usize, out: usize| values[links + (i - 1) * 2 * carry + 2 * (c - 1) + out];
         let mut shifted = ZERO;
         for (s, &c_s) in shifts.iter().enumerate() {
-            let start = &values[3 * d + s * (carry + 1)..3 * d + (s + 1) * (carry + 1)];
+            let start = &values[2 * d + s * (carry + 1)..2 * d + (s + 1) * (carry + 1)];
             let mut x = start[0];
             let mut carries = start[1..].to_vec();
             for i in 1..d {
@@ -181,7 +162,7 @@ impl Functionals {
             }
             shifted += c_s * x;
         }
-        let cert = E::sum((0..d).map(|i| certs[i] * (values[d + i] * values[2 * d + i] + self.mirrors[i])));
+        let cert = E::sum((0..d).map(|i| certs[i] * (values[i] * values[d + i] + self.mirrors[i])));
         coef * pointer + shifted + cert
     }
 }
@@ -287,7 +268,6 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let alpha = transcript.samples(BUS_BITS);
     let zeta = transcript.samples(width);
     let [eta_start, eta_cover, eta_mem, eta_bc] = [0; 4].map(|_| transcript.sample());
-    let rho = transcript.samples(chunks.max_width());
     let eps: Vec<Vec<E>> = (0..n_pointers).map(|_| transcript.samples(d)).collect();
     let slot = eq_kernel(&alpha);
     let s_init = gamma_state[0] + gamma_state[1];
@@ -415,7 +395,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let slices = transcript.next_scalars(K_BITS)?;
     let bit_slices = slices_start..transcript.stream_offset();
     if transcript.checked() {
-        let functionals = Functionals::new(&chunks, &r, &rho, max_shift);
+        let functionals = Functionals::new(&chunks, &r, max_shift);
         let values = functionals.values(&chunks, &slices);
         let eq0_q = product(q_point.iter().map(|&x| ONE + x));
         let last = functionals.summand(coef, &shifts, &values, &certs) + eq0_q * base;

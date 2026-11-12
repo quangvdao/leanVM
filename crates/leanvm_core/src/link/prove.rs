@@ -144,7 +144,6 @@ pub(crate) struct Challenges {
     pub eta_cover: F192,
     pub eta_mem: F192,
     pub eta_bc: F192,
-    pub rho: Vec<F192>,
     /// Per global pointer column, per chunk.
     pub eps: Vec<Vec<F192>>,
 }
@@ -159,7 +158,6 @@ impl Challenges {
         let alpha_bc = ps.sample_vec(crate::leaf::N_BYTECODE_SELECTORS);
         let zeta = ps.sample_vec(chunks.width);
         let [eta_start, eta_cover, eta_mem, eta_bc] = std::array::from_fn(|_| ps.sample());
-        let rho = ps.sample_vec(chunks.max_width());
         let n_pointers: usize = plans.iter().map(|p| p.pointers.len()).sum();
         let eps = (0..n_pointers).map(|_| ps.sample_vec(chunks.d())).collect();
         Self {
@@ -174,7 +172,6 @@ impl Challenges {
             eta_cover,
             eta_mem,
             eta_bc,
-            rho,
             eps,
         }
     }
@@ -492,7 +489,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
 
     let row_end = tracing::info_span!("Row side").in_scope(|| {
         let max_shift = plans.iter().map(|p| p.links.max_shift()).max().unwrap_or(0).max(1);
-        let points = RowPoints::new(&chunks, r, &ch.rho, max_shift);
+        let points = RowPoints::new(&chunks, r, max_shift);
         let mut q = 0;
         let mut tables_in = Vec::with_capacity(tables::N_TABLES);
         for t in 0..tables::N_TABLES {

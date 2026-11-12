@@ -94,11 +94,6 @@ impl Chunks {
         self.widths.len()
     }
 
-    /// The widest chunk, which sets the length of the certificate point.
-    pub fn max_width(&self) -> usize {
-        self.widths[0]
-    }
-
     /// The word of index `sigma`.
     pub fn encode(&self, sigma: usize) -> u64 {
         debug_assert!(sigma >> self.width == 0, "index {sigma} past 2^{}", self.width);
@@ -356,7 +351,7 @@ pub fn eval_chunk(chunks: &Chunks, table: &[F192], word: u64, i: usize) -> F192 
     }
 }
 
-/// `Π_h ρ_h·(1 + ρ_h)`: what `D(ρ)·D(1 + ρ)` is for every one-hot chunk (the mirror test of Emile Wambsgans).
+/// `Π_h r_h·(1 + r_h)`: what `D(r)·D(1 + r)` is for every one-hot chunk (the mirror test of Emile Wambsgans).
 pub fn mirror(point: &[F192]) -> F192 {
     point.iter().map(|&x| x * (F192::ONE + x)).product()
 }
@@ -376,11 +371,12 @@ impl ChunkEq {
         }
     }
 
-    /// At the certificate point: chunk `i` at the first `w_i` coordinates of `rho`, or of `1 + rho` when `mirrored`.
-    pub fn certificate(chunks: &Chunks, rho: &[F192], mirrored: bool) -> Self {
-        let rho: Vec<F192> = rho.iter().map(|&x| if mirrored { F192::ONE + x } else { x }).collect();
+    /// At `1 + point`, chunk `i` at its own coordinates: each table of [`Self::at`] read with its value's bits
+    /// flipped.
+    pub fn mirrored(chunks: &Chunks, point: &[F192]) -> Self {
+        let eq = Self::at(chunks, point);
         Self {
-            tables: chunks.widths.iter().map(|&w| eq_table(&rho[..w])).collect(),
+            tables: eq.tables.iter().map(|t| t.iter().rev().copied().collect()).collect(),
         }
     }
 
@@ -483,6 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn the_certificate_at_the_index_point_holds_for_exactly_the_one_hot_chunks() {
+        let mut rng = Rng::new(11);
+        for w in 1..=4 {
+            let chunks = Chunks::new(w);
+            let r = rng.ext_vec(w);
+            let (eq, bar) = (ChunkEq::at(&chunks, &r), ChunkEq::mirrored(&chunks, &r));
+            let target = mirror(&r);
+            for bits in 0u64..1 << (1 << w) {
+                let at = |t: &ChunkEq| (0..1 << w).filter(|v| bits >> v & 1 == 1).map(|v| t.tables[0][v]).sum::<F192>();
+                assert_eq!(at(&eq) * at(&bar) == target, bits.count_ones() == 1, "width {w}, bits {bits:#x}");
+            }
+        }
+    }
+
+    #[test]
     fn a_word_at_a_point_is_eq_of_its_index() {
         let mut rng = Rng::new(7);
         for w in [5, 7, 13, 22, 23, 24] {
@@ -499,11 +510,7 @@ mod tests {
                 let bits: Vec<F192> = (0..w).map(|h| F192::new(((sigma >> h) & 1) as u64, 0, 0)).collect();
                 let phi: F192 = (0..chunks.d()).map(|i| eqs.eval(&chunks, word, i)).product();
                 assert_eq!(phi, eq_eval(&r, &bits));
-                let rho = rng.ext_vec(chunks.max_width());
-                let (d, dbar) = (
-                    ChunkEq::certificate(&chunks, &rho, false),
-                    ChunkEq::certificate(&chunks, &rho, true),
-                );
+                let dbar = ChunkEq::mirrored(&chunks, &r);
                 let (low, carry) = ChunkEq::shift(&chunks, &r);
                 let at = |t: &ChunkEq| (0..chunks.d()).map(|i| t.eval(&chunks, word, i)).collect::<Vec<_>>();
                 let next = sigma + 1;
@@ -547,8 +554,8 @@ mod tests {
                     assert_eq!(split.at_shifted(&tables, sigma), mu * at(sigma + s) + at(sigma + 1));
                 }
                 for i in 0..chunks.d() {
-                    let product = d.eval(&chunks, word, i) * dbar.eval(&chunks, word, i);
-                    assert_eq!(product, mirror(&rho[..chunks.widths[i]]));
+                    let product = eqs.eval(&chunks, word, i) * dbar.eval(&chunks, word, i);
+                    assert_eq!(product, mirror(chunks.part(&r, i)));
                 }
             }
         }
