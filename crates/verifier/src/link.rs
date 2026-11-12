@@ -212,7 +212,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let n_pointers: usize = pointers.iter().map(Vec::len).sum();
 
     // The challenges.
-    let theta = transcript.samples(N_TABLES); let theta = vec![theta[0]; N_TABLES];
+    let theta = transcript.samples(N_TABLES);
     let tau = transcript.samples(heights.iter().copied().max().unwrap_or(0));
     let gamma_state = transcript.samples(2);
     let gamma_mem = transcript.samples(5);

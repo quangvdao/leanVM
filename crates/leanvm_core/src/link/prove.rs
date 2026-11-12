@@ -124,7 +124,7 @@ pub(crate) struct Challenges {
 
 impl Challenges {
     fn sample(ps: &mut ProverState, plans: &[Plan], taus: &[usize], chunks: &Chunks) -> Self {
-        let theta = ps.sample_vec(tables::N_TABLES); let theta = vec![theta[0]; tables::N_TABLES];
+        let theta = ps.sample_vec(tables::N_TABLES);
         let tau = ps.sample_vec(taus.iter().copied().max().unwrap_or(0));
         let gamma_state = [ps.sample(), ps.sample()];
         let gamma_mem = std::array::from_fn(|_| ps.sample());

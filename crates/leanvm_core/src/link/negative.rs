@@ -315,3 +315,32 @@ fn a_keccak_pointer_past_memory_is_rejected() {
 fn a_wrong_memory_term_is_rejected() {
     rejected(|_| cheat::MEMORY_TERM.set(F192::ONE));
 }
+
+/// A straight-line program whose `XOR` and `MUL` tables have the same height, all in main's frame.
+fn equal_heights() -> Program {
+    let mut prog = vec![Op::Set { o: 25, k: F192::ZERO }];
+    prog.extend((0..3).map(|_| Op::Mul { a: 25, b: 25, c: 26 }));
+    prog.extend((0..4).map(|_| Op::Xor { a: 25, b: 25, c: 27 }));
+    Program::from_bytecode(prog, 32)
+}
+
+/// Row 0 of `XOR` and row 0 of `MUL`, tables of the same height in the same frame, swap their cycles: each claims
+/// the other's cycle and pc. The state and bytecode payloads are linear, so the swapped pair's sum equals the honest
+/// pair's, and only a row weight that differs between the two tables tells the rows apart.
+#[test]
+fn rows_of_two_tables_at_the_same_index_with_swapped_cycles_are_rejected() {
+    let program = equal_heights();
+    let tamper = |w: &mut Witness| {
+        assert_eq!(w.layout.taus[XOR], w.layout.taus[MUL], "{:?}", w.layout.taus);
+        let (x, m) = (plan(XOR).links, plan(MUL).links);
+        let fp = column(w, XOR, x.state.fp)[0];
+        assert_eq!(fp, column(w, MUL, m.state.fp)[0]);
+        for (cx, cm) in [(x.state.cycle, m.state.cycle), (x.state.pc, m.state.pc), (x.bytecode.pointer, m.bytecode.pointer)] {
+            let (a, b) = (column(w, XOR, cx)[0], column(w, MUL, cm)[0]);
+            column(w, XOR, cx)[0] = b;
+            column(w, MUL, cm)[0] = a;
+        }
+    };
+    let (proof, _) = prove_tampered(&program, PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
+    assert_eq!(verify(&program, &PI, &proof).map(|_| ()), Err(CpuError::Verifier(VerifierError::LinkTerminal)));
+}
