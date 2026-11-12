@@ -33,6 +33,9 @@ pub const MAX_COEFFS: usize = 12;
 /// No one-hot value: a tag for a chunk that is not one value across its group.
 const MIXED: u8 = u8::MAX;
 
+/// No index: a word some chunk of which is not one-hot.
+const NO_INDEX: u32 = u32::MAX;
+
 /// Pairs per task of a round.
 const TASK_PAIRS: usize = 256;
 
@@ -121,6 +124,9 @@ pub struct RowPoints {
     pub shifts: Shifts,
     /// `π_{w_i}(ρ)` per chunk.
     pub mirrors: Vec<F192>,
+    /// Per chunk, `D_i(ρ)·D_i(1 + ρ)` over a pair of one-hot values `v ≠ v'` in `X + X²`: entry `v·2^{w_i} + v'`
+    /// is `e_v·ē_{v'} + e_{v'}·ē_v` for the certificate tables `e` and `ē`.
+    pub cert_pairs: Vec<Vec<F192>>,
     /// `eq(r, ·)` over whole pointers.
     pub split: SplitEq,
 }
@@ -128,11 +134,30 @@ pub struct RowPoints {
 impl RowPoints {
     pub fn new(chunks: &Chunks, r: &[F192], rho: &[F192], max_shift: usize) -> Self {
         let eq = ChunkEq::at(chunks, r);
+        let (cert, cert_bar) = (
+            ChunkEq::certificate(chunks, rho, false),
+            ChunkEq::certificate(chunks, rho, true),
+        );
+        let cert_pairs = cert
+            .tables
+            .iter()
+            .zip(&cert_bar.tables)
+            .map(|(e, f)| {
+                let n = e.len();
+                (0..n * n)
+                    .map(|k| {
+                        let (v, w) = (k / n, k % n);
+                        e[v] * f[w] + e[w] * f[v]
+                    })
+                    .collect()
+            })
+            .collect();
         Self {
             shifts: Shifts::new(chunks, &eq, max_shift),
             eq,
-            cert: ChunkEq::certificate(chunks, rho, false),
-            cert_bar: ChunkEq::certificate(chunks, rho, true),
+            cert,
+            cert_bar,
+            cert_pairs,
             mirrors: chunks.widths.iter().map(|&w| mirror(&rho[..w])).collect(),
             split: SplitEq::new(r, max_shift),
         }
@@ -505,23 +530,12 @@ fn linear_pointer(
     }
 }
 
-/// A word's index for [`SplitEq`]: `Some(Some(σ))` when every chunk is one-hot, `Some(None)` when a chunk has no
-/// bit set, so the pointer and every shifted chain vanish, and `None` when a chunk has two bits or more.
+/// `at` of each word of a group by its index, folded by the bound challenges `r`, the first for adjacent words.
 #[inline(always)]
-fn word_index(chunks: &Chunks, word: u64) -> Option<Option<usize>> {
-    match chunks.decode(word) {
-        Some(sigma) => Some(Some(sigma)),
-        None => (0..chunks.d()).any(|i| chunks.bits(word, i) == 0).then_some(None),
-    }
-}
-
-/// `at` of each word of a group by its [`word_index`], zero where a chunk has no bit set, folded by the bound
-/// challenges `r`, the first for adjacent words.
-#[inline(always)]
-fn fold_words(index: &[Option<usize>], r: &[F192], at: impl Fn(usize) -> F192) -> F192 {
+fn fold_words(index: &[u32], r: &[F192], at: impl Fn(usize) -> F192) -> F192 {
     let mut values = [F192::ZERO; MAX_GROUP];
-    for (v, x) in values.iter_mut().zip(index) {
-        *v = x.map_or(F192::ZERO, &at);
+    for (v, &x) in values.iter_mut().zip(index) {
+        *v = at(x as usize);
     }
     let mut len = index.len();
     for &x in r {
@@ -753,6 +767,8 @@ struct Column<'a> {
     starts: Vec<Vec<F192>>,
     /// Per group, its low tables in [`SplitEq`].
     split_starts: Vec<Vec<Vec<F192>>>,
+    /// Each word's index, or [`NO_INDEX`], while the rounds read words.
+    index: Vec<u32>,
     values: Option<Strided>,
     tags: Vec<u8>,
     omega: Coef,
@@ -782,11 +798,23 @@ impl<'a> Column<'a> {
             .iter()
             .map(|g| points.split.shifted_tables(&g.weights))
             .collect();
+        let words = column.words;
+        // SAFETY: every entry is written.
+        let index = unsafe {
+            primitives::filled_vec(words.len(), |index| {
+                parallel::chunks_mut(index, TASK_PAIRS * 16, |task, chunk| {
+                    for (o, &w) in chunk.iter_mut().zip(&words[task * TASK_PAIRS * 16..]) {
+                        *o = chunks.decode(w).map_or(NO_INDEX, |sigma| sigma as u32);
+                    }
+                });
+            })
+        };
         Self {
-            words: column.words,
+            words,
             slots,
             starts,
             split_starts,
+            index,
             values: None,
             tags: Vec::new(),
             omega: column.omega,
@@ -1092,6 +1120,17 @@ impl<'a> State<'a> {
         (omega, act): (&mut Poly, &mut Poly),
     ) {
         let n = 1 << r.len();
+        if skip {
+            let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
+            let mut sigmas = [[0u32; MAX_GROUP]; 2];
+            for t in 0..n {
+                sigmas[0][t] = index(2 * k * n + t);
+                sigmas[1][t] = index((2 * k + 1) * n + t);
+            }
+            if sigmas.iter().all(|s| s[..n].iter().all(|&x| x != NO_INDEX)) {
+                return Self::pair_indices(column, tables, r, sigmas, aux, chunks, points, (omega, act));
+            }
+        }
         let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
         let (mut lo, mut hi) = ([0u64; MAX_GROUP], [0u64; MAX_GROUP]);
         for t in 0..n {
@@ -1110,47 +1149,23 @@ impl<'a> State<'a> {
                 group_value(chunks, table, i, hi, hi_bits[i], r),
             )
         };
-        // With at most one chunk differing across the words, the pointer at a folded row is the words' pointers
-        // folded, and each word's is one lookup in `points.split`.
-        let mut diff = 0;
-        for &u in lo.iter().chain(hi) {
-            diff |= u ^ lo[0];
-        }
-        let mut index = [[None; MAX_GROUP]; 2];
-        let linear = skip
-            && (0..chunks.d()).filter(|&i| chunks.bits(diff, i) != 0).count() <= 1
-            && [lo, hi].iter().zip(&mut index).all(|(words, index)| {
-                words
-                    .iter()
-                    .zip(index.iter_mut())
-                    .all(|(&u, o)| word_index(chunks, u).map(|x| *o = x).is_some())
-            });
         let slots = &column.slots;
         column.add_terms(
             aux,
             omega,
             act,
             |acc, coef, groups, act| {
-                if linear {
-                    let (lo, hi) = (&index[0][..n], &index[1][..n]);
-                    let at = |sigma| points.split.at(sigma);
-                    linear_pointer(acc, coef, groups, act, (fold_words(lo, r, at), fold_words(hi, r, at)), |g| {
-                        let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
-                        (fold_words(lo, r, at), fold_words(hi, r, at))
-                    })
-                } else {
-                    pointer_pair(
-                        acc,
-                        slots,
-                        coef,
-                        groups,
-                        act,
-                        skip,
-                        same,
-                        |i| points.eq.eval(chunks, lo[0], i),
-                        pair,
-                    )
-                }
+                pointer_pair(
+                    acc,
+                    slots,
+                    coef,
+                    groups,
+                    act,
+                    skip,
+                    same,
+                    |i| points.eq.eval(chunks, lo[0], i),
+                    pair,
+                )
             },
             |acc| {
                 cert_pair(
@@ -1164,6 +1179,107 @@ impl<'a> State<'a> {
                     same,
                     pair,
                 )
+            },
+        );
+    }
+
+    /// [`Self::pair_words`] when every word's chunks are one-hot, from the words' indices, `sigmas[0]` for the
+    /// first row's group and `sigmas[1]` for the second's: a chunk
+    /// whose digit agrees across them is constant and its certificate term zero, and a pointer with at most one
+    /// varying chunk is linear in `X`.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_indices(
+        column: &Column,
+        tables: &[(usize, &[F192])],
+        r: &[F192],
+        sigmas: [[u32; MAX_GROUP]; 2],
+        aux: &[(F192, F192)],
+        chunks: &Chunks,
+        points: &RowPoints,
+        (omega, act): (&mut Poly, &mut Poly),
+    ) {
+        let d = chunks.d();
+        let n = 1 << r.len();
+        let (lo, hi) = (&sigmas[0][..n], &sigmas[1][..n]);
+        let (mut lo_diff, mut hi_diff) = (0, 0);
+        for (&a, &b) in lo.iter().zip(hi) {
+            lo_diff |= a ^ lo[0];
+            hi_diff |= b ^ hi[0];
+        }
+        let diff = lo_diff | hi_diff | (lo[0] ^ hi[0]);
+        let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
+        let mut varying = 0u32;
+        for i in 0..d {
+            varying |= u32::from(digit(diff, i) != 0) << i;
+        }
+        // Chunk `i`'s table at a folded row of `side`: one lookup when its digit agrees across the side.
+        let value = |table: &[F192], i: usize, side: &[u32], side_diff: u32| {
+            if digit(side_diff, i) == 0 {
+                return table[digit(side[0], i)];
+            }
+            let mut values = [F192::ZERO; MAX_GROUP];
+            for (v, &sigma) in values.iter_mut().zip(side) {
+                *v = table[digit(sigma, i)];
+            }
+            let mut len = side.len();
+            for &x in r {
+                len /= 2;
+                for t in 0..len {
+                    let (a, b) = (values[2 * t], values[2 * t + 1]);
+                    values[t] = if a == b { a } else { a + x * (a + b) };
+                }
+            }
+            values[0]
+        };
+        let pair = |slot: usize| {
+            let (i, table) = tables[slot];
+            (value(table, i, lo, lo_diff), value(table, i, hi, hi_diff))
+        };
+        let slots = &column.slots;
+        column.add_terms(
+            aux,
+            omega,
+            act,
+            |acc, coef, groups, act| {
+                if varying.count_ones() <= 1 {
+                    let at = |sigma| points.split.at(sigma);
+                    linear_pointer(acc, coef, groups, act, (fold_words(lo, r, at), fold_words(hi, r, at)), |g| {
+                        let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
+                        (fold_words(lo, r, at), fold_words(hi, r, at))
+                    })
+                } else {
+                    pointer_pair(
+                        acc,
+                        slots,
+                        coef,
+                        groups,
+                        act,
+                        true,
+                        |i| varying >> i & 1 == 0,
+                        |i| points.eq.tables[i][digit(lo[0], i)],
+                        pair,
+                    )
+                }
+            },
+            |acc| {
+                let mut m = [F192Unreduced::ZERO; 3];
+                let mut rest = varying;
+                while rest != 0 {
+                    let i = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let eps = column.cert[i];
+                    if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
+                        let t = eps.mul_unreduced(points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)]);
+                        m[1] ^= t;
+                        m[2] ^= t;
+                    } else {
+                        let q = pair_product(pair(slots.rho(i)), pair(slots.rho_bar(i)));
+                        m[0] ^= eps.mul_unreduced(q[0] + points.mirrors[i]);
+                        m[1] ^= eps.mul_unreduced(q[1]);
+                        m[2] ^= eps.mul_unreduced(q[2]);
+                    }
+                }
+                add_into(acc, &m.map(F192Unreduced::reduce));
             },
         );
     }
@@ -1234,6 +1350,7 @@ impl<'a> State<'a> {
                 None => {
                     if materialize {
                         column.materialize(explicit, &self.bound, chunks, points);
+                        column.index = Vec::new();
                     }
                 }
                 Some(values) => {

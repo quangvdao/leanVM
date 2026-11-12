@@ -79,6 +79,12 @@ impl Chunks {
         (word >> self.word_shifts[i]) & (u64::MAX >> (64 - (1 << self.widths[i])))
     }
 
+    /// Chunk `i`'s value in the index `sigma`.
+    #[inline(always)]
+    pub fn digit(&self, sigma: usize, i: usize) -> usize {
+        (sigma >> self.index_shifts[i]) & ((1 << self.widths[i]) - 1)
+    }
+
     /// The index of a word whose chunks are all one-hot.
     #[inline(always)]
     pub fn decode(&self, word: u64) -> Option<usize> {
