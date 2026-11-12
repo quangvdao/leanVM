@@ -1107,14 +1107,14 @@ impl<'a> State<'a> {
     ) {
         let n = 1 << r.len();
         if skip {
-            let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
-            let mut sigmas = [[0u32; MAX_GROUP]; 2];
-            for t in 0..n {
-                sigmas[0][t] = index(2 * k * n + t);
-                sigmas[1][t] = index((2 * k + 1) * n + t);
-            }
-            if sigmas.iter().all(|s| s[..n].iter().all(|&x| x != NO_INDEX)) {
-                return Self::pair_indices(column, tables, r, sigmas, aux, chunks, points, (omega, act));
+            let sums = (&mut *omega, &mut *act);
+            let done = match n {
+                1 => Self::try_indices::<1>(column, tables, r, k, aux, chunks, points, sums),
+                2 => Self::try_indices::<2>(column, tables, r, k, aux, chunks, points, sums),
+                _ => false,
+            };
+            if done {
+                return;
             }
         }
         let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
@@ -1169,24 +1169,45 @@ impl<'a> State<'a> {
         );
     }
 
+    /// [`Self::pair_indices`] on the pair `k` of groups of `N` words when every word's chunks are one-hot; whether it
+    /// was.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn try_indices<const N: usize>(
+        column: &Column,
+        tables: &[(usize, &[F192])],
+        r: &[F192],
+        k: usize,
+        aux: &[(F192, F192)],
+        chunks: &Chunks,
+        points: &RowPoints,
+        sums: (&mut Poly, &mut Poly),
+    ) -> bool {
+        let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
+        let sigmas: [[u32; N]; 2] = [0, 1].map(|side| std::array::from_fn(|t| index((2 * k + side) * N + t)));
+        if sigmas.iter().any(|s| s.contains(&NO_INDEX)) {
+            return false;
+        }
+        Self::pair_indices::<N>(column, tables, r, sigmas, aux, chunks, points, sums);
+        true
+    }
+
     /// [`Self::pair_words`] when every word's chunks are one-hot, from the words' indices, `sigmas[0]` for the
     /// first row's group and `sigmas[1]` for the second's: a chunk
     /// whose digit agrees across them is constant and its certificate term zero, and a pointer with at most one
     /// varying chunk is linear in `X`.
     #[allow(clippy::too_many_arguments)]
-    fn pair_indices(
+    fn pair_indices<const N: usize>(
         column: &Column,
         tables: &[(usize, &[F192])],
         r: &[F192],
-        sigmas: [[u32; MAX_GROUP]; 2],
+        sigmas: [[u32; N]; 2],
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
         (omega, act): (&mut Poly, &mut Poly),
     ) {
-        let d = chunks.d();
-        let n = 1 << r.len();
-        let (lo, hi) = (&sigmas[0][..n], &sigmas[1][..n]);
+        let (lo, hi) = (&sigmas[0], &sigmas[1]);
         let (mut lo_diff, mut hi_diff) = (0, 0);
         for (&a, &b) in lo.iter().zip(hi) {
             lo_diff |= a ^ lo[0];
@@ -1194,10 +1215,7 @@ impl<'a> State<'a> {
         }
         let diff = lo_diff | hi_diff | (lo[0] ^ hi[0]);
         let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
-        let mut varying = 0u32;
-        for i in 0..d {
-            varying |= u32::from(digit(diff, i) != 0) << i;
-        }
+        let varying = chunks.varying(diff);
         // Chunk `i`'s table at a folded row of `side`: one lookup when its digit agrees across the side.
         let value = |table: &[F192], i: usize, side: &[u32], side_diff: u32| {
             if digit(side_diff, i) == 0 {

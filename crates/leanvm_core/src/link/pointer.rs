@@ -26,6 +26,9 @@ pub struct Chunks {
     bytes: Option<Vec<u64>>,
     count_shift: usize,
     one_each: u64,
+    /// Per chunk, its digit's shift and mask in an index; zero past the last chunk.
+    digit_shifts: [u32; 8],
+    digit_masks: [u32; 8],
 }
 
 impl Chunks {
@@ -79,7 +82,14 @@ impl Chunks {
             table
         });
         let one_each = (0..widths.len()).map(|i| 1u64 << (count_bits * i)).sum();
+        let (mut digit_shifts, mut digit_masks) = ([0; 8], [0; 8]);
+        for i in 0..widths.len() {
+            digit_shifts[i] = index_shifts[i] as u32;
+            digit_masks[i] = (1 << widths[i]) - 1;
+        }
         Self {
+            digit_shifts,
+            digit_masks,
             width,
             index_shifts,
             word_shifts,
@@ -112,7 +122,18 @@ impl Chunks {
     /// Chunk `i`'s value in the index `sigma`.
     #[inline(always)]
     pub fn digit(&self, sigma: usize, i: usize) -> usize {
-        (sigma >> self.index_shifts[i]) & ((1 << self.widths[i]) - 1)
+        ((sigma as u32 >> self.digit_shifts[i & 7]) & self.digit_masks[i & 7]) as usize
+    }
+
+    /// Bit `i` set for each chunk `i` whose digit in `diff` is nonzero: the chunks two indices differ in, for `diff`
+    /// their XOR.
+    #[inline(always)]
+    pub fn varying(&self, diff: u32) -> u32 {
+        let mut out = 0;
+        for i in 0..8 {
+            out |= u32::from(diff >> self.digit_shifts[i] & self.digit_masks[i] != 0) << i;
+        }
+        out
     }
 
     /// The index of a word whose chunks are all one-hot.
