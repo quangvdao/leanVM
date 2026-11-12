@@ -21,6 +21,11 @@ pub struct Chunks {
     pub widths: Vec<usize>,
     index_shifts: Vec<usize>,
     word_shifts: Vec<usize>,
+    /// Per byte of a word and value of that byte, its set bits' digits at their index shifts plus a count per chunk
+    /// above [`Self::count_shift`], when those fit one `u64`: see [`Self::decode`].
+    bytes: Option<Vec<u64>>,
+    count_shift: usize,
+    one_each: u64,
 }
 
 impl Chunks {
@@ -47,11 +52,41 @@ impl Chunks {
                 })
                 .collect()
         };
+        let index_shifts: Vec<usize> = prefix(&|w| w);
+        let word_shifts: Vec<usize> = prefix(&|w| 1 << w);
+        // Every bit's digit summed bounds the index field; each chunk's count field holds up to its `2^{w_i}` bits.
+        let total: usize = (0..widths.len())
+            .map(|i| ((1 << widths[i]) * ((1 << widths[i]) - 1) / 2) << index_shifts[i])
+            .sum();
+        let count_shift = (usize::BITS - total.leading_zeros()) as usize;
+        let count_bits = widths[0] + 1;
+        let fits = count_shift + count_bits * widths.len() <= 64;
+        let bytes = fits.then(|| {
+            let mut table = vec![0u64; 8 * 256];
+            for (b, entries) in table.chunks_mut(256).enumerate() {
+                for (byte, e) in entries.iter_mut().enumerate() {
+                    for bit in (0..8).filter(|&bit| byte >> bit & 1 == 1) {
+                        let p = 8 * b + bit;
+                        if let Some(i) = (0..widths.len())
+                            .find(|&i| (word_shifts[i]..word_shifts[i] + (1 << widths[i])).contains(&p))
+                        {
+                            *e += (((p - word_shifts[i]) << index_shifts[i]) as u64)
+                                + (1u64 << (count_shift + count_bits * i));
+                        }
+                    }
+                }
+            }
+            table
+        });
+        let one_each = (0..widths.len()).map(|i| 1u64 << (count_bits * i)).sum();
         Self {
             width,
-            index_shifts: prefix(&|w| w),
-            word_shifts: prefix(&|w| 1 << w),
+            index_shifts,
+            word_shifts,
             widths,
+            bytes,
+            count_shift,
+            one_each,
         }
     }
 
@@ -88,6 +123,13 @@ impl Chunks {
     /// The index of a word whose chunks are all one-hot.
     #[inline(always)]
     pub fn decode(&self, word: u64) -> Option<usize> {
+        // A byte's entry adds each set bit's digit to the index and one to its chunk's count, so a word is one-hot
+        // exactly when every count is one, and then the index field is its index.
+        if let Some(table) = &self.bytes {
+            let sum: u64 = (0..8).map(|b| table[256 * b + (word >> (8 * b) & 0xff) as usize]).sum();
+            return (sum >> self.count_shift == self.one_each)
+                .then_some((sum & ((1 << self.count_shift) - 1)) as usize);
+        }
         let mut sigma = 0;
         for i in 0..self.d() {
             let b = self.bits(word, i);
@@ -407,6 +449,36 @@ mod tests {
             let chunks = Chunks::new(w);
             assert_eq!(chunks.widths.iter().sum::<usize>(), w);
             assert!(chunks.widths.iter().map(|&w| 1usize << w).sum::<usize>() <= 64);
+        }
+    }
+
+    #[test]
+    fn decoding_finds_the_index_of_exactly_the_one_hot_words() {
+        let mut rng = Rng::new(0xdec);
+        for w in 1..=MAX_WIDTH {
+            let chunks = Chunks::new(w);
+            let by_chunk = |word: u64| {
+                (0..chunks.d())
+                    .map(|i| {
+                        let b = chunks.bits(word, i);
+                        b.is_power_of_two()
+                            .then(|| (b.trailing_zeros() as usize) << chunks.index_shifts[i])
+                    })
+                    .sum::<Option<usize>>()
+            };
+            for k in 0..2000 {
+                let sigma = rng.next_u64() as usize & ((1 << w) - 1);
+                let word = match k % 4 {
+                    0 => chunks.encode(sigma),
+                    1 => chunks.encode(sigma) ^ 1 << (rng.next_u64() % 64),
+                    2 => chunks.encode(sigma) | chunks.encode(rng.next_u64() as usize & ((1 << w) - 1)),
+                    _ => rng.next_u64(),
+                };
+                assert_eq!(chunks.decode(word), by_chunk(word), "width {w}, word {word:#x}");
+                if k % 4 == 0 {
+                    assert_eq!(chunks.decode(word), Some(sigma));
+                }
+            }
         }
     }
 
