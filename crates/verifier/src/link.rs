@@ -1,4 +1,4 @@
-//! Hotlink, the verifier's side: one-hot pointer links checked by one sum-check, in place of the bus.
+//! Hotwire, the verifier's side: one-hot pointer links checked by one sum-check, in place of the bus.
 //!
 //! Every row of an instruction table names its cycle, the memory cells it touches and its instruction by
 //! pointers, each committed one-hot in one `K` word. One sum-check runs over the index `j` (the index side), the

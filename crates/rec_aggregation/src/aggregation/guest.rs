@@ -15,10 +15,10 @@ pub fn warm_up() {
 
 /// The aggregation bytecode.
 ///
-/// Its recursion verifier still checks the bus proof: Hotlink has not been ported to the guest. So the guest is
+/// Its recursion verifier still checks the bus proof: Hotwire has not been ported to the guest. So the guest is
 /// compiled from the constants the bus layout gave it ([`frozen_placeholder_map`]), and stays the same program,
-/// with the same digest, as before Hotlink. A leaf aggregate proves this program with the Hotlink prover; a node
-/// aggregate, whose guest would verify Hotlink child proofs, does not work until the guest is ported.
+/// with the same digest, as before Hotwire. A leaf aggregate proves this program with the Hotwire prover; a node
+/// aggregate, whose guest would verify Hotwire child proofs, does not work until the guest is ported.
 pub fn unified_guest() -> &'static Program {
     static GUEST: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
     GUEST.get_or_init(|| {
@@ -46,9 +46,9 @@ fn frozen_placeholder_map() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// The guest compiled from the current layout's constants: the self-referential compile the port to Hotlink will
+/// The guest compiled from the current layout's constants: the self-referential compile the port to Hotwire will
 /// restore in [`unified_guest`].
-#[allow(dead_code, reason = "unused until the guest verifies Hotlink proofs")]
+#[allow(dead_code, reason = "unused until the guest verifies Hotwire proofs")]
 pub(super) fn compile_guest(kbc: usize) -> Program {
     compile_with(&placeholder_map(kbc))
 }

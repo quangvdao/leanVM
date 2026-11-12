@@ -1,4 +1,4 @@
-//! Hotlink's index side: the rounds over the index `j` of cycles, memory cells and instructions, lowest bit
+//! Hotwire's index side: the rounds over the index `j` of cycles, memory cells and instructions, lowest bit
 //! first, each of degree 2.
 //!
 //! The summand is a sum of terms `coef·A(j)·B(j)` and `coef·A(j)` over arrays that are zero past their length,

@@ -12,7 +12,7 @@
 pub(crate) struct Xrow {
     pub(crate) pc: u32,
     pub(crate) fp: u32, // frame base: address = fp + offset, operand = g^offset
-    /// The step that executed the row, its Hotlink cycle pointer.
+    /// The step that executed the row, its Hotwire cycle pointer.
     pub(crate) step: u32,
 }
 pub(crate) struct Srow {

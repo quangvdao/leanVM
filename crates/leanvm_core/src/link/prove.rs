@@ -1,4 +1,4 @@
-//! Hotlink's prover: the challenges, the index side, the row side and the claims they leave on the commitment.
+//! Hotwire's prover: the challenges, the index side, the row side and the claims they leave on the commitment.
 //!
 //! After the commitment the verifier draws the link challenges. The index side runs over `j < 2^W` on arrays the
 //! pointers scatter, then the prover sends `W⁺(r)`, `S(r)` and the memory term `M_1` at its end `r`, and the verifier
@@ -47,10 +47,10 @@ fn index_words(t: usize, column: usize, words: &[u64]) -> std::borrow::Cow<'_, [
     }
 }
 
-/// What a table links, and how Hotlink reads its columns.
+/// What a table links, and how Hotwire reads its columns.
 pub(crate) struct Plan {
     pub links: Links,
-    /// The pointer columns, in Hotlink's order ([`Links::pointers`]).
+    /// The pointer columns, in Hotwire's order ([`Links::pointers`]).
     pub pointers: Vec<usize>,
     /// The columns that gate an access, in order of first use.
     pub gates: Vec<usize>,

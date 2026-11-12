@@ -168,7 +168,7 @@ pub(super) fn gen_verify(
     let mut col_order = committed_globals;
     col_order.sort_by_key(|&global| layout.placements[global].offset);
     // The order by column group (`col_groups`), one entry per run of a group's columns. The guest models the bus-era
-    // layout, in which each group's columns are consecutive. Hotlink places the pointer columns apart from the rest of
+    // layout, in which each group's columns are consecutive. Hotwire places the pointer columns apart from the rest of
     // their group, so the list runs longer than the guest expects. The guest still verifies bus proofs and rejects
     // the child either way until it is ported.
     let groups = col_groups(&col_sources.iter().flatten().copied().collect::<Vec<_>>());

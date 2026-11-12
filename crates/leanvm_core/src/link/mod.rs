@@ -1,4 +1,4 @@
-//! Hotlink: one-hot pointer links checked by sum-checks, in place of the bus.
+//! Hotwire: one-hot pointer links checked by sum-checks, in place of the bus.
 //!
 //! Every row of an instruction table names what it touches by pointers: its cycle, the memory cells it reads
 //! and writes, and its instruction in the program. Each pointer is committed one-hot ([`pointer`]), so a

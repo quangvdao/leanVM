@@ -410,7 +410,7 @@ pub(crate) fn prove_tampered(
         pcs::commit(&mut ps, &w.q, w.layout.shape, log_inv_rate)
     });
 
-    // Hotlink (§link): the pointer links in place of the bus, and JUMP's identities with them. Its claims, the public
+    // Hotwire (§link): the pointer links in place of the bus, and JUMP's identities with them. Its claims, the public
     // input's and the Keccak reduction's are discharged together by ONE WHIR over this commitment (below). The KECCAK
     // value columns are virtual: the input lanes are q_keccak's slots, and the output lanes' values at the row point
     // are the reduction's claim on the permutation's output.

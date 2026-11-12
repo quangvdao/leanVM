@@ -1,5 +1,5 @@
 //! Per-instruction tables (`doc/leanvm/body/07-instruction-tables.tex`). Each opcode is one [`Table`] impl that declares,
-//! in one place, its committed columns, how to fill them from the trace, its links (Hotlink, [`crate::link`]): the
+//! in one place, its committed columns, how to fill them from the trace, its links (Hotwire, [`crate::link`]): the
 //! state it steps, the instruction it executes and the memory cells it touches, each named by a one-hot pointer
 //! column, and its degree-2 constraint. Column indices here are *local* (`0..n_committed_columns`);
 //! `cpu`'s schema offsets them to global witness columns.
@@ -113,7 +113,7 @@ pub struct Links {
 }
 
 impl Links {
-    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access's pointer
+    /// The pointer columns, in the order Hotwire numbers them: the cycle, the bytecode, then each access's pointer
     /// in order of first use.
     pub fn pointers(&self) -> Vec<usize> {
         let mut out = vec![self.state.cycle, self.bytecode.pointer];

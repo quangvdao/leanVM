@@ -1,4 +1,4 @@
-//! Hotlink's row side: one sum-check over every table's rows, then over the pointer columns.
+//! Hotwire's row side: one sum-check over every table's rows, then over the pointer columns.
 //!
 //! The rows are bound lowest variable first, so a round pairs consecutive rows of a table, which are consecutive
 //! executions of its opcode. A table of `2^m` rows takes part from round 1 and is finished after `m` rounds; from

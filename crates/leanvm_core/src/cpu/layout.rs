@@ -147,7 +147,7 @@ pub struct Layout {
     /// Rows per table the program executed, at most `2^taus[t]`: the rest are padding
     /// rows (§sec:e2e-pad).
     pub rows: [usize; tables::N_TABLES],
-    /// The bits of every Hotlink pointer ([`crate::link`]): enough for the cycles `0..=T`, the
+    /// The bits of every Hotwire pointer ([`crate::link`]): enough for the cycles `0..=T`, the
     /// memory and the program.
     pub pointer_width: usize,
 }
@@ -496,7 +496,7 @@ pub(crate) fn layout_of(
     }
 }
 
-/// The bits of every Hotlink pointer: `W = max(t, κ, k_bc)` with `t = ⌈log2(T + 1)⌉`, so the cycles `0..=T`,
+/// The bits of every Hotwire pointer: `W = max(t, κ, k_bc)` with `t = ⌈log2(T + 1)⌉`, so the cycles `0..=T`,
 /// every memory cell and every instruction have an index below `2^W`.
 pub fn pointer_width(log_mem: usize, log_bytecode: usize, cycles: usize) -> usize {
     let t = (usize::BITS - cycles.leading_zeros()) as usize;

@@ -66,7 +66,7 @@ fn the_wire_layout_is_pinned() {
 /// walks a map. A fixed `kbc` is enough: reproducibility does not depend on
 /// the size being the fixed point.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn guest_compiles_reproducibly() {
     let (one, two) = (compile_guest(20), compile_guest(20));
     assert_eq!(
@@ -202,7 +202,7 @@ fn aggregate_mixed_leaf() {
 /// the coverage table then needs a duplicate slot in both regions, and each
 /// child's two claim lists have to land in their own.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn aggregate_mixed_two_to_one() {
     leanvm_core::init_prover();
     let xmss = get_signers(6);
@@ -224,7 +224,7 @@ fn aggregate_mixed_two_to_one() {
 /// claim-absorbing loops run over an empty range and its bound `log(x) <
 /// log(g^0)` (unsatisfiable, so nothing may be written there) is reached.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn aggregate_one_scheme_per_child() {
     leanvm_core::init_prover();
     let lean_xmss_child = prove_leaf(&get_signers(3));
@@ -266,7 +266,7 @@ fn aggregate_one_key_two_messages() {
 }
 
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn guest_column_selectors_match_native_eq() {
     leanvm_core::init_prover();
     let (helpers, _) = include_str!("../../guests/lean_ethereum.py")
@@ -337,7 +337,7 @@ def main():
 /// list's group loop and then a partial last group, while the left leaf's list is
 /// a partial group alone.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn aggregate_two_to_one() {
     leanvm_core::init_prover();
     let big = 2 * CLAIM_GROUP + 3;
@@ -433,7 +433,7 @@ fn invalid_da_selections_are_rejected_before_building_the_proof() {
 /// root, the first's by default or the one it selects, or none; a node with blobs
 /// publishes their matrix's, whatever its children hold.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn a_node_passes_on_one_childs_da_root() {
     leanvm_core::init_prover();
     let signers = get_signers(SMALL_LEAF_SIZE);
@@ -513,7 +513,7 @@ fn forged_da_hints_are_rejected() {
 /// exponent that satisfies the product identity must fail the range check in
 /// `list_split` itself, not reach the dispatch as a wild jump.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn list_split_rejects_a_negative_rest() {
     let (helpers, _) = include_str!("../../guests/lean_ethereum.py")
         .split_once("\ndef main():")
@@ -552,7 +552,7 @@ def main():
 /// The guest accepts committed codewords, and rejects a matrix with one symbol of
 /// one row flipped, though its root and vector are that matrix's: the row is no codeword.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn da_guest_checks_codeword_membership() {
     leanvm_core::init_prover();
     let source = include_str!("../../guests/lean_ethereum.py");
@@ -638,7 +638,7 @@ fn no_payload_publishes_no_root() {
 /// Claims left undeclared take duplicate slots. The first narrowing drops every
 /// claim on one message, the second all but one claim.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn a_node_may_publish_less_than_it_covers() {
     leanvm_core::init_prover();
     let at_a = get_signers(3);
@@ -728,7 +728,7 @@ fn raw_signatures_may_go_undeclared() {
 /// left leaf holds one message, the right both, and the node needs a duplicate
 /// slot for the claim both leaves cover.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn aggregate_two_messages() {
     leanvm_core::init_prover();
     let at_a = get_signers(4);
@@ -773,7 +773,7 @@ fn aggregate_two_messages() {
 }
 
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn aggregate_overlapping_signers() {
     leanvm_core::init_prover();
     let signers = get_signers(40);
@@ -790,7 +790,7 @@ fn aggregate_overlapping_signers() {
 /// the slot it just covered, with the same coverage mark, so write-once memory alone
 /// would not see it: only the gap's `assert_gpow` does.
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn a_child_walk_cannot_step_back() {
     let (helpers, _) = include_str!("../../guests/lean_ethereum.py")
         .split_once("\ndef main():")

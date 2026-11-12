@@ -13,7 +13,7 @@
 //! - [`witness`]: `K`-valued columns stacked into one committed witness.
 //! - [`leaf`]: the coordinates and linear forms the tables' links are written in.
 //! - [`constraints`]: the bus-era table sumcheck's layout, which only the frozen recursion guest still reads.
-//! - [`link`]: Hotlink, one-hot pointer links and the tables' identities checked by sum-checks.
+//! - [`link`]: Hotwire, one-hot pointer links and the tables' identities checked by sum-checks.
 //! - [`tables`]: the six instruction tables (columns, flushes, constraints).
 //! - [`cpu`]: whole-program assembly, control flow, and the prove/verify entry points.
 //! - [`keccak`]: the `KECCAK` glue: the Keccak GKR reduction over the same commitment.

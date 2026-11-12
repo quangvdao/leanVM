@@ -5,7 +5,7 @@ const MSG_1: lean_xmss::Message = [1; lean_xmss::MESSAGE_LEN];
 const MSG_2: lean_xmss::Message = [2; lean_xmss::MESSAGE_LEN];
 
 #[test]
-#[ignore = "the recursion guest still verifies bus proofs: Hotlink is not ported to it"]
+#[ignore = "the recursion guest still verifies bus proofs: Hotwire is not ported to it"]
 fn public_api_end_to_end() {
     setup();
 

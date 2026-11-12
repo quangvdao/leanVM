@@ -1,4 +1,4 @@
-//! One-hot pointers: the chunk layout every Hotlink pointer of a proof shares.
+//! One-hot pointers: the chunk layout every Hotwire pointer of a proof shares.
 //!
 //! A pointer is an index `σ < 2^W`. Its `W` bits split, least significant first, into `d` chunks of widths
 //! `w_i`, and chunk `i` is committed as the `2^{w_i}` indicator bits `[σ_i = v]`, starting at bit
@@ -35,7 +35,7 @@ impl Chunks {
     pub fn new(width: usize) -> Self {
         assert!(
             (1..=MAX_WIDTH).contains(&width),
-            "Hotlink: a {width}-bit pointer does not fit one word"
+            "Hotwire: a {width}-bit pointer does not fit one word"
         );
         let widths = (1..=width)
             .map(|d| {

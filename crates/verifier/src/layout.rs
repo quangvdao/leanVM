@@ -212,7 +212,7 @@ impl Links {
         self.bytecode.as_ref().expect("every table reads the program")
     }
 
-    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access's pointer
+    /// The pointer columns, in the order Hotwire numbers them: the cycle, the bytecode, then each access's pointer
     /// in order of first use.
     pub fn pointers(&self) -> Vec<usize> {
         let mut out = vec![self.state().cycle, self.bytecode_link().pointer];
