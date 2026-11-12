@@ -16,8 +16,8 @@
 
 use crate::cpu::{Drow, Jrow, Krow, Memory, Op, Rows, Srow, Trace};
 use crate::leaf::BusForm;
-use crate::link::pointer::Chunks;
 use crate::leaf::Coord::{self, Col, Const, GCol, Prod};
+use crate::link::pointer::Chunks;
 use primitives::field::{F64, F192, mul_by_g};
 
 // ---- the identities ----------------------------------------------------------
@@ -93,11 +93,12 @@ pub struct BytecodeLink {
     pub operands: Vec<Coord>,
 }
 
-/// A row's memory access: its pointer, the column gating it if any, the address `g^σ` it names as a form, and the
-/// word's three limbs.
+/// A row's memory access: its pointer and how far past the pointer's cell it reads, the column gating it if any,
+/// the address `g^σ` it names as a form, and the word's three limbs.
 #[derive(Clone, Debug)]
 pub struct Access {
     pub pointer: usize,
+    pub shift: usize,
     pub gate: Option<usize>,
     pub addr: Coord,
     pub vals: [Coord; 3],
@@ -112,12 +113,21 @@ pub struct Links {
 }
 
 impl Links {
-    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access.
+    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access's pointer
+    /// in order of first use.
     pub fn pointers(&self) -> Vec<usize> {
-        [self.state.cycle, self.bytecode.pointer]
-            .into_iter()
-            .chain(self.memory.iter().map(|a| a.pointer))
-            .collect()
+        let mut out = vec![self.state.cycle, self.bytecode.pointer];
+        for a in &self.memory {
+            if !out[2..].contains(&a.pointer) {
+                out.push(a.pointer);
+            }
+        }
+        out
+    }
+
+    /// The largest shift any access takes.
+    pub fn max_shift(&self) -> usize {
+        self.memory.iter().map(|a| a.shift).max().unwrap_or(0)
     }
 }
 
@@ -203,16 +213,35 @@ impl FlushBuilder {
     /// form: the cell then holds whatever the form says, which removes both the value
     /// columns and the identity that used to tie them (§sec:m3).
     pub(crate) fn memory_coords(&mut self, addr: Coord, pointer: usize, vals: [Coord; 3]) {
-        self.memory_pushing(GCol(pointer, 1), None, addr, pointer, vals);
+        self.memory_shifted(addr, pointer, 0, None, vals);
     }
 
-    /// [`Self::memory_coords`] when the column `flag` is 1; at 0 the access takes part in no link.
-    pub(crate) fn memory_coords_if(&mut self, flag: usize, addr: Coord, pointer: usize, vals: [Coord; 3]) {
-        let counter = Coord::Sum(vec![Col(pointer), Prod(flag, pointer, 1), Prod(flag, pointer, 0)]);
-        self.memory_pushing(counter, Some(flag), addr, pointer, vals);
+    /// The access to the cell `shift` past the one the pointer column `pointer` names, when the column `gate` is 1
+    /// if there is one; at 0 the access takes part in no link.
+    pub(crate) fn memory_shifted(
+        &mut self,
+        addr: Coord,
+        pointer: usize,
+        shift: usize,
+        gate: Option<usize>,
+        vals: [Coord; 3],
+    ) {
+        let counter = match gate {
+            None => GCol(pointer, 1),
+            Some(flag) => Coord::Sum(vec![Col(pointer), Prod(flag, pointer, 1), Prod(flag, pointer, 0)]),
+        };
+        self.memory_pushing(counter, gate, addr, pointer, shift, vals);
     }
 
-    fn memory_pushing(&mut self, counter: Coord, gate: Option<usize>, addr: Coord, pointer: usize, vals: [Coord; 3]) {
+    fn memory_pushing(
+        &mut self,
+        counter: Coord,
+        gate: Option<usize>,
+        addr: Coord,
+        pointer: usize,
+        shift: usize,
+        vals: [Coord; 3],
+    ) {
         let mut push = vec![Const(SEP_MEM), addr.clone(), counter];
         let mut pull = vec![Const(SEP_MEM), addr.clone(), Col(pointer)];
         push.extend_from_slice(&vals);
@@ -220,6 +249,7 @@ impl FlushBuilder {
         self.pair(push, pull);
         self.memory.push(Access {
             pointer,
+            shift,
             gate,
             addr,
             vals,
@@ -698,7 +728,9 @@ impl Table for SetTable {
             let k = imm(r).1;
             k.to_limbs().map(F64)
         });
-        ctx.cols(out, rows, R, |r| [ctx.ptr(r.fp + imm(r).0), ctx.ptr(r.pc), ctx.ptr(r.step)]);
+        ctx.cols(out, rows, R, |r| {
+            [ctx.ptr(r.fp + imm(r).0), ctx.ptr(r.pc), ctx.ptr(r.step)]
+        });
     }
 }
 
@@ -978,7 +1010,6 @@ impl Table for JumpTable {
 struct KeccakTable;
 
 pub(crate) mod keccakt {
-    use crate::keccak::ROW_CELLS;
     use primitives::hash::STATE_LANES;
 
     pub const PC: usize = 0;
@@ -991,8 +1022,8 @@ pub(crate) mod keccakt {
     pub const FREE: usize = OUT_ALL + 1; // the read limb that holds no lane
     pub const V_IN: usize = FREE + 1; // the 25 input lanes, in lane order …
     pub const V_OUT: usize = V_IN + STATE_LANES; // … and the 25 output lanes
-    pub const R0: usize = V_OUT + STATE_LANES; // one pointer per cell, in flush order
-    pub const RBC: usize = R0 + ROW_CELLS;
+    pub const R0: usize = V_OUT + STATE_LANES; // one pointer per offset operand, at the cell it names
+    pub const RBC: usize = R0 + 8;
     pub const CYC: usize = RBC + 1;
     pub const N: usize = CYC + 1;
 }
@@ -1018,14 +1049,14 @@ impl Table for KeccakTable {
         keccakt::N
     }
     fn count_columns(&self) -> &'static [usize] {
-        const COUNTS: [usize; crate::keccak::ROW_CELLS + 1] = {
-            let mut c = [0usize; crate::keccak::ROW_CELLS + 1];
+        const COUNTS: [usize; 9] = {
+            let mut c = [0usize; 9];
             let mut i = 0;
-            while i < crate::keccak::ROW_CELLS {
+            while i < 8 {
                 c[i] = keccakt::R0 + i;
                 i += 1;
             }
-            c[crate::keccak::ROW_CELLS] = keccakt::RBC;
+            c[8] = keccakt::RBC;
             c
         };
         &COUNTS
@@ -1048,7 +1079,8 @@ impl Table for KeccakTable {
         let operands: Vec<Coord> = (O_M0..=OUT_ALL).map(Col).collect();
         f.bytecode(PC, RBC, OP_KECCAK, &operands);
         // Thirteen cells read, then up to thirteen written: output cell 0 always, cell 1 as `OUT_TWO` says, the
-        // rest as `OUT_ALL` says. A consecutive cell is a free ×g on the product's g-power.
+        // rest as `OUT_ALL` says. A consecutive cell is a free ×g on the product's g-power, and the cell `step` past
+        // its operand's pointer.
         let (even, odd) = (cell_lanes(false), cell_lanes(true));
         for (c, &(operand, step)) in KECCAK_CELLS.iter().enumerate() {
             let (s, values, flag, free) = if c < STATE_CELLS {
@@ -1059,11 +1091,12 @@ impl Table for KeccakTable {
             let lo = layout_limb(even[s].0, odd[s].0, values, flag, free);
             let hi = layout_limb(even[s].1, odd[s].1, values, flag, free);
             let (addr, vals) = (Prod(FP, O_M0 + operand, step), [lo, hi, Const(F64::ZERO)]);
-            match c.checked_sub(STATE_CELLS) {
-                None | Some(0) => f.memory_coords(addr, R0 + c, vals),
-                Some(1) => f.memory_coords_if(OUT_TWO, addr, R0 + c, vals),
-                Some(_) => f.memory_coords_if(OUT_ALL, addr, R0 + c, vals),
-            }
+            let gate = match c.checked_sub(STATE_CELLS) {
+                None | Some(0) => None,
+                Some(1) => Some(OUT_TWO),
+                Some(_) => Some(OUT_ALL),
+            };
+            f.memory_shifted(addr, R0 + operand, step as usize, gate, vals);
         }
     }
     /// Every column but the input lanes, which are `q_keccak`'s and have no window here. The output lanes are the
@@ -1105,12 +1138,7 @@ impl Table for KeccakTable {
             primitives::hash::keccak_f(&mut lanes);
             lanes.map(F64)
         });
-        // A cell the row does not write takes part in no link, and points at cell 0.
-        ctx.cols(out, rows, R0, |r| {
-            let k = op(r);
-            let written = crate::keccak::STATE_CELLS + k.out_cells.cells();
-            std::array::from_fn::<_, { crate::keccak::ROW_CELLS }, _>(|c| ctx.ptr(if c < written { k.cell(r.fp, c) } else { 0 }))
-        });
+        ctx.cols(out, rows, R0, |r| op(r).offsets.map(|o| ctx.ptr(r.fp + o)));
         ctx.cols(out, rows, RBC, |r| [ctx.ptr(r.pc), ctx.ptr(r.step)]);
     }
 }

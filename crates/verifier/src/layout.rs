@@ -121,7 +121,6 @@ fn prod(a: usize, b: usize, exponent: u64) -> Form {
     Form::term(vec![a.min(b), a.max(b)], gpow(exponent))
 }
 
-
 /// A row's step of the state chain: its cycle pointer, its `(pc, fp)`, and the successor state it derives.
 #[derive(Clone, Debug)]
 pub struct StateLink {
@@ -140,10 +139,12 @@ pub struct BytecodeLink {
     pub operands: Vec<Form>,
 }
 
-/// A row's memory access: its pointer, the column gating it if any, the address and the word's three limbs.
+/// A row's memory access: its pointer and how far past the pointer's cell it reads, the column gating it if any,
+/// the address and the word's three limbs.
 #[derive(Clone, Debug)]
 pub struct Access {
     pub pointer: usize,
+    pub shift: usize,
     pub gate: Option<usize>,
     pub address: Form,
     pub values: [Form; 3],
@@ -181,19 +182,16 @@ impl Links {
     }
 
     fn memory(&mut self, address: Form, pointer: usize, values: &[Form; 3]) {
-        self.memory.push(Access {
-            pointer,
-            gate: None,
-            address,
-            values: values.clone(),
-        });
+        self.memory_shifted(address, pointer, 0, None, values);
     }
 
-    /// `memory` when the column `flag` is 1; at 0 the access takes part in no link.
-    fn memory_if(&mut self, flag: usize, address: Form, pointer: usize, values: &[Form; 3]) {
+    /// The access to the cell `shift` past the one `pointer` names, when the column `gate` is 1 if there is one; at
+    /// 0 the access takes part in no link.
+    fn memory_shifted(&mut self, address: Form, pointer: usize, shift: usize, gate: Option<usize>, values: &[Form; 3]) {
         self.memory.push(Access {
             pointer,
-            gate: Some(flag),
+            shift,
+            gate,
             address,
             values: values.clone(),
         });
@@ -213,12 +211,21 @@ impl Links {
         self.bytecode.as_ref().expect("every table reads the program")
     }
 
-    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access.
+    /// The pointer columns, in the order Hotlink numbers them: the cycle, the bytecode, then each access's pointer
+    /// in order of first use.
     pub fn pointers(&self) -> Vec<usize> {
-        [self.state().cycle, self.bytecode_link().pointer]
-            .into_iter()
-            .chain(self.memory.iter().map(|access| access.pointer))
-            .collect()
+        let mut out = vec![self.state().cycle, self.bytecode_link().pointer];
+        for access in &self.memory {
+            if !out[2..].contains(&access.pointer) {
+                out.push(access.pointer);
+            }
+        }
+        out
+    }
+
+    /// The largest shift any access takes.
+    pub fn max_shift(&self) -> usize {
+        self.memory.iter().map(|a| a.shift).max().unwrap_or(0)
     }
 }
 
@@ -244,7 +251,9 @@ impl Table {
 fn links_arith(opcode: usize, multiply: bool) -> Links {
     let [pc, fp, o_a, o_b, o_c, ix_a, ix_b, ix_c, ix_bc, ix_cycle] = cols(
         ARITH_COLUMNS,
-        ["pc", "fp", "o_a", "o_b", "o_c", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle"],
+        [
+            "pc", "fp", "o_a", "o_b", "o_c", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle",
+        ],
     );
     let va = cols(ARITH_COLUMNS, ["va_0", "va_1", "va_2"]);
     let vb = cols(ARITH_COLUMNS, ["vb_0", "vb_1", "vb_2"]);
@@ -376,12 +385,15 @@ fn links_keccak() -> Links {
     // The thirteen cells read (four addressed ones, the tail run, b8, the cap run), then the thirteen written, each
     // holding its lanes in the layout its flag names: a read cell's free lane is the column `free`, a written one's zero.
     // Output cell 0 is always written, cell 1 when `out_two` is 1, and cells 2..13 when `out_all` is 1.
-    let address = |cell: usize| match cell {
-        0..4 => prod(fp, o_m[cell], 0),
-        4..8 => prod(fp, o_tail, cell as u64 - 4),
-        8 => prod(fp, o_b8, 0),
-        _ => prod(fp, o_cap, cell as u64 - 9),
+    // A cell's operand, as `KECCAK_HEAD` orders the eight, and its step past the operand's cell, whose pointer is
+    // `KECCAK_IX + operand`.
+    let part = |cell: usize| match cell {
+        0..4 => (cell, 0),
+        4..8 => (4, cell - 4),
+        8 => (5, 0),
+        _ => (6, cell - 9),
     };
+    let offsets = [o_m[0], o_m[1], o_m[2], o_m[3], o_tail, o_b8, o_cap, o_out];
     let (even, odd) = (keccak_cell_lanes(false), keccak_cell_lanes(true));
     for (side, lanes, flag, missing) in [(0, KECCAK_IN, in_odd, Some(free)), (1, KECCAK_OUT, out_odd, None)] {
         let lane = |lane: Option<usize>| lane.map(|lane| lanes + lane);
@@ -392,15 +404,14 @@ fn links_keccak() -> Links {
                 limb(even[cell].1, odd[cell].1),
                 constant(ZERO),
             ];
-            let pointer = KECCAK_IX + KECCAK_CELLS * side + cell;
-            match (side, cell) {
-                (0, _) => links.memory(address(cell), pointer, &values),
-                (_, 0) => links.memory(prod(fp, o_out, 0), pointer, &values),
-                _ => {
-                    let flag = if cell == 1 { out_two } else { out_all };
-                    links.memory_if(flag, prod(fp, o_out, cell as u64), pointer, &values);
-                }
-            }
+            let ((operand, step), gate) = match (side, cell) {
+                (0, _) => (part(cell), None),
+                (_, 0) => ((7, 0), None),
+                (_, 1) => ((7, 1), Some(out_two)),
+                _ => ((7, cell), Some(out_all)),
+            };
+            let address = prod(fp, offsets[operand], step as u64);
+            links.memory_shifted(address, KECCAK_IX + operand, step, gate, &values);
         }
     }
     links
@@ -430,7 +441,7 @@ const KECCAK_CELLS: usize = 13; // a sponge state, read then written
 pub const KECCAK_IN: usize = KECCAK_HEAD.len();
 pub const KECCAK_OUT: usize = KECCAK_IN + STATE_LANES;
 const KECCAK_IX: usize = KECCAK_OUT + STATE_LANES;
-const KECCAK_IX_BC: usize = KECCAK_IX + 2 * KECCAK_CELLS;
+const KECCAK_IX_BC: usize = KECCAK_IX + 8;
 const KECCAK_CYCLE: usize = KECCAK_IX_BC + 1;
 
 /// The local KECCAK column riding spare slot `k` (`cpu::keccak_value` in the prover): its
@@ -470,7 +481,7 @@ fn qkeccak_slot(column: usize) -> Option<usize> {
 
 fn keccak_columns() -> Vec<String> {
     let lanes = |prefix: &'static str| (0..STATE_LANES).map(move |lane| format!("{prefix}_{lane}"));
-    let pointers = (0..2 * KECCAK_CELLS).map(|cell| format!("ix_{cell}"));
+    let pointers = ["m0", "m1", "m2", "m3", "tail", "b8", "cap", "out"].map(|operand| format!("ix_{operand}"));
     let head = KECCAK_HEAD.iter().map(|name| name.to_string());
     head.chain(lanes("in"))
         .chain(lanes("out"))
@@ -536,7 +547,12 @@ fn keccak_shape(table_log_heights: &[usize]) -> KeccakShape {
 /// Every column's log size, in global order: the framework's, q_keccak's, then each table's block.
 fn column_kappas(tables: &[Table], log_memory: usize, table_log_heights: &[usize]) -> Vec<usize> {
     let keccak = keccak_shape(table_log_heights);
-    let mut kappas = vec![log_memory, log_memory, log_memory, keccak.log_steps + keccak.slot_bits()];
+    let mut kappas = vec![
+        log_memory,
+        log_memory,
+        log_memory,
+        keccak.log_steps + keccak.slot_bits(),
+    ];
     for table in tables {
         kappas.extend(vec![table_log_heights[table.opcode]; table.width()]);
     }

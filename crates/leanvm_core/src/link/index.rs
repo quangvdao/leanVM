@@ -165,10 +165,10 @@ impl Scatter {
         }
     }
 
-    /// Add `weight(u)` at the index of each row's word, or the index plus one with `shift` (dropping `2^W`).
-    /// A word whose chunks are not all one-hot adds at every index of it ([`Chunks::indices`]), which is what
-    /// the row side's `Φ_0` and `Φ_1` of that word sum to.
-    pub fn add_words(&self, chunks: &Chunks, words: &[u64], shift: bool, weight: impl Fn(usize) -> F192 + Sync) {
+    /// Add `weight(u)` at the index of each row's word plus `shift`, dropping indices past `2^W`. A word whose
+    /// chunks are not all one-hot adds at every index of it ([`Chunks::indices`]), which is what the row side's
+    /// `Φ_s` of that word sums to.
+    pub fn add_words(&self, chunks: &Chunks, words: &[u64], shift: usize, weight: impl Fn(usize) -> F192 + Sync) {
         let top = 1usize << chunks.width;
         parallel::for_each_chunk(words.len().div_ceil(TASK_PAIRS), |start, end| {
             for task in start..end {
@@ -178,7 +178,7 @@ impl Scatter {
                         continue;
                     }
                     let mut add = |j: usize| {
-                        let j = j + usize::from(shift);
+                        let j = j + shift;
                         if j < top {
                             self.add(j, w);
                         }
@@ -311,7 +311,7 @@ mod tests {
             let (low, carry) = ChunkEq::shift(&chunks, &r);
             for shift in [false, true] {
                 let scatter = Scatter::new(top);
-                scatter.add_words(&chunks, &words, shift, |u| weights[u]);
+                scatter.add_words(&chunks, &words, usize::from(shift), |u| weights[u]);
                 let array = scatter.into_vec();
                 let rows: F192 = words
                     .iter()

@@ -109,6 +109,11 @@ impl Chunks {
         walk(self, word, 0, 0, f);
     }
 
+    /// Where chunk `i`'s indicator bits start in a word.
+    pub fn word_shift(&self, i: usize) -> usize {
+        self.word_shifts[i]
+    }
+
     /// Bit `b` of a word: its chunk and the value it indicates, `None` past the chunks.
     pub fn slot(&self, b: usize) -> Option<(usize, usize)> {
         (0..self.d())
@@ -122,14 +127,129 @@ impl Chunks {
     }
 }
 
-/// The pointer shifted by one, `Φ_1 = (1 0)·Λ_1⋯Λ_d·(1 0)ᵀ`, from each chunk's `D_i`, `A_i` and `B_i`: the
-/// state is the pair (no carry, carry), which chunk 0 starts at `(A_0, B_0)`.
-pub fn shifted(d: &[F192], a: &[F192], b: &[F192]) -> F192 {
-    let (mut x, mut y) = (a[0], b[0]);
-    for i in 1..d.len() {
-        (x, y) = (x * d[i] + y * a[i], y * b[i]);
+/// The carries out of chunk 0 a shift of at most `max_shift` leaves: none with one chunk, where a carry out is past
+/// `2^W`. Every later chunk is at least two bits wide, so it passes on a carry of at most one.
+pub fn max_carry(chunks: &Chunks, max_shift: usize) -> usize {
+    if chunks.d() == 1 {
+        return 0;
+    }
+    let carry = ((1 << chunks.widths[0]) - 1 + max_shift) >> chunks.widths[0];
+    assert!(chunks.widths[1..].iter().all(|&w| carry <= 1 << w));
+    carry
+}
+
+/// `tbl[v] = eq(e, (v + a) mod 2^w)` where `(v + a) >> w = out`, zero elsewhere: chunk `i` taking `a` in and passing
+/// `out` on, from its eq table `e` over `2^w` values (Binary Jolt's carry matrices, for any amount).
+pub fn carry_table(e: &[F192], a: usize, out: usize) -> Vec<F192> {
+    let n = e.len();
+    (0..n)
+        .map(|v| if (v + a) / n == out { e[(v + a) % n] } else { F192::ZERO })
+        .collect()
+}
+
+/// A shifted pointer from its chunks' values: `start[c]`, chunk 0 with carry `c` out, then per later chunk `D_i`
+/// and `link(i, c, out)`, the chunk taking carry `c ≥ 1` in and passing `out ≤ 1` on. A carry out of the top chunk
+/// is past `2^W`, which no index is.
+pub fn chain(start: &[F192], d: usize, eq: impl Fn(usize) -> F192, link: impl Fn(usize, usize, usize) -> F192) -> F192 {
+    let mut x = start[0];
+    let mut carries: Vec<F192> = start[1..].to_vec();
+    for i in 1..d {
+        let mut out = F192::ZERO;
+        x *= eq(i);
+        for (c, &y) in carries.iter().enumerate() {
+            x += y * link(i, c + 1, 0);
+            out += y * link(i, c + 1, 1);
+        }
+        carries = vec![out];
     }
     x
+}
+
+/// The pointer shifted by one from each chunk's `D_i`, `A_i` (carry one in, none out) and `B_i` (carry one in and
+/// out): [`chain`] with chunk 0 starting at `(A_0, B_0)`.
+pub fn shifted(d: &[F192], a: &[F192], b: &[F192]) -> F192 {
+    chain(
+        &[a[0], b[0]],
+        d.len(),
+        |i| d[i],
+        |i, _, out| if out == 0 { a[i] } else { b[i] },
+    )
+}
+
+/// The shift tables at a `W`-point `r`: per shift `s ≤ max_shift`, chunk 0's table for each carry it passes on, and
+/// per later chunk, its table for each carry `c ≥ 1` in and `out ≤ 1` on.
+#[derive(Clone, Debug)]
+pub struct Shifts {
+    pub max_shift: usize,
+    pub carry: usize,
+    /// `start[s][c]`: chunk 0's table under shift `s` passing carry `c` on.
+    pub start: Vec<Vec<Vec<F192>>>,
+    /// `links[i][2·(c − 1) + out]`, chunk `i`'s tables (empty for chunk 0).
+    pub links: Vec<Vec<Vec<F192>>>,
+}
+
+impl Shifts {
+    pub fn new(chunks: &Chunks, eq: &ChunkEq, max_shift: usize) -> Self {
+        let carry = max_carry(chunks, max_shift);
+        let start = (0..=max_shift)
+            .map(|s| (0..=carry).map(|c| carry_table(&eq.tables[0], s, c)).collect())
+            .collect();
+        let links = (0..chunks.d())
+            .map(|i| {
+                if i == 0 {
+                    return Vec::new();
+                }
+                (1..=carry)
+                    .flat_map(|c| (0..2).map(move |out| (c, out)))
+                    .map(|(c, out)| carry_table(&eq.tables[i], c, out))
+                    .collect()
+            })
+            .collect();
+        Self {
+            max_shift,
+            carry,
+            start,
+            links,
+        }
+    }
+
+    /// Chunk 0's tables for `Σ_s μ_s·Φ_s` over `weights = [(s, μ_s)]`, one per carry passed on.
+    pub fn combined_start(&self, weights: &[(usize, F192)]) -> Vec<Vec<F192>> {
+        (0..=self.carry)
+            .map(|c| {
+                let n = self.start[0][0].len();
+                let mut t = vec![F192::ZERO; n];
+                for &(s, mu) in weights {
+                    for (o, &e) in t.iter_mut().zip(&self.start[s][c]) {
+                        *o += mu * e;
+                    }
+                }
+                t
+            })
+            .collect()
+    }
+}
+
+/// A functional of chunk `i` with table `table` at a word: a lookup when the chunk is one-hot, the sum over its set
+/// bits otherwise.
+#[inline(always)]
+pub fn eval_chunk(chunks: &Chunks, table: &[F192], word: u64, i: usize) -> F192 {
+    let bits = chunks.bits(word, i);
+    if bits & bits.wrapping_sub(1) == 0 {
+        if bits == 0 {
+            F192::ZERO
+        } else {
+            table[bits.trailing_zeros() as usize]
+        }
+    } else {
+        let mut sum = F192::ZERO;
+        let mut rest = bits;
+        while rest != 0 {
+            sum += table[rest.trailing_zeros() as usize];
+            rest &= rest - 1;
+        }
+        sum
+    }
 }
 
 /// `Π_h ρ_h·(1 + ρ_h)`: what `D(ρ)·D(1 + ρ)` is for every one-hot chunk (the mirror test of Emile Wambsgans).
@@ -186,26 +306,10 @@ impl ChunkEq {
         (Self { tables: low }, Self { tables: carry })
     }
 
-    /// `D_i` of a word: a lookup when the chunk is one-hot, the sum over its set bits otherwise.
+    /// `D_i` of a word.
     #[inline(always)]
     pub fn eval(&self, chunks: &Chunks, word: u64, i: usize) -> F192 {
-        let bits = chunks.bits(word, i);
-        let table = &self.tables[i];
-        if bits & bits.wrapping_sub(1) == 0 {
-            if bits == 0 {
-                F192::ZERO
-            } else {
-                table[bits.trailing_zeros() as usize]
-            }
-        } else {
-            let mut sum = F192::ZERO;
-            let mut rest = bits;
-            while rest != 0 {
-                sum += table[rest.trailing_zeros() as usize];
-                rest &= rest - 1;
-            }
-            sum
-        }
+        eval_chunk(chunks, &self.tables[i], word, i)
     }
 
     /// `D_i` from a word's 64 bit-slices: the functional is linear in the bits.
@@ -247,7 +351,7 @@ mod tests {
     #[test]
     fn a_word_at_a_point_is_eq_of_its_index() {
         let mut rng = Rng::new(7);
-        for w in [5, 13, 22, 24] {
+        for w in [5, 7, 13, 22, 23, 24] {
             let chunks = Chunks::new(w);
             let r = rng.ext_vec(w);
             let eqs = ChunkEq::at(&chunks, &r);
@@ -280,6 +384,26 @@ mod tests {
                     expected,
                     "sigma + 1 = {next}"
                 );
+                let shifts = Shifts::new(&chunks, &eqs, 12);
+                for s in 1..=12 {
+                    let start: Vec<F192> = (0..=shifts.carry)
+                        .map(|c| eval_chunk(&chunks, &shifts.start[s][c], word, 0))
+                        .collect();
+                    let value = chain(
+                        &start,
+                        chunks.d(),
+                        |i| eqs.eval(&chunks, word, i),
+                        |i, c, out| eval_chunk(&chunks, &shifts.links[i][2 * (c - 1) + out], word, i),
+                    );
+                    let next = sigma + s;
+                    let expected = if next >> w == 0 {
+                        let bits: Vec<F192> = (0..w).map(|h| F192::new(((next >> h) & 1) as u64, 0, 0)).collect();
+                        eq_eval(&r, &bits)
+                    } else {
+                        F192::ZERO
+                    };
+                    assert_eq!(value, expected, "sigma + {s}");
+                }
                 for i in 0..chunks.d() {
                     let product = d.eval(&chunks, word, i) * dbar.eval(&chunks, word, i);
                     assert_eq!(product, mirror(&rho[..chunks.widths[i]]));

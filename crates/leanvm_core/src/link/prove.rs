@@ -98,6 +98,48 @@ impl Plan {
     fn gate_aux(&self, gate: usize) -> usize {
         1 + self.gates.iter().position(|&g| g == gate).expect("a gate")
     }
+
+    /// A pointer column's coefficient on `ω_F` from the access it takes unshifted, and its shift groups, one per
+    /// gate, from the accesses it takes shifted; `c` is `η_mm·Y(r)`.
+    fn access_coefs(&self, pointer: usize, mu: &[F192], c: F192) -> (Coef, Coef, Vec<row::ShiftGroup>) {
+        let coef = |gate: Option<usize>| match gate {
+            None => Coef::constant(c),
+            Some(g) => Coef {
+                constant: F192::ZERO,
+                aux: Some((self.gate_aux(g), c)),
+            },
+        };
+        let mut omega = None;
+        let mut groups: Vec<(Option<usize>, row::ShiftGroup)> = Vec::new();
+        for (access, &mu) in self.links.memory.iter().zip(mu) {
+            if access.pointer != pointer {
+                continue;
+            }
+            if access.shift == 0 {
+                assert!(omega.is_none(), "one unshifted access per pointer");
+                let mut base = coef(access.gate);
+                base.constant *= mu;
+                base.aux = base.aux.map(|(a, s)| (a, s * mu));
+                omega = Some(base);
+                continue;
+            }
+            match groups.iter_mut().find(|(g, _)| *g == access.gate) {
+                Some((_, group)) => group.weights.push((access.shift, mu)),
+                None => groups.push((
+                    access.gate,
+                    row::ShiftGroup {
+                        coef: coef(access.gate),
+                        weights: vec![(access.shift, mu)],
+                    },
+                )),
+            }
+        }
+        (
+            omega.unwrap_or(Coef::ZERO),
+            Coef::ZERO,
+            groups.into_iter().map(|(_, g)| g).collect(),
+        )
+    }
 }
 
 /// The link challenges, drawn after the commitment.
@@ -198,7 +240,14 @@ fn payload_forms(table: &dyn Table, plan: &Plan, ch: &Challenges, t: usize) -> (
 }
 
 /// A table's base blocks, every form scaled by `scale`, and `JUMP`'s identities on every row.
-fn blocks(table: &dyn Table, plan: &Plan, ch: &Challenges, t: usize, scale: F192, jump: Option<[F192; 2]>) -> Vec<Block> {
+fn blocks(
+    table: &dyn Table,
+    plan: &Plan,
+    ch: &Challenges,
+    t: usize,
+    scale: F192,
+    jump: Option<[F192; 2]>,
+) -> Vec<Block> {
     let (ungated, gated) = payload_forms(table, plan, ch, t);
     let mut out = vec![Block {
         weight: Weight::Omega,
@@ -223,10 +272,7 @@ fn blocks(table: &dyn Table, plan: &Plan, ch: &Challenges, t: usize, scale: F192
 /// One past the last row that differs from the padrow in any column, at least `rows`, even, at most `2^log_rows`.
 fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usize) -> usize {
     let last = parallel::map_collect(columns.len(), |c| {
-        columns[c]
-            .iter()
-            .rposition(|&v| v != padrow[c])
-            .map_or(0, |u| u + 1)
+        columns[c].iter().rposition(|&v| v != padrow[c]).map_or(0, |u| u + 1)
     });
     let e = last.into_iter().max().unwrap_or(0).max(rows);
     (e + (e & 1)).min(1 << log_rows)
@@ -272,12 +318,7 @@ pub(crate) struct LinkEnd {
 
 /// Prove the links of an execution whose committed columns are `columns` (every global column, virtual ones
 /// included), of `layout`, running `program`.
-pub(crate) fn prove(
-    ps: &mut ProverState,
-    layout: &Layout,
-    columns: &[&[F64]],
-    program: &BytecodeColumns,
-) -> LinkEnd {
+pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], program: &BytecodeColumns) -> LinkEnd {
     let chunks = Chunks::new(layout.pointer_width);
     let width = chunks.width;
     let n = 1usize << width;
@@ -325,17 +366,17 @@ pub(crate) fn prove(
             let (plan, cols, omega, n_t) = (&plans[t], local(t), &omegas[t], rows[t]);
             let pointer = |c: usize| index_words(t, c, &words(cols[c])[..n_t]);
             let cycle = pointer(plan.links.state.cycle);
-            w_plus.add_words(&chunks, &cycle, true, |u| omega[u]);
-            spine.add_words(&chunks, &cycle, false, |u| state_at(t, u));
-            cover.add_words(&chunks, &cycle, false, |_| F192::ONE);
+            w_plus.add_words(&chunks, &cycle, 1, |u| omega[u]);
+            spine.add_words(&chunks, &cycle, 0, |u| state_at(t, u));
+            cover.add_words(&chunks, &cycle, 0, |_| F192::ONE);
             for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
-                let words = pointer(access.pointer);
+                let (words, s) = (pointer(access.pointer), access.shift);
                 match access.gate {
-                    None => w_mem.add_words(&chunks, &words, false, |u| mu * omega[u]),
-                    Some(g) => w_mem.add_words(&chunks, &words, false, |u| (mu * omega[u]).mul_base(cols[g][u])),
+                    None => w_mem.add_words(&chunks, &words, s, |u| mu * omega[u]),
+                    Some(g) => w_mem.add_words(&chunks, &words, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
                 }
             }
-            w_bc.add_words(&chunks, &pointer(plan.links.bytecode.pointer), false, |u| omega[u]);
+            w_bc.add_words(&chunks, &pointer(plan.links.bytecode.pointer), 0, |u| omega[u]);
         }
         let mut spine = spine.into_vec();
         if spine.len() <= cycles {
@@ -367,7 +408,12 @@ pub(crate) fn prove(
         drop(idx);
         let payload: F192 = (0..tables::N_TABLES)
             .map(|t| {
-                let base = Base::new(blocks(all[t], &plans[t], &ch, t, F192::ONE, None), local(t).to_vec(), &padrows[t], None);
+                let base = Base::new(
+                    blocks(all[t], &plans[t], &ch, t, F192::ONE, None),
+                    local(t).to_vec(),
+                    &padrows[t],
+                    None,
+                );
                 base.omega_sum(&omegas[t])
             })
             .sum();
@@ -385,11 +431,31 @@ pub(crate) fn prove(
             vec![payload],
         ];
         let terms = [
-            Term::Product { coef: F192::ONE, a: 0, b: 1 },
-            Term::Product { coef: ch.eta_mem, a: 3, b: 4 },
-            Term::Product { coef: ch.eta_bc, a: 5, b: 6 },
-            Term::Product { coef: ch.eta_cover, a: 7, b: 2 },
-            Term::Product { coef: ch.eta_start, a: 8, b: 1 },
+            Term::Product {
+                coef: F192::ONE,
+                a: 0,
+                b: 1,
+            },
+            Term::Product {
+                coef: ch.eta_mem,
+                a: 3,
+                b: 4,
+            },
+            Term::Product {
+                coef: ch.eta_bc,
+                a: 5,
+                b: 6,
+            },
+            Term::Product {
+                coef: ch.eta_cover,
+                a: 7,
+                b: 2,
+            },
+            Term::Product {
+                coef: ch.eta_start,
+                a: 8,
+                b: 1,
+            },
             Term::Single { coef: F192::ONE, a: 9 },
         ];
         index::prove(width, arrays, &terms, &mut |poly| {
@@ -424,7 +490,8 @@ pub(crate) fn prove(
     let eq_zeta_r = index_end.values[7];
 
     let row_end = tracing::info_span!("Row side").in_scope(|| {
-        let points = RowPoints::new(&chunks, r, &ch.rho);
+        let max_shift = plans.iter().map(|p| p.links.max_shift()).max().unwrap_or(0).max(1);
+        let points = RowPoints::new(&chunks, r, &ch.rho, max_shift);
         let mut q = 0;
         let mut tables_in = Vec::with_capacity(tables::N_TABLES);
         for t in 0..tables::N_TABLES {
@@ -432,41 +499,38 @@ pub(crate) fn prove(
             let ex = explicit[t];
             let pad = &padrows[t];
             let mut aux = vec![(0..ex).map(|u| state_at(t, u)).collect::<Vec<_>>()];
-            aux.extend(plan.gates.iter().map(|&g| cols[g][..ex].iter().map(|&v| F192::from(v)).collect()));
+            aux.extend(
+                plan.gates
+                    .iter()
+                    .map(|&g| cols[g][..ex].iter().map(|&v| F192::from(v)).collect()),
+            );
             let s = &plan.links.state;
             let mut aux_tail = vec![g_pc.mul_base(pad[s.pc]) + g_fp.mul_base(pad[s.fp])];
             aux_tail.extend(plan.gates.iter().map(|&g| F192::from(pad[g])));
             let mut row_columns = Vec::with_capacity(plan.pointers.len());
             for (k, &pointer) in plan.pointers.iter().enumerate() {
-                let (omega, act, plus) = match k {
+                let (omega, act, shifts) = match k {
                     0 => (
                         Coef::ZERO,
                         Coef {
                             constant: ch.eta_cover * eq_zeta_r,
                             aux: Some((0, fresh.spine)),
                         },
-                        Some(fresh.plus),
+                        vec![row::ShiftGroup {
+                            coef: Coef::constant(fresh.plus),
+                            weights: vec![(1, F192::ONE)],
+                        }],
                     ),
-                    1 => (Coef::constant(ch.eta_bc * x_bc_r), Coef::ZERO, None),
-                    _ => {
-                        let access = &plan.links.memory[k - 2];
-                        let c = ch.eta_mem * ch.mu[t][k - 2] * y_mem_r;
-                        let omega = match access.gate {
-                            None => Coef::constant(c),
-                            Some(g) => Coef {
-                                constant: F192::ZERO,
-                                aux: Some((plan.gate_aux(g), c)),
-                            },
-                        };
-                        (omega, Coef::ZERO, None)
-                    }
+                    1 => (Coef::constant(ch.eta_bc * x_bc_r), Coef::ZERO, Vec::new()),
+                    _ => plan.access_coefs(pointer, &ch.mu[t], ch.eta_mem * y_mem_r),
                 };
                 row_columns.push(RowColumn {
                     words: words(cols[pointer]),
                     omega,
                     act,
-                    plus,
+                    shifts,
                     cert: ch.eps[q].iter().map(|&e| fresh.cert * e).collect(),
+                    q,
                 });
                 q += 1;
             }
@@ -488,7 +552,8 @@ pub(crate) fn prove(
                 base: Some(base),
             });
         }
-        row::prove(&chunks, &points, tables_in, true, &mut |poly| {
+        let q_vars = q.next_power_of_two().trailing_zeros() as usize;
+        row::prove(&chunks, &points, tables_in, q_vars, true, &mut |poly| {
             ps.add_round_poly(poly, false);
             ps.sample()
         })
