@@ -83,7 +83,14 @@ fn describe(n_lean_xmss: usize, n_lean_sphincs: usize) -> String {
 /// Proving runs one discarded warmup pass followed by `plan.repeat` measured
 /// passes; see [`bench`] for why the first pass is not
 /// representative and why the cooldown matters.
-pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize, log_inv_rate: usize, plan: Plan) {
+pub fn run_aggregation(
+    n_lean_xmss: usize,
+    n_lean_sphincs: usize,
+    n_blobs: usize,
+    log_inv_rate: usize,
+    plan: Plan,
+    verify_repeat: usize,
+) {
     assert!(
         n_lean_xmss > 0 || n_lean_sphincs > 0 || n_blobs > 0,
         "a leaf needs signatures or blobs"
@@ -107,7 +114,7 @@ pub fn run_aggregation(n_lean_xmss: usize, n_lean_sphincs: usize, n_blobs: usize
         )
         .expect("leaf aggregates")
     });
-    let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
+    let (_, verify_time) = Plan::new(verify_repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(bench::suppress_tracing);
         sig.verify().expect("the leaf aggregate verifies");
     });

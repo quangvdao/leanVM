@@ -33,6 +33,15 @@ struct Cli {
     )]
     repeat: usize,
 
+    /// Verifications of an aggregate whose mean the benchmark reports.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 1,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    verify_repeat: usize,
+
     /// Idle seconds before each measured pass.
     #[arg(long, global = true, default_value_t = 2)]
     cooldown: u64,
@@ -117,7 +126,7 @@ fn main() {
     }
     match cli.command {
         Command::Aggregate { xmss, sphincs, blobs } => {
-            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, plan);
+            benchmark::run_aggregation(xmss, sphincs, blobs, cli.log_inv_rate, plan, cli.verify_repeat);
         }
         Command::Recursion {
             n,
