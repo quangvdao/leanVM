@@ -25,7 +25,7 @@
 
 use super::base::Base;
 use super::pointer::{ChunkEq, Chunks, Shifts, chain, eval_chunk, mirror};
-use primitives::field::F192;
+use primitives::field::{F192, F192Unreduced};
 
 /// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 10`.
 pub const MAX_COEFFS: usize = 12;
@@ -424,6 +424,9 @@ fn pointer_pair(
             start += 1;
         }
     }
+    if p[..len].iter().all(|c| c.is_zero()) {
+        return;
+    }
     let mut scalar = F192::ONE;
     let mut linear = [(F192::ZERO, F192::ZERO); 8];
     let mut n_linear = 0;
@@ -435,15 +438,38 @@ fn pointer_pair(
             n_linear += 1;
         }
     }
-    if scalar != F192::ONE {
-        for v in &mut p[..len] {
-            *v *= scalar;
+    if n_linear == 0 {
+        if scalar != F192::ONE {
+            for v in &mut p[..len] {
+                *v *= scalar;
+            }
         }
+        add_into(acc, &p[..len]);
+        return;
     }
-    for &e in &linear[..n_linear] {
-        len = mul_pair(&mut p, len, e);
+    // The remaining factors' product first, the scalar in its first factor, then one product with `p`: cheaper than
+    // multiplying the longer `p` by each factor in turn.
+    if len == 1 {
+        scalar *= p[0];
     }
-    add_into(acc, &p[..len]);
+    let (a, b) = linear[0];
+    let (a, b) = if scalar == F192::ONE { (a, b) } else { (scalar * a, scalar * b) };
+    let mut r = [F192::ZERO; MAX_COEFFS];
+    r[0] = a;
+    r[1] = a + b;
+    let mut r_len = 2;
+    for &e in &linear[1..n_linear] {
+        r_len = mul_pair(&mut r, r_len, e);
+    }
+    if len == 1 {
+        add_into(acc, &r[..r_len]);
+        return;
+    }
+    for j in 0..len + r_len - 1 {
+        let lo = (j + 1).saturating_sub(r_len);
+        let sum = (lo..=j.min(len - 1)).fold(F192Unreduced::ZERO, |s, i| s ^ p[i].mul_unreduced(r[j - i]));
+        acc[j] += sum.reduce();
+    }
 }
 
 /// `Σ_i ε_i·(D_i(ρ)·D_i(1 + ρ) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
@@ -462,26 +488,26 @@ fn cert_pair(
     same: impl Fn(usize) -> bool,
     pair: impl Fn(usize) -> (F192, F192),
 ) {
-    let mut m = [F192::ZERO; 3];
+    let mut m = [F192Unreduced::ZERO; 3];
     for i in 0..slots.d {
         if skip && clean(i) {
             continue;
         }
         let (x, y, eps) = (pair(slots.rho(i)), pair(slots.rho_bar(i)), cert[i]);
         if skip && one_hot(i) {
-            let t = eps * (x.0 + x.1) * (y.0 + y.1);
-            m[1] += t;
-            m[2] += t;
+            let t = eps.mul_unreduced((x.0 + x.1) * (y.0 + y.1));
+            m[1] ^= t;
+            m[2] ^= t;
         } else if skip && same(i) {
-            m[0] += eps * (x.0 * y.0 + mirrors[i]);
+            m[0] ^= eps.mul_unreduced(x.0 * y.0 + mirrors[i]);
         } else {
             let q = pair_product(x, y);
-            m[0] += eps * (q[0] + mirrors[i]);
-            m[1] += eps * q[1];
-            m[2] += eps * q[2];
+            m[0] ^= eps.mul_unreduced(q[0] + mirrors[i]);
+            m[1] ^= eps.mul_unreduced(q[1]);
+            m[2] ^= eps.mul_unreduced(q[2]);
         }
     }
-    add_into(acc, &m);
+    add_into(acc, &m.map(F192Unreduced::reduce));
 }
 
 /// `ω(X)·m(X)` added to `acc`, `m` of three coefficients.
