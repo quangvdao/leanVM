@@ -24,7 +24,7 @@
 //! like any summand, and the column rounds carry their total `B` as `eq(0, q)·B`.
 
 use super::base::Base;
-use super::pointer::{ChunkEq, Chunks, Shifts, chain, eval_chunk, mirror};
+use super::pointer::{ChunkEq, Chunks, Shifts, SplitEq, chain, eval_chunk, mirror};
 use primitives::field::{F192, F192Unreduced};
 
 /// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 10`.
@@ -119,6 +119,8 @@ pub struct RowPoints {
     pub shifts: Shifts,
     /// `π_{w_i}(ρ)` per chunk.
     pub mirrors: Vec<F192>,
+    /// `eq(r, ·)` over whole pointers.
+    pub split: SplitEq,
 }
 
 impl RowPoints {
@@ -130,6 +132,7 @@ impl RowPoints {
             cert: ChunkEq::certificate(chunks, rho, false),
             cert_bar: ChunkEq::certificate(chunks, rho, true),
             mirrors: chunks.widths.iter().map(|&w| mirror(&rho[..w])).collect(),
+            split: SplitEq::new(r, max_shift),
         }
     }
 
@@ -465,6 +468,70 @@ fn pointer_pair(
     }
 }
 
+/// `acc ← acc + c·f` for `c` of one or two coefficients and the linear `f` through `pair`.
+#[inline(always)]
+fn add_times_pair(acc: &mut Poly, c: &[F192], pair: (F192, F192)) {
+    let (a, b) = (pair.0, pair.0 + pair.1);
+    acc[0] += c[0] * a;
+    if c.len() == 1 || c[1].is_zero() {
+        acc[1] += c[0] * b;
+    } else {
+        acc[1] += (c[0].mul_unreduced(b) ^ c[1].mul_unreduced(a)).reduce();
+        acc[2] += c[1] * b;
+    }
+}
+
+/// [`pointer_pair`] when at most one chunk differs across the pair's words: the pointer and every shifted chain are
+/// then linear in `X`, through their values `phi` and `shifted(g)` at the two rows.
+#[inline(always)]
+fn linear_pointer(
+    acc: &mut Poly,
+    coef: &[F192],
+    groups: &[[F192; 2]],
+    act: Option<(&mut Poly, &[F192])>,
+    phi: (F192, F192),
+    shifted: impl Fn(usize) -> (F192, F192),
+) {
+    add_times_pair(acc, coef, phi);
+    for (g, gc) in groups.iter().enumerate() {
+        if !(gc[0].is_zero() && gc[1].is_zero()) {
+            add_times_pair(acc, gc, shifted(g));
+        }
+    }
+    if let Some((act_acc, c)) = act {
+        add_times_pair(act_acc, c, phi);
+    }
+}
+
+/// A word's index for [`SplitEq`]: `Some(Some(σ))` when every chunk is one-hot, `Some(None)` when a chunk has no
+/// bit set, so the pointer and every shifted chain vanish, and `None` when a chunk has two bits or more.
+#[inline(always)]
+fn word_index(chunks: &Chunks, word: u64) -> Option<Option<usize>> {
+    match chunks.decode(word) {
+        Some(sigma) => Some(Some(sigma)),
+        None => (0..chunks.d()).any(|i| chunks.bits(word, i) == 0).then_some(None),
+    }
+}
+
+/// `at` of each word of a group by its [`word_index`], zero where a chunk has no bit set, folded by the bound
+/// challenges `r`, the first for adjacent words.
+#[inline(always)]
+fn fold_words(index: &[Option<usize>], r: &[F192], at: impl Fn(usize) -> F192) -> F192 {
+    let mut values = [F192::ZERO; MAX_GROUP];
+    for (v, x) in values.iter_mut().zip(index) {
+        *v = x.map_or(F192::ZERO, &at);
+    }
+    let mut len = index.len();
+    for &x in r {
+        len /= 2;
+        for t in 0..len {
+            let (a, b) = (values[2 * t], values[2 * t + 1]);
+            values[t] = if a == b { a } else { a + x * (a + b) };
+        }
+    }
+    values[0]
+}
+
 /// `acc ← acc + p·scalar·Π_j f_j` for the linear `f_j` through `linear[j]`.
 #[inline(always)]
 fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192, F192)]) {
@@ -682,6 +749,8 @@ struct Column<'a> {
     slots: Slots,
     /// Chunk 0's table per group and carry passed on, in slot order.
     starts: Vec<Vec<F192>>,
+    /// Per group, its low tables in [`SplitEq`].
+    split_starts: Vec<Vec<Vec<F192>>>,
     values: Option<Strided>,
     tags: Vec<u8>,
     omega: Coef,
@@ -706,10 +775,16 @@ impl<'a> Column<'a> {
                 points.shifts.combined_start(&g.weights)
             })
             .collect();
+        let split_starts = column
+            .shifts
+            .iter()
+            .map(|g| points.split.shifted_tables(&g.weights))
+            .collect();
         Self {
             words: column.words,
             slots,
             starts,
+            split_starts,
             values: None,
             tags: Vec::new(),
             omega: column.omega,
@@ -1002,23 +1077,47 @@ impl<'a> State<'a> {
                 group_value(chunks, table, i, hi, hi_bits[i], r),
             )
         };
+        // With at most one chunk differing across the words, the pointer at a folded row is the words' pointers
+        // folded, and each word's is one lookup in `points.split`.
+        let mut diff = 0;
+        for &u in lo.iter().chain(hi) {
+            diff |= u ^ lo[0];
+        }
+        let mut index = [[None; MAX_GROUP]; 2];
+        let linear = skip
+            && (0..chunks.d()).filter(|&i| chunks.bits(diff, i) != 0).count() <= 1
+            && [lo, hi].iter().zip(&mut index).all(|(words, index)| {
+                words
+                    .iter()
+                    .zip(index.iter_mut())
+                    .all(|(&u, o)| word_index(chunks, u).map(|x| *o = x).is_some())
+            });
         let slots = &column.slots;
         column.add_terms(
             aux,
             omega,
             act,
             |acc, coef, groups, act| {
-                pointer_pair(
-                    acc,
-                    slots,
-                    coef,
-                    groups,
-                    act,
-                    skip,
-                    same,
-                    |i| points.eq.eval(chunks, lo[0], i),
-                    pair,
-                )
+                if linear {
+                    let (lo, hi) = (&index[0][..n], &index[1][..n]);
+                    let at = |sigma| points.split.at(sigma);
+                    linear_pointer(acc, coef, groups, act, (fold_words(lo, r, at), fold_words(hi, r, at)), |g| {
+                        let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
+                        (fold_words(lo, r, at), fold_words(hi, r, at))
+                    })
+                } else {
+                    pointer_pair(
+                        acc,
+                        slots,
+                        coef,
+                        groups,
+                        act,
+                        skip,
+                        same,
+                        |i| points.eq.eval(chunks, lo[0], i),
+                        pair,
+                    )
+                }
             },
             |acc| {
                 cert_pair(

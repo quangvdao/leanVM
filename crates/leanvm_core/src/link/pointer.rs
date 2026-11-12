@@ -8,7 +8,7 @@
 //! A chunk at a point `r_i ∈ E^{w_i}` is the linear functional `D_i(r_i) = Σ_v eq(r_i, v)·e_v` of its bits, so a
 //! pointer at `r = (r_1, …, r_d)` is `Φ(r) = Π_i D_i(r_i) = eq(r, σ)` when every chunk is one-hot.
 
-use primitives::field::F192;
+use primitives::field::{F192, F192Unreduced};
 use primitives::multilinear::eq_table;
 
 /// The widest pointer one `K` word holds: eight chunks of three bits.
@@ -230,6 +230,62 @@ impl Shifts {
     }
 }
 
+/// `eq(r, σ)` at a `W`-point `r` as two tables, over the low `lo_bits` bits of `σ` and over the rest, so a
+/// pointer whose chunks are one-hot is one product at `r` rather than one factor per chunk.
+#[derive(Clone, Debug)]
+pub struct SplitEq {
+    lo_bits: usize,
+    lo: Vec<F192>,
+    /// Zeros past `2^{W - lo_bits}`, where a shift carries a pointer past `2^W`.
+    hi: Vec<F192>,
+    /// The most a shift of at most `max_shift` carries into the high bits.
+    carry: usize,
+}
+
+impl SplitEq {
+    pub fn new(r: &[F192], max_shift: usize) -> Self {
+        let lo_bits = r.len().div_ceil(2);
+        let carry = ((1 << lo_bits) - 1 + max_shift) >> lo_bits;
+        let mut hi = eq_table(&r[lo_bits..]);
+        hi.resize(hi.len() + carry, F192::ZERO);
+        Self {
+            lo_bits,
+            lo: eq_table(&r[..lo_bits]),
+            hi,
+            carry,
+        }
+    }
+
+    /// `eq(r, σ)`.
+    #[inline(always)]
+    pub fn at(&self, sigma: usize) -> F192 {
+        self.lo[sigma & (self.lo.len() - 1)] * self.hi[sigma >> self.lo_bits]
+    }
+
+    /// The low tables of `Σ_s μ_s·eq(r, σ + s)` over `weights = [(s, μ_s)]`, one per carry into the high bits.
+    pub fn shifted_tables(&self, weights: &[(usize, F192)]) -> Vec<Vec<F192>> {
+        let n = self.lo.len();
+        let mut tables = vec![vec![F192::ZERO; n]; self.carry + 1];
+        for &(s, mu) in weights {
+            for v in 0..n {
+                tables[(v + s) / n][v] += mu * self.lo[(v + s) % n];
+            }
+        }
+        tables
+    }
+
+    /// `Σ_s μ_s·eq(r, σ + s)` from [`Self::shifted_tables`].
+    #[inline(always)]
+    pub fn at_shifted(&self, tables: &[Vec<F192>], sigma: usize) -> F192 {
+        let (lo, hi) = (sigma & (self.lo.len() - 1), sigma >> self.lo_bits);
+        tables
+            .iter()
+            .zip(&self.hi[hi..])
+            .fold(F192Unreduced::ZERO, |sum, (t, &h)| sum ^ t[lo].mul_unreduced(h))
+            .reduce()
+    }
+}
+
 /// A functional of chunk `i` with table `table` at a word: a lookup when the chunk is one-hot, the sum over its set
 /// bits otherwise.
 #[inline(always)]
@@ -403,6 +459,14 @@ mod tests {
                         F192::ZERO
                     };
                     assert_eq!(value, expected, "sigma + {s}");
+                }
+                let split = SplitEq::new(&r, 12);
+                assert_eq!(split.at(sigma), phi);
+                for s in 1..=12 {
+                    let mu = rng.ext();
+                    let tables = split.shifted_tables(&[(s, mu), (1, F192::ONE)]);
+                    let at = |t: usize| if t >> w == 0 { split.at(t) } else { F192::ZERO };
+                    assert_eq!(split.at_shifted(&tables, sigma), mu * at(sigma + s) + at(sigma + 1));
                 }
                 for i in 0..chunks.d() {
                     let product = d.eval(&chunks, word, i) * dbar.eval(&chunks, word, i);
