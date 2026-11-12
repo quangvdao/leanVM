@@ -238,9 +238,11 @@ impl<'a> Base<'a> {
         match &self.folded {
             Some(rows) => f(rows.get(u * s..(u + 1) * s).unwrap_or(&self.tail)),
             None if self.columns.first().is_some_and(|c| u < c.len()) => {
-                let mut row = [F192::ZERO; MAX_SLOTS];
-                self.slots(|c| self.columns[c][u], &mut row[..s]);
-                f(&row[..s])
+                let mut row = [std::mem::MaybeUninit::<F192>::uninit(); MAX_SLOTS];
+                // SAFETY: `F192` is plain data, and `slots` writes each of the first `s` values before `f` reads them.
+                let row = unsafe { &mut *(std::ptr::from_mut(&mut row[..s]) as *mut [F192]) };
+                self.slots(|c| self.columns[c][u], row);
+                f(row)
             }
             None => f(&self.tail),
         }
