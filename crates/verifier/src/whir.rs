@@ -7,7 +7,7 @@ use crate::multilinear::{dot, eq_eval, eq_kernel, log2_strict, multilinear_eval,
 use crate::transcript::Transcript;
 use crate::{VerifierError, require};
 
-const INITIAL_FOLDING_FACTOR: usize = 6;
+pub(crate) const INITIAL_FOLDING_FACTOR: usize = 6;
 const SUBSEQUENT_FOLDING_FACTOR: usize = 4;
 const RS_DOMAIN_INITIAL_REDUCTION_FACTOR: usize = 3;
 const RS_DOMAIN_SUBSEQUENT_REDUCTION_FACTOR: usize = 1;

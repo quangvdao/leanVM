@@ -476,7 +476,13 @@ pub(crate) fn layout_of(
         count_blocks.extend(table.count_columns().iter().map(|&c| table_block(vec![Col(c)])));
     }
 
-    let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus));
+    let mut pointer = vec![false; sch.n];
+    for (t, table) in tables::tables().iter().enumerate() {
+        for column in tables::links(*table).pointers() {
+            pointer[sch.base[t] + column] = true;
+        }
+    }
+    let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus), &pointer);
     Layout {
         push,
         pull,

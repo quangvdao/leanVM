@@ -131,16 +131,57 @@ impl Placement {
     }
 }
 
-pub fn stack_offsets(sizes: &[usize]) -> (Vec<u64>, usize) {
+/// Lay `2^sizes[i]`-word blocks end to end, largest first at aligned offsets and ties by index, and return each block's
+/// offset and the stack's log size, at least `min_log`. A lane of the stack is `2^(log - lane_fold)` words. Inside a size
+/// class smaller than a lane, the `shared` blocks (the pointer columns, which the opening reads at one point) sit at as
+/// few in-lane offsets as [`arrange`] finds, so the opening reads them with as few sets of ring weights.
+pub fn stack_offsets(sizes: &[usize], shared: &[bool], min_log: usize, lane_fold: usize) -> (Vec<u64>, usize) {
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&index| (std::cmp::Reverse(sizes[index]), index));
+    let total: u64 = sizes.iter().map(|&size| 1u64 << size).sum();
+    let log = log2_ceil(total).max(min_log);
+    let lane = log - lane_fold;
     let mut offsets = vec![0; sizes.len()];
-    let mut total = 0;
-    for index in order {
-        offsets[index] = total;
-        total += 1 << sizes[index];
+    let mut start = 0;
+    for class in order.chunk_by(|&a, &b| sizes[a] == sizes[b]) {
+        let size = sizes[class[0]];
+        let per_lane = 1usize << lane.saturating_sub(size).min(usize::BITS as usize - 1);
+        for (&index, slot) in class.iter().zip(arrange(class, shared, per_lane)) {
+            offsets[index] = start + ((slot as u64) << size);
+        }
+        start += (class.len() as u64) << size;
     }
-    (offsets, log2_ceil(total))
+    (offsets, log)
+}
+
+/// The slot of each block in a size class of `per_lane` slots to a lane. The class starts at a multiple of its block
+/// size, so slots `p` and `q` share an in-lane offset exactly when `p ≡ q mod per_lane`. The shared blocks, in index
+/// order, fill the residue with the most free slots (the lowest on a tie) and move to the next such one when it is
+/// full. The other blocks then take the free slots in index order.
+fn arrange(class: &[usize], shared: &[bool], per_lane: usize) -> Vec<usize> {
+    let n = class.len();
+    if per_lane == 1 || per_lane >= n {
+        return (0..n).collect();
+    }
+    let mut free: Vec<Vec<usize>> = (0..per_lane).map(|residue| (residue..n).step_by(per_lane).rev().collect()).collect();
+    let mut slots = vec![usize::MAX; n];
+    let mut residue: Option<usize> = None;
+    for (slot, &index) in slots.iter_mut().zip(class) {
+        if shared[index] {
+            let at = match residue {
+                Some(at) if !free[at].is_empty() => at,
+                _ => (0..per_lane).max_by_key(|&at| (free[at].len(), std::cmp::Reverse(at))).unwrap_or(0),
+            };
+            residue = Some(at);
+            *slot = free[at].pop().unwrap_or(usize::MAX);
+        }
+    }
+    let mut rest: Vec<usize> = free.into_iter().flatten().collect();
+    rest.sort_unstable();
+    for (slot, free) in slots.iter_mut().filter(|slot| **slot == usize::MAX).zip(rest) {
+        *slot = free;
+    }
+    slots
 }
 
 fn selector_point(selector: u64, length: usize) -> Vec<E> {

@@ -28,6 +28,7 @@ pub use layout::{
     min_execution_stacked_log,
 };
 pub use merkle::MerklePath;
+pub use multilinear::stack_offsets;
 pub use transcript::Proof;
 pub use whir::whir_queries;
 

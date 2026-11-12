@@ -74,10 +74,23 @@ pub(crate) fn stack_offsets(kappas: &[Option<usize>]) -> (Vec<usize>, usize) {
 
 /// Per-column placements (offset + n_vars) and the stack's [`StackShape`] from the
 /// columns' log-sizes alone, largest-first at aligned offsets. A `None` kappa marks
-/// a virtual (uncommitted) column. Depends only on lengths, so the verifier can
-/// reconstruct it.
-pub fn placements_of(kappas: &[Option<usize>]) -> (Vec<Placement>, StackShape) {
-    let (offsets, placed) = stack_offsets(kappas);
+/// a virtual (uncommitted) column. The `pointer` columns, which the opening reads at
+/// one point, share in-lane offsets as far as [`verifier::stack_offsets`] can place
+/// them so. Depends only on lengths and which columns are pointers, and the verifier
+/// runs the same function, so it reconstructs the same tiling.
+pub fn placements_of(kappas: &[Option<usize>], pointer: &[bool]) -> (Vec<Placement>, StackShape) {
+    let committed: Vec<usize> = (0..kappas.len()).filter(|&i| kappas[i].is_some()).collect();
+    let sizes: Vec<usize> = committed.iter().map(|&i| kappas[i].unwrap()).collect();
+    let shared: Vec<bool> = committed.iter().map(|&i| pointer[i]).collect();
+    // Floor at the PCS minimum (WHIR's level ladder needs room); tiny
+    // witnesses zero-pad up.
+    let (committed_offsets, mu) =
+        verifier::stack_offsets(&sizes, &shared, crate::pcs::MIN_STACKED_LOG, crate::pcs::LOG_BATCH);
+    let mut offsets = vec![0usize; kappas.len()];
+    for (&i, &offset) in committed.iter().zip(&committed_offsets) {
+        offsets[i] = offset as usize;
+    }
+    let placed: usize = sizes.iter().map(|&k| 1usize << k).sum();
     let placements = kappas
         .iter()
         .zip(&offsets)
@@ -86,9 +99,6 @@ pub fn placements_of(kappas: &[Option<usize>]) -> (Vec<Placement>, StackShape) {
             None => Placement::VIRTUAL,
         })
         .collect();
-    // Floor at the PCS minimum (WHIR's level ladder needs room); tiny
-    // witnesses zero-pad up. Both sides derive this identically from the kappas.
-    let mu = crate::log2_ceil_usize(placed.max(1)).max(crate::pcs::MIN_STACKED_LOG);
     // The columns tile from 0, so the padding is the tail: round it up to a whole
     // lane and the lanes past that are never committed at all.
     let n_lanes = placed.div_ceil(1 << (mu - crate::pcs::LOG_BATCH)).max(1);
@@ -169,7 +179,7 @@ mod tests {
         ];
         for kappas in cases {
             let placed: usize = kappas.iter().flatten().map(|k| 1usize << k).sum();
-            let (placements, shape) = placements_of(&kappas);
+            let (placements, shape) = placements_of(&kappas, &vec![false; kappas.len()]);
             let lane_block = 1usize << (shape.mu - crate::pcs::LOG_BATCH);
 
             assert_eq!(
@@ -187,6 +197,27 @@ mod tests {
             for p in placements.iter().filter(|p| !p.is_virtual()) {
                 assert!(p.offset + (1usize << p.n_vars) <= shape.committed_len());
             }
+        }
+    }
+
+    /// The opening reads every pointer column at one point and pays once per in-lane offset they sit at, so the
+    /// pointers of a size class must take as few in-lane offsets as the class's lanes allow, and the columns must still
+    /// tile from 0 at aligned offsets.
+    #[test]
+    fn pointer_columns_share_in_lane_offsets() {
+        // 64 columns of 2^8 words: the stack floors at 2^MIN_STACKED_LOG, four columns to a lane, 16 lanes.
+        let kappas = vec![Some(8); 64];
+        for n_pointers in [1usize, 5, 16, 17, 40] {
+            let pointer: Vec<bool> = (0..64).map(|i| (i * 7) % 64 < n_pointers).collect();
+            let (placements, shape) = placements_of(&kappas, &pointer);
+            let lane = 1usize << (shape.mu - crate::pcs::LOG_BATCH);
+            let mut offsets: Vec<usize> = placements.iter().map(|p| p.offset).collect();
+            offsets.sort_unstable();
+            assert_eq!(offsets, (0..64).map(|i| i << 8).collect::<Vec<_>>(), "the columns tile from 0");
+            let mut in_lane: Vec<usize> = (0..64).filter(|&i| pointer[i]).map(|i| placements[i].offset % lane).collect();
+            in_lane.sort_unstable();
+            in_lane.dedup();
+            assert_eq!(in_lane.len(), n_pointers.div_ceil(64 / (lane >> 8)), "{n_pointers} pointers");
         }
     }
 }

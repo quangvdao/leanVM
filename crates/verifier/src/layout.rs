@@ -5,6 +5,7 @@ use crate::field::{E, GEN, ONE, ZERO};
 use crate::hash::{STATE_LANES, keccak_f};
 use crate::keccak::KeccakShape;
 use crate::multilinear::{Placement, log2_ceil, log2_strict, stack_offsets};
+use crate::whir::INITIAL_FOLDING_FACTOR;
 use crate::{VerifierError, require};
 use std::collections::BTreeMap;
 use std::ops::Add;
@@ -571,21 +572,27 @@ fn stacked_blocks(columns: usize) -> Vec<usize> {
 }
 
 /// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
-fn stack(kappas: &[usize]) -> (BTreeMap<usize, u64>, usize) {
+/// The pointer columns are [`stack_offsets`]'s shared blocks, the opening reading them all at one point.
+fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, u64>, usize) {
     let blocks = stacked_blocks(kappas.len());
     let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
-    let (block_offsets, total_log) = stack_offsets(&block_kappas);
-    (
-        blocks.into_iter().zip(block_offsets).collect(),
-        MIN_STACKED_LOG.max(total_log),
-    )
+    let mut pointer = vec![false; kappas.len()];
+    for table in tables {
+        for column in table.links.pointers() {
+            pointer[GLOBAL_COLUMN_BASES[table.opcode] + column] = true;
+        }
+    }
+    let shared: Vec<bool> = blocks.iter().map(|&column| pointer[column]).collect();
+    let (block_offsets, stack_log) = stack_offsets(&block_kappas, &shared, MIN_STACKED_LOG, INITIAL_FOLDING_FACTOR);
+    (blocks.into_iter().zip(block_offsets).collect(), stack_log)
 }
 
 /// The stack of the smallest execution of a bytecode of `2^log_bytecode` instructions: the least memory, every table at
 /// its floor. A recursion guest, whose children are proofs of its own bytecode, need open no smaller one. The program
 /// is public and has no committed column, so the stack does not depend on its size.
 pub fn min_execution_stacked_log(_log_bytecode: usize) -> usize {
-    stack(&column_kappas(&tables(), MIN_LOG_MEMORY, &TABLE_LOG_FLOORS)).1
+    let tables = tables();
+    stack(&tables, &column_kappas(&tables, MIN_LOG_MEMORY, &TABLE_LOG_FLOORS)).1
 }
 
 pub fn build_layout<'a>(
@@ -613,7 +620,7 @@ pub fn build_layout<'a>(
 
     let keccak = keccak_shape(&table_log_heights);
     let kappas = column_kappas(&tables, log_memory, &table_log_heights);
-    let (offsets, stack_log) = stack(&kappas);
+    let (offsets, stack_log) = stack(&tables, &kappas);
     let placement = |(column, &kappa): (usize, &usize)| {
         let index = match qkeccak_slot(column) {
             Some(slot) => offsets[&QKECCAK] + ((slot as u64) << kappa),
