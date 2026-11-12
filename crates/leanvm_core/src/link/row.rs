@@ -241,11 +241,6 @@ pub struct ColumnEnd {
     pub values: Vec<F192>,
 }
 
-/// `Σ_u eq(χ, u)·bit_b(word_u)` for each bit `b`.
-pub fn bit_slices(words: &[u64], chi: &[F192]) -> Vec<F192> {
-    bit_slices_eq(words, &primitives::multilinear::eq_table(chi))
-}
-
 /// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`.
 pub fn bit_slices_eq(words: &[u64], eq: &[F192]) -> Vec<F192> {
     let n = words.len().min(eq.len());

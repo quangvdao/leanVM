@@ -558,6 +558,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     let chi = &row_end.point;
     let mut column_claims = Vec::new();
     let mut lanes = [F192::ZERO; primitives::hash::STATE_LANES];
+    let column_values = tracing::info_span!("Column values").entered();
     for t in 0..tables::N_TABLES {
         let point = &chi[..taus[t]];
         let cols = local(t);
@@ -575,14 +576,16 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             }
         }
     }
+    drop(column_values);
     let eq_q = eq_table(&row_end.column_point);
     let mut slices = vec![F192::ZERO; 64];
     let mut pieces = Vec::new();
     let mut q = 0;
+    // The row side's ends hold each pointer column's bit-slices at its table's row point.
     for t in 0..tables::N_TABLES {
         let point = &chi[..taus[t]];
-        for &pointer in &plans[t].pointers {
-            for (s, v) in slices.iter_mut().zip(row::bit_slices(words(local(t)[pointer]), point)) {
+        for (&pointer, end) in plans[t].pointers.iter().zip(&row_end.tables[t].columns) {
+            for (s, &v) in slices.iter_mut().zip(&end.slices) {
                 *s += eq_q[q] * v;
             }
             pieces.push(RingPiece {
