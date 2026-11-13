@@ -10,6 +10,9 @@ use super::pointer::{Chunks, NO_INDEX};
 use primitives::field::{F64, F192, F192Unreduced};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Rows ahead that a scatter prefetches its target.
+const PREFETCH: usize = 16;
+
 /// Pairs per task of a round.
 const TASK_PAIRS: usize = 1 << 12;
 
@@ -378,6 +381,28 @@ impl Scatter {
         }
     }
 
+    /// Prefetch entry `j` for writing: the scatters' indices land all over the arrays, and a row's target is known
+    /// [`PREFETCH`] rows ahead.
+    #[inline(always)]
+    fn prefetch(&self, j: usize) {
+        let Some(cell) = self.limbs.get(3 * j) else {
+            return;
+        };
+        let at = std::ptr::from_ref(cell);
+        // SAFETY: a prefetch never faults and writes nothing.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) at, options(nostack, preserves_flags, readonly));
+        }
+        // SAFETY: as above.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(at.cast());
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = at;
+    }
+
     /// Whether an index fell past the array.
     pub fn overflowed(&self) -> bool {
         self.overflow.load(Ordering::Relaxed)
@@ -425,6 +450,13 @@ impl Scatter {
         let top = 1usize << chunks.width;
         parallel::for_each(words.len().div_ceil(TASK_PAIRS), |task| {
             for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
+                if let Some(&j) = index.get(u + PREFETCH)
+                    && j != NO_INDEX
+                {
+                    for &(array, shift) in &targets {
+                        array.prefetch(j as usize + shift);
+                    }
+                }
                 let w = weights(u);
                 let mut add = |j: usize| {
                     for (&(array, shift), &w) in targets.iter().zip(&w) {
@@ -469,6 +501,11 @@ impl Scatter {
             let mut combine = adder();
             for task in start..end {
                 for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
+                    if let Some(&j) = index.get(u + PREFETCH)
+                        && j != NO_INDEX
+                    {
+                        self.prefetch(j as usize + shift);
+                    }
                     let w = weight(u);
                     if w.is_zero() {
                         continue;
