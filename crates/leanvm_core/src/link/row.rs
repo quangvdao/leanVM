@@ -920,7 +920,33 @@ impl<'a> Column<'a> {
         chunks: &Chunks,
     ) {
         let mut group = [0u64; 2 * MAX_GROUP];
+        let mut sigmas = [0u32; 2 * MAX_GROUP];
         for ((row, t), k) in values.chunks_mut(tables.len()).zip(tags).zip(rows) {
+            for (o, s) in sigmas[..n].iter_mut().enumerate() {
+                *s = self.index.get(k * n + o).copied().unwrap_or(NO_INDEX);
+            }
+            // Every word one-hot: a chunk is uniform where its digit agrees across the group's indices.
+            if !sigmas[..n].contains(&NO_INDEX) {
+                let sigmas = &sigmas[..n];
+                let diff = sigmas.iter().fold(0, |d, &s| d | (s ^ sigmas[0])) as usize;
+                let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
+                for ((o, &(i, table)), weighted) in row.iter_mut().zip(tables).zip(weighted) {
+                    *o = if chunks.digit(diff, i) == 0 {
+                        table[digit(sigmas[0], i)]
+                    } else {
+                        let len = table.len();
+                        (sigmas.iter().enumerate())
+                            .fold(F192::ZERO, |sum, (t, &s)| sum + weighted[t * len + digit(s, i)])
+                    };
+                }
+                *t = ALL_MIXED;
+                for i in 0..chunks.d() {
+                    if chunks.digit(diff, i) == 0 {
+                        *t ^= u64::from(MIXED ^ digit(sigmas[0], i) as u8) << (8 * i);
+                    }
+                }
+                continue;
+            }
             for (o, u) in group[..n].iter_mut().enumerate() {
                 *u = self.words.get(k * n + o).copied().unwrap_or(0);
             }
