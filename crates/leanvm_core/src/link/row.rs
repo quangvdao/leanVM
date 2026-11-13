@@ -137,6 +137,61 @@ pub struct RowPoints {
     pub cert_pairs: Vec<Vec<F192>>,
     /// `eq(r, ·)` over whole pointers.
     pub split: SplitEq,
+    /// `Π_i D_i(r_i)` over sets of chunks at one-hot values.
+    clean: CleanEq,
+}
+
+/// Entries of one block of [`CleanEq`], at most.
+const CLEAN_BLOCK: usize = 1 << 13;
+
+/// Blocks of [`CleanEq`], at most.
+const CLEAN_BLOCKS: usize = 4;
+
+/// The products of the chunk tables at one-hot values over any set of chunks: per block of consecutive chunks, a
+/// table over the block's codes, a chunk's code its digit plus one when it is in the set and zero when not, so a
+/// product over chunks whose digits are known is one lookup per block.
+struct CleanEq {
+    /// Per chunk, its block and the place value of its code there.
+    place: [(usize, u32); MAX_CHUNKS],
+    blocks: Vec<Vec<F192>>,
+}
+
+impl CleanEq {
+    fn new(tables: &[Vec<F192>]) -> Self {
+        let mut place = [(0, 0); MAX_CHUNKS];
+        let mut blocks: Vec<Vec<F192>> = vec![vec![F192::ONE]];
+        for (i, table) in tables.iter().enumerate() {
+            let radix = table.len() + 1;
+            if blocks.last().unwrap().len() * radix > CLEAN_BLOCK {
+                blocks.push(vec![F192::ONE]);
+            }
+            let block = blocks.last_mut().unwrap();
+            let stride = block.len();
+            place[i] = (blocks.len() - 1, stride as u32);
+            let block = blocks.last_mut().unwrap();
+            let low = block.clone();
+            block.extend(table.iter().flat_map(|&t| low.iter().map(move |&v| v * t)));
+        }
+        assert!(blocks.len() <= CLEAN_BLOCKS);
+        Self { place, blocks }
+    }
+
+    /// Put chunk `i` at digit `v` into the set `codes`.
+    #[inline(always)]
+    fn add(&self, codes: &mut [u32; CLEAN_BLOCKS], i: usize, v: u8) {
+        let (block, stride) = self.place[i];
+        codes[block] += (u32::from(v) + 1) * stride;
+    }
+
+    /// The product over the set `codes`.
+    #[inline(always)]
+    fn at(&self, codes: &[u32; CLEAN_BLOCKS]) -> F192 {
+        match self.blocks.as_slice() {
+            [a] => a[codes[0] as usize],
+            [a, b] => a[codes[0] as usize] * b[codes[1] as usize],
+            blocks => (blocks.iter().zip(codes)).map(|(b, &c)| b[c as usize]).product(),
+        }
+    }
 }
 
 impl RowPoints {
@@ -158,6 +213,7 @@ impl RowPoints {
             })
             .collect();
         Self {
+            clean: CleanEq::new(&eq.tables),
             shifts: Shifts::new(chunks, &eq, max_shift),
             mirrors: (0..chunks.d()).map(|i| mirror(chunks.part(r, i))).collect(),
             eq,
@@ -322,6 +378,9 @@ pub struct RowEnd {
 
 type Poly = [F192; MAX_COEFFS];
 
+/// A round's terms under one weight at a pair, unreduced.
+type Acc = [F192Unreduced; MAX_COEFFS];
+
 /// `p ← p·(a + b·X)` for `p` of `len` coefficients; the new length.
 #[inline(always)]
 fn mul_linear(p: &mut Poly, len: usize, a: F192, b: F192) -> usize {
@@ -384,12 +443,13 @@ fn is_zero_pair(p: (F192, F192)) -> bool {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn pointer_pair(
-    acc: &mut Poly,
+    acc: &mut Acc,
     slots: &Slots,
     coef: &[F192],
     groups: &[[F192; 2]],
-    mut act: Option<(&mut Poly, &[F192])>,
+    mut act: Option<(&mut Acc, &[F192])>,
     skip: bool,
+    (clean, digit): (&CleanEq, impl Fn(usize) -> Option<u8>),
     same: impl Fn(usize) -> bool,
     first: impl Fn(usize) -> F192,
     pair: impl Fn(usize) -> (F192, F192),
@@ -469,36 +529,54 @@ fn pointer_pair(
     if !p_live && !q_live {
         return;
     }
-    let mut scalar = F192::ONE;
-    let mut linear = [(F192::ZERO, F192::ZERO); 8];
-    let mut n_linear = 0;
+    // The remaining factors: one lookup for the chunks constant at one-hot values, one product for the rest.
+    let mut codes = [0u32; CLEAN_BLOCKS];
+    let mut factors = [(F192::ZERO, F192::ZERO); MAX_CHUNKS];
+    let mut n = 0;
     for i in start..d {
-        if skip && same(i) {
-            scalar *= first(i);
+        if let Some(v) = digit(i) {
+            clean.add(&mut codes, i, v);
         } else {
-            linear[n_linear] = pair(slots.eq(i));
-            n_linear += 1;
+            factors[n] = if skip && same(i) {
+                (first(i), F192::ZERO)
+            } else {
+                let (a, b) = pair(slots.eq(i));
+                (a, a + b)
+            };
+            n += 1;
         }
     }
-    let finish = |acc: &mut Poly, p: &[F192]| finish_pointer(acc, p, scalar, &linear[..n_linear]);
+    let s = clean.at(&codes);
+    let t = product(&factors[..n]);
+    let t = &t[..n + 1];
     if p_live {
-        finish(acc, &p[..len]);
+        add_tail(acc, &p[..len], s, t);
     }
     if q_live && let Some((act_acc, _)) = &mut act {
-        finish(act_acc, &q[..q_len]);
+        add_tail(act_acc, &q[..q_len], s, t);
+    }
+}
+
+/// `acc ← acc + s·p·t`.
+#[inline(always)]
+fn add_tail(acc: &mut Acc, p: &[F192], s: F192, t: &[F192]) {
+    for (i, &c) in p.iter().enumerate() {
+        let c = s * c;
+        for (o, &v) in acc[i..].iter_mut().zip(t) {
+            *o ^= c.mul_unreduced(v);
+        }
     }
 }
 
 /// `acc ← acc + c·f` for `c` of one or two coefficients and the linear `f` through `pair`.
 #[inline(always)]
-fn add_times_pair(acc: &mut Poly, c: &[F192], pair: (F192, F192)) {
+fn add_times_pair(acc: &mut Acc, c: &[F192], pair: (F192, F192)) {
     let (a, b) = (pair.0, pair.0 + pair.1);
-    acc[0] += c[0] * a;
-    if c.len() == 1 || c[1].is_zero() {
-        acc[1] += c[0] * b;
-    } else {
-        acc[1] += (c[0].mul_unreduced(b) ^ c[1].mul_unreduced(a)).reduce();
-        acc[2] += c[1] * b;
+    acc[0] ^= c[0].mul_unreduced(a);
+    acc[1] ^= c[0].mul_unreduced(b);
+    if c.len() == 2 && !c[1].is_zero() {
+        acc[1] ^= c[1].mul_unreduced(a);
+        acc[2] ^= c[1].mul_unreduced(b);
     }
 }
 
@@ -506,10 +584,10 @@ fn add_times_pair(acc: &mut Poly, c: &[F192], pair: (F192, F192)) {
 /// then linear in `X`, through their values `phi` and `shifted(g)` at the two rows.
 #[inline(always)]
 fn linear_pointer(
-    acc: &mut Poly,
+    acc: &mut Acc,
     coef: &[F192],
     groups: &[[F192; 2]],
-    act: Option<(&mut Poly, &[F192])>,
+    act: Option<(&mut Acc, &[F192])>,
     phi: (F192, F192),
     shifted: impl Fn(usize) -> (F192, F192),
 ) {
@@ -542,49 +620,6 @@ fn fold_words(index: &[u32], r: &[F192], at: impl Fn(usize) -> F192) -> F192 {
     values[0]
 }
 
-/// `acc ← acc + p·scalar·Π_j f_j` for the linear `f_j` through `linear[j]`.
-#[inline(always)]
-fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192, F192)]) {
-    let len = p.len();
-    if linear.is_empty() {
-        if scalar == F192::ONE {
-            add_into(acc, p);
-        } else {
-            for (a, &v) in acc.iter_mut().zip(p) {
-                *a += v * scalar;
-            }
-        }
-        return;
-    }
-    // The remaining factors' product first, the scalar in its first factor, then one product with `p`: cheaper than
-    // multiplying the longer `p` by each factor in turn.
-    if len == 1 {
-        scalar *= p[0];
-    }
-    let (a, b) = linear[0];
-    let (a, b) = if scalar == F192::ONE {
-        (a, b)
-    } else {
-        (scalar * a, scalar * b)
-    };
-    let mut r = [F192::ZERO; MAX_COEFFS];
-    r[0] = a;
-    r[1] = a + b;
-    let mut r_len = 2;
-    for &e in &linear[1..] {
-        r_len = mul_pair(&mut r, r_len, e);
-    }
-    if len == 1 {
-        add_into(acc, &r[..r_len]);
-        return;
-    }
-    for j in 0..len + r_len - 1 {
-        let lo = (j + 1).saturating_sub(r_len);
-        let sum = (lo..=j.min(len - 1)).fold(F192Unreduced::ZERO, |s, i| s ^ p[i].mul_unreduced(r[j - i]));
-        acc[j] += sum.reduce();
-    }
-}
-
 /// `Σ_i ε_i·(D_i(r_i)·D_i(1 + r_i) + π_i)(X)` for one column at one pair, added to `acc`, from the bar slots, which
 /// hold `ε_i·D_i(1 + r_i)` (see [`Column::bars`]), and `ε_i·π_i` in `cert_mirrors`. With `skip`, a chunk that is one
 /// one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds `b·b̄·(X + X²)`, and one
@@ -592,7 +627,7 @@ fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192,
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn cert_pair(
-    acc: &mut Poly,
+    acc: &mut Acc,
     slots: &Slots,
     cert: &[F192],
     cert_mirrors: &[F192],
@@ -621,8 +656,159 @@ fn cert_pair(
             constant += cert_mirrors[i];
         }
     }
-    let m = m.map(F192Unreduced::reduce);
-    add_into(acc, &[m[0] + constant, m[1], m[2]]);
+    add_cert(acc, m, constant);
+}
+
+/// `acc ← acc + m + constant`, `m` of three coefficients.
+#[inline(always)]
+fn add_cert(acc: &mut Acc, m: [F192Unreduced; 3], constant: F192) {
+    acc[0] ^= m[0] ^ F192Unreduced::from(constant);
+    acc[1] ^= m[1];
+    acc[2] ^= m[2];
+}
+
+/// How a chunk stands at a pair of rows, for [`plain_terms`].
+#[derive(Clone, Copy)]
+enum ChunkPair {
+    /// One one-hot value at both rows.
+    Constant(u8),
+    /// One-hot values `a` at the first row and `b ≠ a` at the second.
+    OneHot(u8, u8),
+    /// `D_i` and the scaled `D̄_i` at the two rows.
+    Values((F192, F192), (F192, F192)),
+}
+
+/// The product of two linear factors `a + b·X`, by Karatsuba.
+#[inline(always)]
+fn quad(f: (F192, F192), g: (F192, F192)) -> [F192; 3] {
+    let c0 = f.0.mul_unreduced(g.0);
+    let c2 = f.1.mul_unreduced(g.1);
+    let m = (f.0 + f.1).mul_unreduced(g.0 + g.1);
+    [c0.reduce(), (m ^ c0 ^ c2).reduce(), c2.reduce()]
+}
+
+/// `out ← p·q` for `p` of `P` and `q` of `Q` coefficients.
+#[inline(always)]
+fn conv<const P: usize, const Q: usize>(p: &[F192], q: &[F192], out: &mut [F192]) {
+    let mut u = [F192Unreduced::ZERO; MAX_CHUNKS + 1];
+    for i in 0..P {
+        for j in 0..Q {
+            u[i + j] ^= p[i].mul_unreduced(q[j]);
+        }
+    }
+    for (o, v) in out[..P + Q - 1].iter_mut().zip(u) {
+        *o = v.reduce();
+    }
+}
+
+/// The product of three linear factors.
+#[inline(always)]
+fn cubic(f: &[(F192, F192)]) -> [F192; 4] {
+    let mut out = [F192::ZERO; 4];
+    conv::<3, 2>(&quad(f[0], f[1]), &[f[2].0, f[2].1], &mut out);
+    out
+}
+
+/// The product of the linear factors `a + b·X` in `f`, as a balanced tree; its length is `f.len() + 1`.
+#[inline(always)]
+fn product(f: &[(F192, F192)]) -> [F192; MAX_CHUNKS + 1] {
+    let mut out = [F192::ZERO; MAX_CHUNKS + 1];
+    match f.len() {
+        0 => out[0] = F192::ONE,
+        1 => (out[0], out[1]) = f[0],
+        2 => out[..3].copy_from_slice(&quad(f[0], f[1])),
+        3 => out[..4].copy_from_slice(&cubic(f)),
+        4 => conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut out),
+        5 => conv::<3, 4>(&quad(f[0], f[1]), &cubic(&f[2..]), &mut out),
+        6 => conv::<4, 4>(&cubic(f), &cubic(&f[3..]), &mut out),
+        7 => {
+            let mut four = [F192::ZERO; 5];
+            conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut four);
+            conv::<5, 4>(&four, &cubic(&f[4..]), &mut out)
+        }
+        _ => {
+            let mut four = [[F192::ZERO; 5]; 2];
+            for (o, f) in four.iter_mut().zip(f.chunks(4)) {
+                conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), o);
+            }
+            conv::<5, 5>(&four[0], &four[1], &mut out)
+        }
+    }
+    out
+}
+
+/// `acc ← acc + s·c·p` for `c` of one or two coefficients.
+#[inline(always)]
+fn add_scaled(acc: &mut Acc, s: F192, c: &[F192], p: &[F192]) {
+    let t0 = s * c[0];
+    for (o, &v) in acc.iter_mut().zip(p) {
+        *o ^= t0.mul_unreduced(v);
+    }
+    if c.len() == 2 && !c[1].is_zero() {
+        let t1 = s * c[1];
+        for (o, &v) in acc[1..].iter_mut().zip(p) {
+            *o ^= t1.mul_unreduced(v);
+        }
+    }
+}
+
+/// [`Column::add_terms`] for a column without shift groups, from how each of its chunks stands at the pair:
+/// `c(X)·Φ_0(X)` under each weight and the certificate under `ω`. The chunks that stand constant at one-hot values
+/// give one lookup in [`CleanEq`], the rest one product of linear factors, which both weights share.
+#[inline(always)]
+fn plain_terms(
+    column: &Column,
+    aux: &[(F192, F192)],
+    points: &RowPoints,
+    widths: &[usize],
+    (omega, act): (&mut Acc, &mut Acc),
+    chunk: impl Fn(usize) -> ChunkPair,
+) {
+    let mut codes = [0u32; CLEAN_BLOCKS];
+    let mut factors = [(F192::ZERO, F192::ZERO); MAX_CHUNKS];
+    let mut n = 0;
+    let mut m = [F192Unreduced::ZERO; 3];
+    let mut constant = F192::ZERO;
+    for (i, &eps) in column.cert.iter().enumerate() {
+        match chunk(i) {
+            ChunkPair::Constant(v) => points.clean.add(&mut codes, i, v),
+            ChunkPair::OneHot(a, b) => {
+                let t = &points.eq.tables[i];
+                let (x0, x1) = (t[usize::from(a)], t[usize::from(b)]);
+                factors[n] = (x0, x0 + x1);
+                n += 1;
+                if !eps.is_zero() {
+                    let c = eps.mul_unreduced(points.cert_pairs[i][(usize::from(a) << widths[i]) + usize::from(b)]);
+                    m[1] ^= c;
+                    m[2] ^= c;
+                }
+            }
+            ChunkPair::Values(x, y) => {
+                factors[n] = (x.0, x.0 + x.1);
+                n += 1;
+                if !eps.is_zero() {
+                    add_pair_product(&mut m, x, y);
+                    constant += column.cert_mirrors[i];
+                }
+            }
+        }
+    }
+    add_cert(omega, m, constant);
+    let (coef, len) = coef_linear(column.omega, aux);
+    let live = !(coef[0].is_zero() && coef[1].is_zero());
+    if !live && column.act.is_zero() {
+        return;
+    }
+    let s = points.clean.at(&codes);
+    let p = product(&factors[..n]);
+    let p = &p[..n + 1];
+    if live {
+        add_scaled(omega, s, &coef[..len], p);
+    }
+    if !column.act.is_zero() {
+        let (c, len) = coef_linear(column.act, aux);
+        add_scaled(act, s, &c[..len], p);
+    }
 }
 
 /// `m ← m + x(X)·y(X)` for the linear `x`, `y` through their pairs, by Karatsuba.
@@ -991,10 +1177,10 @@ impl<'a> Column<'a> {
     fn add_terms(
         &self,
         aux: &[(F192, F192)],
-        omega: &mut Poly,
-        act: &mut Poly,
-        pointer: impl FnOnce(&mut Poly, &[F192], &[[F192; 2]], Option<(&mut Poly, &[F192])>),
-        cert: impl FnOnce(&mut Poly),
+        omega: &mut Acc,
+        act: &mut Acc,
+        pointer: impl FnOnce(&mut Acc, &[F192], &[[F192; 2]], Option<(&mut Acc, &[F192])>),
+        cert: impl FnOnce(&mut Acc),
     ) {
         let mut groups = [[F192::ZERO; 2]; 4];
         for (o, g) in groups.iter_mut().zip(&self.shifts) {
@@ -1225,12 +1411,15 @@ impl<'a> State<'a> {
             || [F192::ZERO; MAX_COEFFS],
             |acc, task| {
                 let mut factored = [F192Unreduced::ZERO; MAX_COEFFS];
-                let mut under_one = [F192::ZERO; MAX_COEFFS];
+                let mut under_one = [F192Unreduced::ZERO; MAX_COEFFS];
                 let range = task * per_task..pairs.min((task + 1) * per_task);
                 for k in range.clone() {
                     let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
-                    // The terms under each weight, summed before the weight multiplies them.
-                    let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
+                    // The terms under each weight, summed before the weight multiplies them: the base terms' reduced,
+                    // the columns' not.
+                    let mut under_omega = [F192::ZERO; MAX_COEFFS];
+                    let (mut cols_omega, mut cols_act) =
+                        ([F192Unreduced::ZERO; MAX_COEFFS], [F192Unreduced::ZERO; MAX_COEFFS]);
                     if let Some(base) = &self.base {
                         let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
                         if with_omega || base.on_padding() {
@@ -1243,12 +1432,15 @@ impl<'a> State<'a> {
                     let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
                     let aux = self.aux_pair(k);
                     for ((column, tables), weighted) in self.columns.iter().zip(&tables).zip(&weighted) {
-                        let sums = (&mut under_omega, &mut under_act);
+                        let sums = (&mut cols_omega, &mut cols_act);
                         let words = (tables.as_slice(), weighted.as_slice());
                         match &column.values {
                             None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
-                            Some(values) => Self::pair_folded(column, values, k, &aux, skip, sums),
+                            Some(values) => Self::pair_folded(column, values, k, &aux, points, chunks, skip, sums),
                         }
+                    }
+                    for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
+                        *o += c.reduce();
                     }
                     if k < whole {
                         let scale = omega.0 + omega.1;
@@ -1256,11 +1448,14 @@ impl<'a> State<'a> {
                             *f ^= scale.mul_unreduced(v);
                         }
                         if self.any_act {
-                            add_into(&mut under_one, &under_act[..len]);
+                            for (o, &c) in under_one[..len].iter_mut().zip(&cols_act) {
+                                *o ^= c;
+                            }
                         }
                     } else {
                         add_mul_pair(acc, 0, &under_omega, len, omega);
                         if self.any_act {
+                            let under_act = cols_act.map(F192Unreduced::reduce);
                             add_mul_pair(acc, 0, &under_act, len, act);
                         }
                     }
@@ -1268,7 +1463,7 @@ impl<'a> State<'a> {
                 if range.start < whole {
                     let factored = factored.map(F192Unreduced::reduce);
                     add_mul_pair(acc, 0, &factored, len, (F192::ONE + tau, tau));
-                    add_into(acc, &under_one[..len]);
+                    add_into(acc, &under_one.map(F192Unreduced::reduce)[..len]);
                 }
             },
             |mut a, b| {
@@ -1294,7 +1489,7 @@ impl<'a> State<'a> {
         chunks: &Chunks,
         points: &RowPoints,
         skip: bool,
-        (omega, act): (&mut Poly, &mut Poly),
+        (omega, act): (&mut Acc, &mut Acc),
     ) {
         let n = 1 << r.len();
         if skip {
@@ -1339,6 +1534,10 @@ impl<'a> State<'a> {
                     groups,
                     act,
                     skip,
+                    (&points.clean, |i| {
+                        let b = lo_bits[i].filter(|b| skip && same(i) && b.is_power_of_two());
+                        b.map(|b| b.trailing_zeros() as u8)
+                    }),
                     same,
                     |i| points.eq.eval(chunks, lo[0], i),
                     pair,
@@ -1372,7 +1571,7 @@ impl<'a> State<'a> {
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
-        sums: (&mut Poly, &mut Poly),
+        sums: (&mut Acc, &mut Acc),
     ) -> bool {
         let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
         let sigmas: [[u32; N]; 2] = [0, 1].map(|side| std::array::from_fn(|t| index((2 * k + side) * N + t)));
@@ -1396,7 +1595,7 @@ impl<'a> State<'a> {
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
-        (omega, act): (&mut Poly, &mut Poly),
+        (omega, act): (&mut Acc, &mut Acc),
     ) {
         let (lo, hi) = (&sigmas[0], &sigmas[1]);
         let (mut lo_diff, mut hi_diff) = (0, 0);
@@ -1421,6 +1620,19 @@ impl<'a> State<'a> {
         };
         let pair = |slot: usize| (value(slot, lo, lo_diff), value(slot, hi, hi_diff));
         let slots = &column.slots;
+        if column.shifts.is_empty() && (N > 1 || varying.count_ones() > 1) {
+            let chunk = |i: usize| {
+                let v = |sigma: u32| digit(sigma, i) as u8;
+                if varying >> i & 1 == 0 {
+                    ChunkPair::Constant(v(lo[0]))
+                } else if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
+                    ChunkPair::OneHot(v(lo[0]), v(hi[0]))
+                } else {
+                    ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i)))
+                }
+            };
+            return plain_terms(column, aux, points, &chunks.widths, (omega, act), chunk);
+        }
         column.add_terms(
             aux,
             omega,
@@ -1447,8 +1659,11 @@ impl<'a> State<'a> {
                         groups,
                         act,
                         true,
-                        |i| varying >> i & 1 == 0,
-                        |i| points.eq.tables[i][digit(lo[0], i)],
+                        (&points.clean, |i| {
+                            (varying >> i & 1 == 0).then(|| digit(lo[0], i) as u8)
+                        }),
+                        |_| false,
+                        |_| F192::ZERO,
                         pair,
                     )
                 }
@@ -1475,26 +1690,39 @@ impl<'a> State<'a> {
                         constant += column.cert_mirrors[i];
                     }
                 }
-                let m = m.map(F192Unreduced::reduce);
-                add_into(acc, &[m[0] + constant, m[1], m[2]]);
+                add_cert(acc, m, constant);
             },
         );
     }
 
     /// Later rounds: the pair `(2k, 2k + 1)` of the folded columns.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn pair_folded(
         column: &Column,
         values: &Strided,
         k: usize,
         aux: &[(F192, F192)],
+        points: &RowPoints,
+        chunks: &Chunks,
         skip: bool,
-        (omega, act): (&mut Poly, &mut Poly),
+        (omega, act): (&mut Acc, &mut Acc),
     ) {
         let slots = &column.slots;
         let (lo, hi) = (values.row(2 * k), values.row(2 * k + 1));
         let pair = |slot: usize| (lo[slot], hi[slot]);
         let (lo_tags, hi_tags) = (row_tags(&column.tags, 2 * k), row_tags(&column.tags, 2 * k + 1));
+        if skip && column.shifts.is_empty() {
+            let chunk = |i: usize| {
+                let (a, b) = ((lo_tags >> (8 * i)) as u8, (hi_tags >> (8 * i)) as u8);
+                match (a, b) {
+                    (MIXED, _) | (_, MIXED) => ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i))),
+                    _ if a == b => ChunkPair::Constant(a),
+                    _ => ChunkPair::OneHot(a, b),
+                }
+            };
+            return plain_terms(column, aux, points, &chunks.widths, (omega, act), chunk);
+        }
         let clean = |i: usize| {
             let t = (lo_tags >> (8 * i)) as u8;
             t != MIXED && t == (hi_tags >> (8 * i)) as u8
@@ -1505,7 +1733,12 @@ impl<'a> State<'a> {
             omega,
             act,
             |acc, coef, groups, act| {
-                pointer_pair(acc, slots, coef, groups, act, skip, |i| lo[i] == hi[i], |i| lo[i], pair)
+                let digit = |i: usize| {
+                    let t = (lo_tags >> (8 * i)) as u8;
+                    (skip && t != MIXED && t == (hi_tags >> (8 * i)) as u8).then_some(t)
+                };
+                let (clean, same) = ((&points.clean, digit), |i| lo[i] == hi[i]);
+                pointer_pair(acc, slots, coef, groups, act, skip, clean, same, |i| lo[i], pair)
             },
             |acc| {
                 cert_pair(
@@ -1734,17 +1967,20 @@ fn prove_columns(
             let (lo, hi) = (&columns[2 * k], &columns[2 * k + 1]);
             let pair = |slot: usize| (lo.2[slot], hi.2[slot]);
             let groups: Vec<[F192; 2]> = (0..n_shifts).map(|s| [lo.1[s], lo.1[s] + hi.1[s]]).collect();
+            let mut terms = [F192Unreduced::ZERO; MAX_COEFFS];
             pointer_pair(
-                &mut poly,
+                &mut terms,
                 &slots,
                 &[lo.0, lo.0 + hi.0],
                 &groups,
                 None,
                 false,
+                (&points.clean, |_| None),
                 |_| false,
                 |_| F192::ZERO,
                 pair,
             );
+            add_into(&mut poly, &terms.map(F192Unreduced::reduce));
             for i in 0..d {
                 let m = pair_product(pair(slots.eq(i)), pair(slots.bar(i)));
                 add_weighted(&mut poly, (lo.3[i], hi.3[i]), [m[0] + points.mirrors[i], m[1], m[2]]);
