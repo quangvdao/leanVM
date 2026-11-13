@@ -133,12 +133,47 @@ fn equal_blocks(stack: &[F64]) -> Vec<bool> {
     parallel::map_collect(blocks.len(), |b| b > 0 && blocks[b] == blocks[b - 1])
 }
 
-/// A ring claim's block structure and where its terms sit.
-struct Ring {
+/// A low table some rings share: their points agree on a block's low bits, as every table's row point of one
+/// sum-check does, so a block's bit rows fold against it once for all of them.
+struct RingLow {
     /// Folds a bit row of a block against `e_lo`.
     fold: BitFold,
     /// `e_lo(x)` for every word of a block.
     e_lo: Vec<F192>,
+}
+
+impl RingLow {
+    /// Each bit row of `block` folded against `e_lo`: an addition per set bit for sparse words such as one-hot
+    /// pointers, else the byte tables over the block's bit-transposed `cols`, transposed on first use.
+    fn fold_block<const CHUNKS: usize>(
+        &self,
+        block: &[F64],
+        sparse: &mut Option<bool>,
+        cols: &mut Option<[[u8; ROWS]; CHUNKS]>,
+    ) -> [F192; ROWS] {
+        let words = primitives::cast_slice::<F64, u64>(block);
+        let few = || words.iter().map(|w| w.count_ones() as usize).sum::<usize>() <= SPARSE_BITS * words.len();
+        let mut folded = [F192::ZERO; ROWS];
+        if *sparse.get_or_insert_with(few) {
+            fold_set_bits(&self.e_lo, words, &mut folded);
+            return folded;
+        }
+        let cols = cols.get_or_insert_with(|| {
+            let mut cols = [[0u8; ROWS]; CHUNKS];
+            for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
+                bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
+            }
+            cols
+        });
+        self.fold.fold_columns(cols, &mut folded);
+        folded
+    }
+}
+
+/// A ring claim's block structure and where its terms sit.
+struct Ring {
+    /// Its low table in [`Terms::ring_lows`].
+    low: usize,
     /// `e_hi(h)` for every block.
     e_hi: Vec<F192>,
     point: Vec<F192>,
@@ -159,6 +194,7 @@ pub(crate) struct Terms {
     /// The blocks a claim's `gamma` is nonzero on, widened to whole vectors.
     ranges: Vec<std::ops::Range<usize>>,
     patterns: Vec<Pattern>,
+    ring_lows: Vec<RingLow>,
     rings: Vec<Ring>,
     /// Tags the stack's blocks of `2^low_vars` words that equal their predecessor, or is empty.
     repeats: Vec<bool>,
@@ -193,8 +229,9 @@ impl Terms {
         let repeat = |h: usize| repeats.get(h) == Some(&true);
         let mut q = vec![F192::ZERO; n_blocks * self.patterns.len()];
         let mut sigmas = vec![F192::ZERO; ROWS * self.rings.len()];
-        let mut cols = [[0u8; ROWS]; CHUNKS];
         let mut dots = vec![None; self.patterns.len()];
+        // Per low table, the current run's block folded against it; per ring, that fold once the ring meets the run.
+        let mut low_folds: Vec<Option<[F192; ROWS]>> = vec![None; self.ring_lows.len()];
         let mut folds: Vec<Option<[F192; ROWS]>> = vec![None; self.rings.len()];
         let mut masses = vec![F192::ZERO; self.rings.len()];
         for start in (0..n_blocks).step_by(SWEEP) {
@@ -212,9 +249,9 @@ impl Terms {
             for h in blocks {
                 if !repeat(h) {
                     flush(&mut folds, &mut masses, &mut sigmas);
+                    low_folds.fill(None);
                 }
-                let mut transposed = false;
-                let mut sparse = None;
+                let (mut sparse, mut cols) = (None, None);
                 for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
                     let e_hi = ring.e_hi[h];
                     if e_hi == F192::ZERO {
@@ -222,26 +259,9 @@ impl Terms {
                     }
                     *mass += e_hi;
                     fold.get_or_insert_with(|| {
-                        let words = primitives::cast_slice::<F64, u64>(block(h));
-                        // One-hot words, such as pointers, set a few bits each: an addition per set bit beats the
-                        // byte tables.
-                        let few = || {
-                            words.iter().map(|w| w.count_ones() as usize).sum::<usize>() <= SPARSE_BITS * words.len()
-                        };
-                        if *sparse.get_or_insert_with(few) {
-                            let mut folded = [F192::ZERO; ROWS];
-                            fold_set_bits(&ring.e_lo, words, &mut folded);
-                            return folded;
-                        }
-                        if !transposed {
-                            for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
-                                bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
-                            }
-                            transposed = true;
-                        }
-                        let mut folded = [F192::ZERO; ROWS];
-                        ring.fold.fold_columns(&cols, &mut folded);
-                        folded
+                        *low_folds[ring.low].get_or_insert_with(|| {
+                            self.ring_lows[ring.low].fold_block::<CHUNKS>(block(h), &mut sparse, &mut cols)
+                        })
                     });
                 }
             }
@@ -393,6 +413,7 @@ pub(super) fn initial_basis(
         gamma: Vec::new(),
         ranges: Vec::new(),
         patterns: Vec::new(),
+        ring_lows: Vec::new(),
         rings: Vec::new(),
         // Padding repeats blocks, which the projection and the last lane round skip.
         repeats: if low_vars == LOW_VARS {
@@ -457,9 +478,18 @@ pub(super) fn initial_basis(
                 Some(k) => (claims.len() + first_ring + k) << lane_bits,
                 None => {
                     let e_lo = table(low);
+                    let low = match terms.ring_lows.iter().position(|r| r.e_lo == e_lo) {
+                        Some(k) => k,
+                        None => {
+                            terms.ring_lows.push(RingLow {
+                                fold: BitFold::new(&e_lo),
+                                e_lo,
+                            });
+                            terms.ring_lows.len() - 1
+                        }
+                    };
                     terms.rings.push(Ring {
-                        fold: BitFold::new(&e_lo),
-                        e_lo,
+                        low,
                         e_hi: table(mid),
                         point: piece.point.clone(),
                         x_offset,
