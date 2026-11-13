@@ -342,6 +342,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
         g_pc.mul_base(cols[s.pc][u]) + g_fp.mul_base(cols[s.fp][u])
     };
 
+    // The base terms' `ω` blocks' first row round, which also gives the index side its payload.
+    let mut base_firsts = Vec::new();
     let index_end = tracing::info_span!("Index side").in_scope(|| {
         let scatter = tracing::info_span!("Scatter").entered();
         let fill = |lens: [usize; 5]| {
@@ -402,7 +404,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             x
         });
         drop(idx);
-        let payload: F192 = (0..tables::N_TABLES)
+        let firsts: Vec<[F192; 5]> = (0..tables::N_TABLES)
             .map(|t| {
                 let base = Base::new(
                     blocks(all[t], &plans[t], &ch, t, F192::ONE, None),
@@ -410,11 +412,13 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                     &padrows[t],
                     None,
                 );
-                base.omega_sum(&omegas[t])
+                base.omega_round(&omegas[t], ch.tau.first().copied())
             })
-            .sum();
+            .collect();
+        let payload: F192 = firsts.iter().flat_map(|f| f[1..].iter().copied()).sum();
         let eq_zeta = eq_table(&ch.zeta);
         drop(_tables);
+        base_firsts = firsts;
         let arrays = vec![
             w_plus.into_vec(),
             spine,
@@ -545,6 +549,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 aux_tail,
                 columns: row_columns,
                 base: Some(base),
+                base_first: Some(base_firsts[t].map(|c| eq0_r * c)),
             });
         }
         let q_vars = q.next_power_of_two().trailing_zeros() as usize;

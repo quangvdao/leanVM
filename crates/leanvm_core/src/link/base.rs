@@ -264,29 +264,59 @@ impl<'a> Base<'a> {
         }
     }
 
-    /// `Σ_u ω(u)·gate(u)·form(u)` over the `ω` blocks, `omega` on the executed rows: what the blocks sum to
-    /// before any row is bound.
-    pub fn omega_sum(&self, omega: &[F192]) -> F192 {
-        parallel::fold_reduce(
-            omega.len().div_ceil(FOLD_ROWS),
-            || F192::ZERO,
-            |acc, task| {
-                for (u, &w) in omega.iter().enumerate().skip(task * FOLD_ROWS).take(FOLD_ROWS) {
-                    if w.is_zero() {
+    /// The first round's polynomial of the `ω` blocks, `Σ_k ω(X)·gate(X)·form(X)` over the pairs `(2k, 2k + 1)`,
+    /// with `omega` on the executed rows. Its values at 0 and 1 sum to what the blocks sum to before any row is
+    /// bound. With `tau0`, `ω` is `θ·eq(τ, ·)` there and `tau0` is `τ`'s first coordinate, so a pair of executed
+    /// rows has `ω(X) = (ω_0 + ω_1)·eq(τ_0, X)` and the product with `eq(τ_0, X)` is taken once.
+    pub fn omega_round(&self, omega: &[F192], tau0: Option<F192>) -> [F192; 5] {
+        let pairs = omega.len().div_ceil(2);
+        let whole = if tau0.is_some() { omega.len() / 2 } else { 0 };
+        let (factored, direct) = parallel::fold_reduce(
+            pairs.div_ceil(FOLD_ROWS),
+            || ([F192Unreduced::ZERO; 4], [F192::ZERO; 5]),
+            |(factored, direct), task| {
+                for k in task * FOLD_ROWS..pairs.min((task + 1) * FOLD_ROWS) {
+                    let (w0, w1) = (omega[2 * k], at(omega, 2 * k + 1));
+                    if w0.is_zero() && w1.is_zero() {
                         continue;
                     }
-                    let forms: F192 = self.with_row(u, |row| {
-                        self.blocks
-                            .iter()
-                            .filter(|b| b.weight == Weight::Omega)
-                            .map(|b| form_at(b, row))
-                            .sum()
-                    });
-                    *acc += w * forms;
+                    let (mut under, mut eq_blocks) = ([F192::ZERO; 4], [F192::ZERO; 5]);
+                    self.pair(k, true, &mut under, &mut eq_blocks);
+                    if k < whole {
+                        let s = w0 + w1;
+                        for (f, &v) in factored.iter_mut().zip(&under) {
+                            *f ^= v.mul_unreduced(s);
+                        }
+                    } else {
+                        let wb = w0 + w1;
+                        direct[0] += under[0] * w0;
+                        for j in 1..4 {
+                            direct[j] += (under[j].mul_unreduced(w0) ^ under[j - 1].mul_unreduced(wb)).reduce();
+                        }
+                        direct[4] += under[3] * wb;
+                    }
                 }
             },
-            |a, b| a + b,
-        )
+            |(mut fa, mut da), (fb, db)| {
+                for (x, y) in fa.iter_mut().zip(fb) {
+                    *x ^= y;
+                }
+                for (x, y) in da.iter_mut().zip(db) {
+                    *x += y;
+                }
+                (fa, da)
+            },
+        );
+        // `eq(τ_0, X) = 1 + τ_0 + X`.
+        let mut out = direct;
+        if let Some(t) = tau0 {
+            let f = factored.map(F192Unreduced::reduce);
+            for j in 0..4 {
+                out[j] += f[j] * (F192::ONE + t);
+                out[j + 1] += f[j];
+            }
+        }
+        out
     }
 
     /// Whether a block reaches the padding rows, so the rounds must sum every explicit pair.
@@ -487,7 +517,15 @@ mod tests {
         let omega_sum: F192 = (0..1 << m)
             .map(|u| row_value(&omega_only, omega[u], eq[u], &|c| F192::from(columns[c][u])))
             .sum();
-        assert_eq!(base.omega_sum(&omega[..rows]), omega_sum);
+        let first = base.omega_round(&omega[..rows], None);
+        assert_eq!(first[1..].iter().copied().sum::<F192>(), omega_sum);
+        // With `ω = θ·eq(τ, ·)` on the executed rows, factoring `eq(τ_0, X)` out gives the same polynomial.
+        let theta = rng.ext();
+        let omega_eq: Vec<F192> = eq[..rows].iter().map(|&e| theta * e).collect();
+        assert_eq!(
+            base.omega_round(&omega_eq, Some(tau[0])),
+            base.omega_round(&omega_eq, None)
+        );
         let mut om = omega.clone();
         let mut point = Vec::new();
         let mut explicit = 1 << m;

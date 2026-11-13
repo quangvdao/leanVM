@@ -120,6 +120,9 @@ pub struct RowTable<'a> {
     pub columns: Vec<RowColumn<'a>>,
     /// The table's base terms, at `q = 0`.
     pub base: Option<Base<'a>>,
+    /// The first round's polynomial of `base`'s `ω` blocks ([`Base::omega_round`]), which that round then adds in
+    /// place of summing them.
+    pub base_first: Option<[F192; 5]>,
 }
 
 /// The functionals the row side evaluates pointers with: `D_i` at the index point `r`, the shift tables there, and
@@ -1059,6 +1062,8 @@ struct State<'a> {
     /// The table's value once its rows are bound, and the corner factor since.
     done: Option<(F192, F192)>,
     base: Option<Base<'a>>,
+    /// [`RowTable::base_first`], until the first round.
+    base_first: Option<[F192; 5]>,
     /// Whether a column has a term under `act_F`.
     any_act: bool,
 }
@@ -1110,6 +1115,7 @@ impl<'a> State<'a> {
             bound: Vec::new(),
             done: None,
             base: table.base,
+            base_first: table.base_first.filter(|_| table.log_rows > 0),
             any_act: false,
         };
         state.any_act = state.columns.iter().any(|c| !c.act.is_zero());
@@ -1198,7 +1204,7 @@ impl<'a> State<'a> {
         let len = (chunks.d() + 2).max(4);
         // A small round still spreads over the workers.
         let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
-        parallel::fold_reduce(
+        let mut poly = parallel::fold_reduce(
             pairs.div_ceil(per_task),
             || [F192::ZERO; MAX_COEFFS],
             |acc, task| {
@@ -1210,7 +1216,10 @@ impl<'a> State<'a> {
                     // The terms under each weight, summed before the weight multiplies them.
                     let (mut under_omega, mut under_act) = ([F192::ZERO; MAX_COEFFS], [F192::ZERO; MAX_COEFFS]);
                     if let Some(base) = &self.base {
-                        base.pair(k, !is_zero_pair(omega), &mut under_omega, acc);
+                        let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
+                        if with_omega || base.on_padding() {
+                            base.pair(k, with_omega, &mut under_omega, acc);
+                        }
                     }
                     if is_zero_pair(omega) && 2 * k >= self.act.len() {
                         continue;
@@ -1250,7 +1259,11 @@ impl<'a> State<'a> {
                 add_into(&mut a, &b);
                 a
             },
-        )
+        );
+        if let Some(first) = &self.base_first {
+            add_into(&mut poly, first);
+        }
+        poly
     }
 
     /// The first rounds: the pair `(2k, 2k + 1)` straight from the words, each folded row its group of words folded
@@ -1518,6 +1531,7 @@ impl<'a> State<'a> {
         if let Some(base) = &mut self.base {
             base.fold(explicit, x);
         }
+        self.base_first = None;
         let words = self.columns.first().is_some_and(|c| c.values.is_none());
         if words {
             self.bound.push(x);
@@ -1978,6 +1992,15 @@ mod tests {
                         &t.padrow,
                         Some(eq_table(&t.tau)),
                     )),
+                    base_first: Some(
+                        Base::new(
+                            t.blocks.clone(),
+                            t.k_columns.iter().map(|c| &c[..]).collect(),
+                            &t.padrow,
+                            Some(eq_table(&t.tau)),
+                        )
+                        .omega_round(&t.omega, t.tau.first().copied().filter(|_| skip)),
+                    ),
                 })
                 .collect();
 
