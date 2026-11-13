@@ -334,9 +334,13 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     // ω_F on each table's executed rows, and the state form `s_γ` on its explicit rows.
     let omegas: Vec<Vec<F192>> = (0..tables::N_TABLES)
         .map(|t| {
-            let mut e = eq_table(&ch.tau[..taus[t]]);
+            // SAFETY: the fill writes every entry.
+            let mut e = unsafe {
+                primitives::filled_vec(1 << taus[t], |out| {
+                    primitives::multilinear::fill_eq_table(&ch.tau[..taus[t]], ch.theta[t], out)
+                })
+            };
             e.truncate(rows[t]);
-            e.iter_mut().for_each(|x| *x *= ch.theta[t]);
             e
         })
         .collect();
