@@ -434,7 +434,7 @@ impl Scatter {
         shift: usize,
         weight: impl Fn(usize) -> F192 + Sync,
     ) {
-        self.add_words_with(chunks, words, index, shift, weight, || Direct(self));
+        self.add_words_with(chunks, &[(words, index, shift)], |_, u| weight(u), || Direct(self));
     }
 
     /// [`Scatter::add_words`] into several arrays in one pass over the words: `weights(u)[a]` at the index plus
@@ -483,42 +483,66 @@ impl Scatter {
         shift: usize,
         weight: impl Fn(usize) -> F192 + Sync,
     ) {
-        self.add_words_with(chunks, words, index, shift, weight, || Combine::<SLOTS>::new(self));
+        self.add_words_with(
+            chunks,
+            &[(words, index, shift)],
+            |_, u| weight(u),
+            || Combine::<SLOTS>::new(self),
+        );
+    }
+
+    /// [`Scatter::add_repeated_words`] for several pointers into the same rows in one pass, such as a table's
+    /// memory accesses: `accesses[a]` is a pointer's words, their indices and its shift, and row `u` adds
+    /// `weight(a, u)` at access `a`'s index.
+    pub fn add_repeated_accesses<const SLOTS: usize>(
+        &self,
+        chunks: &Chunks,
+        accesses: &[(&[u64], &[u32], usize)],
+        weight: impl Fn(usize, usize) -> F192 + Sync,
+    ) {
+        self.add_words_with(chunks, accesses, weight, || Combine::<SLOTS>::new(self));
     }
 
     fn add_words_with<A: Adder>(
         &self,
         chunks: &Chunks,
-        words: &[u64],
-        index: &[u32],
-        shift: usize,
-        weight: impl Fn(usize) -> F192 + Sync,
+        accesses: &[(&[u64], &[u32], usize)],
+        weight: impl Fn(usize, usize) -> F192 + Sync,
         adder: impl Fn() -> A + Sync,
     ) {
-        assert_eq!(index.len(), words.len(), "an index per word");
+        let Some(&(first, ..)) = accesses.first() else {
+            return;
+        };
+        let rows = first.len();
+        for &(words, index, _) in accesses {
+            assert_eq!(words.len(), rows, "a word per row");
+            assert_eq!(index.len(), rows, "an index per word");
+        }
         let top = 1usize << chunks.width;
-        parallel::for_each_chunk(words.len().div_ceil(TASK_PAIRS), |start, end| {
+        parallel::for_each_chunk(rows.div_ceil(TASK_PAIRS), |start, end| {
             let mut combine = adder();
             for task in start..end {
-                for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
-                    if let Some(&j) = index.get(u + PREFETCH)
-                        && j != NO_INDEX
-                    {
-                        self.prefetch(j as usize + shift);
-                    }
-                    let w = weight(u);
-                    if w.is_zero() {
-                        continue;
-                    }
-                    let mut add = |j: usize| {
-                        let j = j + shift;
-                        if j < top {
-                            combine.add(j, w);
+                for u in task * TASK_PAIRS..rows.min((task + 1) * TASK_PAIRS) {
+                    for (a, &(words, index, shift)) in accesses.iter().enumerate() {
+                        if let Some(&j) = index.get(u + PREFETCH)
+                            && j != NO_INDEX
+                        {
+                            self.prefetch(j as usize + shift);
                         }
-                    };
-                    match index[u] {
-                        NO_INDEX => chunks.indices(words[u], &mut add),
-                        j => add(j as usize),
+                        let w = weight(a, u);
+                        if w.is_zero() {
+                            continue;
+                        }
+                        let mut add = |j: usize| {
+                            let j = j + shift;
+                            if j < top {
+                                combine.add(j, w);
+                            }
+                        };
+                        match index[u] {
+                            NO_INDEX => chunks.indices(words[u], &mut add),
+                            j => add(j as usize),
+                        }
                     }
                 }
             }
