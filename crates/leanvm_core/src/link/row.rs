@@ -470,7 +470,8 @@ fn is_zero_pair(p: (F192, F192)) -> bool {
 /// `same(i)` holds is a constant factor `first(i)`.
 ///
 /// A group's chain starts at chunk 0 with one state per carry passed on. Once no carry is left, every group's value
-/// and the pointer's share the remaining factors `Π D_i`, which the skip then shortens.
+/// and the pointer's share the remaining factors `Π D_i`, which the skip then shortens. The pointer's term under the
+/// act weight has no shift groups: it is its coefficient times all the factors, one product after the chain.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn pointer_pair(
@@ -478,7 +479,7 @@ fn pointer_pair(
     slots: &Slots,
     coef: &[F192],
     groups: &[[F192; 2]],
-    mut act: Option<(&mut Acc, &[F192])>,
+    act: Option<(&mut Acc, &[F192])>,
     skip: bool,
     (clean, digit): (&CleanEq, impl Fn(usize) -> Option<u8>),
     same: impl Fn(usize) -> bool,
@@ -487,22 +488,22 @@ fn pointer_pair(
 ) {
     let d = slots.d;
     let mut p = [F192::ZERO; MAX_COEFFS];
-    p[..coef.len()].copy_from_slice(coef);
-    let mut len = coef.len();
-    // The pointer's term under the act weight: its coefficient times the same factors, without the shift groups.
-    let mut q = [F192::ZERO; MAX_COEFFS];
-    let mut q_len = 0;
-    if let Some((_, c)) = &act {
-        q[..c.len()].copy_from_slice(c);
-        q_len = c.len();
-    }
+    // A zero coefficient (the cycle pointer's) starts the chain empty.
+    let mut len = if coef.iter().all(|c| c.is_zero()) {
+        0
+    } else {
+        coef.len()
+    };
+    p[..len].copy_from_slice(&coef[..len]);
+    // The factors `D_i` as `a + b·X`: the chain's chunks first (for the act term), then the remaining ones.
+    let mut factors = [(F192::ZERO, F192::ZERO); MAX_CHUNKS];
     let mut start = 0;
     let live = groups.iter().any(|g| g.iter().any(|c| !c.is_zero()));
     if live {
         let e = pair(slots.eq(0));
-        len = mul_pair(&mut p, len, e);
-        if q_len > 0 {
-            q_len = mul_pair(&mut q, q_len, e);
+        factors[0] = (e.0, e.0 + e.1);
+        if len > 0 {
+            len = mul_pair(&mut p, len, e);
         }
         // The carry states after chunk `start - 1`, carry `c` at `c - 1`, and whether any is nonzero.
         let mut carries = [[F192::ZERO; MAX_COEFFS]; 4];
@@ -529,9 +530,9 @@ fn pointer_pair(
         while start < d && carry_len.iter().any(|&l| l > 0) {
             let i = start;
             let e = pair(slots.eq(i));
-            len = mul_pair(&mut p, len, e);
-            if q_len > 0 {
-                q_len = mul_pair(&mut q, q_len, e);
+            factors[i] = (e.0, e.0 + e.1);
+            if len > 0 {
+                len = mul_pair(&mut p, len, e);
             }
             let mut out = [F192::ZERO; MAX_COEFFS];
             let mut out_len = 0;
@@ -539,14 +540,14 @@ fn pointer_pair(
                 if carry_len[c - 1] == 0 {
                     continue;
                 }
-                let (y, y_len) = (carries[c - 1], carry_len[c - 1]);
+                let (y, y_len) = (&carries[c - 1], carry_len[c - 1]);
                 let e0 = pair(slots.link(i, c, 0));
                 if !is_zero_pair(e0) {
-                    len = add_mul_pair(&mut p, len, &y, y_len, e0);
+                    len = add_mul_pair(&mut p, len, y, y_len, e0);
                 }
                 let e1 = pair(slots.link(i, c, 1));
                 if !is_zero_pair(e1) {
-                    out_len = add_mul_pair(&mut out, out_len, &y, y_len, e1);
+                    out_len = add_mul_pair(&mut out, out_len, y, y_len, e1);
                 }
             }
             carry_len = [0; 4];
@@ -556,14 +557,13 @@ fn pointer_pair(
         }
     }
     let p_live = !p[..len].iter().all(|c| c.is_zero());
-    let q_live = !q[..q_len].iter().all(|c| c.is_zero());
-    if !p_live && !q_live {
+    let act = act.filter(|(_, c)| !c.iter().all(|c| c.is_zero()));
+    if !p_live && act.is_none() {
         return;
     }
     // The remaining factors: one lookup for the chunks constant at one-hot values, one product for the rest.
     let mut codes = [0u32; CLEAN_BLOCKS];
-    let mut factors = [(F192::ZERO, F192::ZERO); MAX_CHUNKS];
-    let mut n = 0;
+    let mut n = start;
     for i in start..d {
         if let Some(v) = digit(i) {
             clean.add(&mut codes, i, v);
@@ -578,13 +578,13 @@ fn pointer_pair(
         }
     }
     let s = clean.at(&codes);
-    let t = product(&factors[..n]);
-    let t = &t[..n + 1];
     if p_live {
-        add_tail(acc, &p[..len], s, t);
+        let t = product(&factors[start..n]);
+        add_tail(acc, &p[..len], s, &t[..n - start + 1]);
     }
-    if q_live && let Some((act_acc, _)) = &mut act {
-        add_tail(act_acc, &q[..q_len], s, t);
+    if let Some((act_acc, c)) = act {
+        let t = product(&factors[..n]);
+        add_scaled(act_acc, s, c, &t[..n + 1]);
     }
 }
 
