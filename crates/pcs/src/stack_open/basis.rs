@@ -13,7 +13,7 @@
 //! `b(l, x) = sum_t A(l, t) * K_t(x)` over one term per claim and 192 per ring claim, and the table
 //! `P(l, t) = sum_x stack(l, x) * K_t(x)` takes the stack's place in the lane rounds.
 
-use primitives::bit_fold::BitFold;
+use primitives::bit_fold::{BitFold, SPARSE_BITS, fold_set_bits};
 use primitives::bits::bit_transpose_64bytes;
 use primitives::field::{Acc8, F64, F192, F192x8, Weights8, dot_base, msg_lone8_ext, xor_into8};
 
@@ -137,6 +137,8 @@ fn equal_blocks(stack: &[F64]) -> Vec<bool> {
 struct Ring {
     /// Folds a bit row of a block against `e_lo`.
     fold: BitFold,
+    /// `e_lo(x)` for every word of a block.
+    e_lo: Vec<F192>,
     /// `e_hi(h)` for every block.
     e_hi: Vec<F192>,
     point: Vec<F192>,
@@ -212,6 +214,7 @@ impl Terms {
                     flush(&mut folds, &mut masses, &mut sigmas);
                 }
                 let mut transposed = false;
+                let mut sparse = None;
                 for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
                     let e_hi = ring.e_hi[h];
                     if e_hi == F192::ZERO {
@@ -219,6 +222,17 @@ impl Terms {
                     }
                     *mass += e_hi;
                     fold.get_or_insert_with(|| {
+                        let words = primitives::cast_slice::<F64, u64>(block(h));
+                        // One-hot words, such as pointers, set a few bits each: an addition per set bit beats the
+                        // byte tables.
+                        let few = || {
+                            words.iter().map(|w| w.count_ones() as usize).sum::<usize>() <= SPARSE_BITS * words.len()
+                        };
+                        if *sparse.get_or_insert_with(few) {
+                            let mut folded = [F192::ZERO; ROWS];
+                            fold_set_bits(&ring.e_lo, words, &mut folded);
+                            return folded;
+                        }
                         if !transposed {
                             for (col, group) in cols.iter_mut().zip(block(h).as_chunks::<8>().0) {
                                 bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
@@ -442,8 +456,10 @@ pub(super) fn initial_basis(
             let at = match shared {
                 Some(k) => (claims.len() + first_ring + k) << lane_bits,
                 None => {
+                    let e_lo = table(low);
                     terms.rings.push(Ring {
-                        fold: BitFold::new(&table(low)),
+                        fold: BitFold::new(&e_lo),
+                        e_lo,
                         e_hi: table(mid),
                         point: piece.point.clone(),
                         x_offset,

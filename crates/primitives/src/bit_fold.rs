@@ -71,6 +71,45 @@ impl BitFold {
     }
 }
 
+/// The most set bits a word may average for [`fold_set_bits`] to beat [`BitFold::fold_columns`]. The GFNI fold costs
+/// a few instructions per 64 rows whatever the bits, so there it never does.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+pub const SPARSE_BITS: usize = 0;
+/// The most set bits a word may average for [`fold_set_bits`] to beat [`BitFold::fold_columns`].
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+)))]
+pub const SPARSE_BITS: usize = 12;
+
+/// [`BitFold::fold_columns`] of `words` before their transpose, with `weights` the fold's weights: `out[p]` sums the
+/// weights of the words whose bit `p` is set, one addition per set bit. Cheaper than the byte tables when the words
+/// have few bits set, as one-hot words do.
+pub fn fold_set_bits(weights: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
+    assert_eq!(weights.len(), words.len(), "a weight per word");
+    // Two banks, so neighbouring words that set the same bit do not wait on each other's addition.
+    let mut banks = [[F192::ZERO; BLOCK]; 2];
+    for (pair, weights) in words.chunks(2).zip(weights.chunks(2)) {
+        for ((bank, &word), &w) in banks.iter_mut().zip(pair).zip(weights) {
+            let mut bits = word;
+            while bits != 0 {
+                bank[bits.trailing_zeros() as usize] += w;
+                bits &= bits - 1;
+            }
+        }
+    }
+    for ((o, &a), &b) in out.iter_mut().zip(&banks[0]).zip(&banks[1]) {
+        *o = a + b;
+    }
+}
+
 #[cfg(any(
     test,
     not(all(
@@ -844,6 +883,32 @@ mod tests {
         check::<32>(&mut rng);
         check::<64>(&mut rng);
         check::<128>(&mut rng);
+    }
+
+    /// The set-bit fold of words against the table fold of their transpose, for sparse and dense words.
+    #[test]
+    fn fold_set_bits_matches_fold_columns() {
+        let mut rng = Rng::new(0x5E7_B175);
+        let weights: Vec<F192> = (0..1024).map(|_| rng.ext()).collect();
+        let fold = BitFold::new(&weights);
+        for dense in [false, true] {
+            let words: Vec<u64> = (0..1024)
+                .map(|_| match dense {
+                    true => rng.next_u64(),
+                    false => (0..7).fold(0, |w, i| w | 1 << (8 * i + rng.next_u32() % 8)),
+                })
+                .collect();
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let cols: [[u8; BLOCK]; 128] = std::array::from_fn(|j| {
+                let mut col = [0u8; BLOCK];
+                crate::bits::bit_transpose_64bytes(bytes[64 * j..][..64].try_into().unwrap(), &mut col);
+                col
+            });
+            let (mut want, mut got) = ([F192::ZERO; BLOCK], [F192::ZERO; BLOCK]);
+            fold.fold_columns(&cols, &mut want);
+            fold_set_bits(&weights, &words, &mut got);
+            assert_eq!(got, want, "dense {dense}");
+        }
     }
 
     /// Two runs of bytes against the byte-table folds of each, full and short blocks.
