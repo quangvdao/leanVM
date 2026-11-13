@@ -583,16 +583,17 @@ fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192,
     }
 }
 
-/// `Σ_i ε_i·(D_i(r_i)·D_i(1 + r_i) + π_i)(X)` for one column at one pair, added to `acc`. With `skip`, a chunk
-/// that is one one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds
-/// `b·b̄·(X + X²)`, and one whose values agree (`same`) a constant.
+/// `Σ_i ε_i·(D_i(r_i)·D_i(1 + r_i) + π_i)(X)` for one column at one pair, added to `acc`, from the bar slots, which
+/// hold `ε_i·D_i(1 + r_i)` (see [`Column::bars`]), and `ε_i·π_i` in `cert_mirrors`. With `skip`, a chunk that is one
+/// one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds `b·b̄·(X + X²)`, and one
+/// whose values agree (`same`) a constant.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn cert_pair(
     acc: &mut Poly,
     slots: &Slots,
     cert: &[F192],
-    mirrors: &[F192],
+    cert_mirrors: &[F192],
     skip: bool,
     clean: impl Fn(usize) -> bool,
     one_hot: impl Fn(usize) -> bool,
@@ -600,25 +601,36 @@ fn cert_pair(
     pair: impl Fn(usize) -> (F192, F192),
 ) {
     let mut m = [F192Unreduced::ZERO; 3];
+    let mut constant = F192::ZERO;
     for i in 0..slots.d {
-        if skip && clean(i) {
+        if (skip && clean(i)) || cert[i].is_zero() {
             continue;
         }
-        let (x, y, eps) = (pair(slots.eq(i)), pair(slots.bar(i)), cert[i]);
+        let (x, y) = (pair(slots.eq(i)), pair(slots.bar(i)));
         if skip && one_hot(i) {
-            let t = eps.mul_unreduced((x.0 + x.1) * (y.0 + y.1));
+            let t = (x.0 + x.1).mul_unreduced(y.0 + y.1);
             m[1] ^= t;
             m[2] ^= t;
         } else if skip && same(i) {
-            m[0] ^= eps.mul_unreduced(x.0 * y.0 + mirrors[i]);
+            m[0] ^= x.0.mul_unreduced(y.0);
+            constant += cert_mirrors[i];
         } else {
-            let q = pair_product(x, y);
-            m[0] ^= eps.mul_unreduced(q[0] + mirrors[i]);
-            m[1] ^= eps.mul_unreduced(q[1]);
-            m[2] ^= eps.mul_unreduced(q[2]);
+            add_pair_product(&mut m, x, y);
+            constant += cert_mirrors[i];
         }
     }
-    add_into(acc, &m.map(F192Unreduced::reduce));
+    let m = m.map(F192Unreduced::reduce);
+    add_into(acc, &[m[0] + constant, m[1], m[2]]);
+}
+
+/// `m ← m + x(X)·y(X)` for the linear `x`, `y` through their pairs, by Karatsuba.
+#[inline(always)]
+fn add_pair_product(m: &mut [F192Unreduced; 3], x: (F192, F192), y: (F192, F192)) {
+    let c0 = x.0.mul_unreduced(y.0);
+    let c2 = (x.0 + x.1).mul_unreduced(y.0 + y.1);
+    m[0] ^= c0;
+    m[1] ^= x.1.mul_unreduced(y.1) ^ c0 ^ c2;
+    m[2] ^= c2;
 }
 
 /// `ω(X)·m(X)` added to `acc`, `m` of three coefficients.
@@ -826,7 +838,17 @@ struct Column<'a> {
     act: Coef,
     shifts: Vec<ShiftGroup>,
     cert: Vec<F192>,
+    /// Per chunk, `D_i` at `1 + r` times the chunk's certificate weight `ε_i` (one when `ε_i` is zero), so a pair's
+    /// certificate term is one product of its two slots; [`State::end`] divides the weight back out.
+    bars: Vec<Vec<F192>>,
+    /// `ε_i·π_i` per chunk.
+    cert_mirrors: Vec<F192>,
     q: usize,
+}
+
+/// A chunk's certificate weight as [`Column::bars`] scales its table by.
+fn bar_scale(eps: F192) -> F192 {
+    if eps.is_zero() { F192::ONE } else { eps }
 }
 
 impl<'a> Column<'a> {
@@ -871,6 +893,10 @@ impl<'a> Column<'a> {
             omega: column.omega,
             act: column.act,
             shifts: column.shifts,
+            bars: (points.bar.tables.iter().zip(&column.cert))
+                .map(|(t, &e)| t.iter().map(|&v| bar_scale(e) * v).collect())
+                .collect(),
+            cert_mirrors: column.cert.iter().zip(&points.mirrors).map(|(&e, &m)| e * m).collect(),
             cert: column.cert,
             q: column.q,
         }
@@ -878,8 +904,12 @@ impl<'a> Column<'a> {
 
     /// Every slot's table and chunk, in slot order.
     fn tables<'b>(&'b self, points: &'b RowPoints) -> Vec<(usize, &'b [F192])> {
+        let d = self.slots.d;
         (0..self.slots.n_values())
-            .map(|k| self.slots.table(k, points, &self.starts))
+            .map(|k| match k.checked_sub(d) {
+                Some(i) if i < d => (i, self.bars[i].as_slice()),
+                _ => self.slots.table(k, points, &self.starts),
+            })
             .collect()
     }
 
@@ -1192,7 +1222,7 @@ impl<'a> State<'a> {
                         let words = (tables.as_slice(), weighted.as_slice());
                         match &column.values {
                             None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
-                            Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
+                            Some(values) => Self::pair_folded(column, values, k, &aux, skip, sums),
                         }
                     }
                     if k < whole {
@@ -1290,7 +1320,7 @@ impl<'a> State<'a> {
                     acc,
                     slots,
                     &column.cert,
-                    &points.mirrors,
+                    &column.cert_mirrors,
                     skip,
                     |i| same(i) && lo_bits[i].is_some_and(u64::is_power_of_two),
                     one_hot,
@@ -1396,11 +1426,15 @@ impl<'a> State<'a> {
             },
             |acc| {
                 let mut m = [F192Unreduced::ZERO; 3];
+                let mut constant = F192::ZERO;
                 let mut rest = varying;
                 while rest != 0 {
                     let i = rest.trailing_zeros() as usize;
                     rest &= rest - 1;
                     let eps = column.cert[i];
+                    if eps.is_zero() {
+                        continue;
+                    }
                     if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
                         let t = eps.mul_unreduced(
                             points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)],
@@ -1408,13 +1442,12 @@ impl<'a> State<'a> {
                         m[1] ^= t;
                         m[2] ^= t;
                     } else {
-                        let q = pair_product(pair(slots.eq(i)), pair(slots.bar(i)));
-                        m[0] ^= eps.mul_unreduced(q[0] + points.mirrors[i]);
-                        m[1] ^= eps.mul_unreduced(q[1]);
-                        m[2] ^= eps.mul_unreduced(q[2]);
+                        add_pair_product(&mut m, pair(slots.eq(i)), pair(slots.bar(i)));
+                        constant += column.cert_mirrors[i];
                     }
                 }
-                add_into(acc, &m.map(F192Unreduced::reduce));
+                let m = m.map(F192Unreduced::reduce);
+                add_into(acc, &[m[0] + constant, m[1], m[2]]);
             },
         );
     }
@@ -1426,7 +1459,6 @@ impl<'a> State<'a> {
         values: &Strided,
         k: usize,
         aux: &[(F192, F192)],
-        points: &RowPoints,
         skip: bool,
         (omega, act): (&mut Poly, &mut Poly),
     ) {
@@ -1451,7 +1483,7 @@ impl<'a> State<'a> {
                     acc,
                     slots,
                     &column.cert,
-                    &points.mirrors,
+                    &column.cert_mirrors,
                     skip,
                     clean,
                     |_| false,
@@ -1520,9 +1552,16 @@ impl<'a> State<'a> {
             columns: self
                 .columns
                 .iter()
-                .map(|c| ColumnEnd {
-                    slices: Vec::new(),
-                    values: c.values.as_ref().map_or(Vec::new(), |v| v.row(0).to_vec()),
+                .map(|c| {
+                    let mut values = c.values.as_ref().map_or(Vec::new(), |v| v.row(0).to_vec());
+                    let d = c.slots.d;
+                    for (v, &e) in values.iter_mut().skip(d).take(d).zip(&c.cert) {
+                        *v *= bar_scale(e).inv();
+                    }
+                    ColumnEnd {
+                        slices: Vec::new(),
+                        values,
+                    }
                 })
                 .collect(),
             base: self.base.as_ref().map_or(F192::ZERO, |b| b.end(at(&self.omega, 0))),
