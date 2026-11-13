@@ -46,6 +46,10 @@ impl Linear {
     }
 }
 
+/// A linear form's constant and each term's column with its coefficient times `1 + x` and times `x`: the form at a
+/// row folded at `x` from the two rows' columns.
+type SplitLinear = (F192, Vec<(usize, F192, F192)>);
+
 /// A block over the tabulated values: its weight, its gate's slot, the slot of its linear part and a
 /// `(factor, linear form)` pair of slots per product.
 #[derive(Clone, Debug)]
@@ -325,6 +329,19 @@ impl<'a> Base<'a> {
     /// Bind the lowest row variable at `x`: `explicit` rows after.
     pub fn fold(&mut self, explicit: usize, x: F192) {
         let s = self.stride;
+        let n = self.factors.len();
+        // Before the first fold, each linear form at the folded row is `(1 + x)·L(lo) + x·L(hi)`: its coefficients
+        // times `1 + x` and `x` on the two rows' columns, with no product of the two rows' values.
+        let split: Vec<SplitLinear> = match &self.folded {
+            Some(_) => Vec::new(),
+            None => (self.linears.iter())
+                .map(|l| {
+                    let terms = l.terms.iter().map(|&(c, w)| (c, w * (F192::ONE + x), w * x)).collect();
+                    (l.constant, terms)
+                })
+                .collect(),
+        };
+        let rows = self.columns.first().map_or(0, |c| c.len());
         // SAFETY: every row writes each of its `s` values.
         let folded = unsafe {
             primitives::filled_vec(explicit * s, |out| {
@@ -332,6 +349,21 @@ impl<'a> Base<'a> {
                     parallel::chunks_mut(out, s * FOLD_ROWS, |task, chunk| {
                         for (j, row) in chunk.chunks_mut(s).enumerate() {
                             let k = task * FOLD_ROWS + j;
+                            if self.folded.is_none() && 2 * k + 1 < rows {
+                                let column = |c: usize| (self.columns[c][2 * k], self.columns[c][2 * k + 1]);
+                                for (o, &c) in row.iter_mut().zip(&self.factors) {
+                                    let (a, b) = column(c);
+                                    *o = F192::from(a) + x.mul_base(a + b);
+                                }
+                                for (o, (constant, terms)) in row[n..].iter_mut().zip(&split) {
+                                    let sum = terms.iter().fold(F192Unreduced::ZERO, |acc, &(c, w0, w1)| {
+                                        let (a, b) = column(c);
+                                        acc ^ w0.mul_base_unreduced(a) ^ w1.mul_base_unreduced(b)
+                                    });
+                                    *o = *constant + sum.reduce();
+                                }
+                                continue;
+                            }
                             self.with_row(2 * k, |lo| {
                                 self.with_row(2 * k + 1, |hi| {
                                     for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
