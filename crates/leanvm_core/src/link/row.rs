@@ -305,14 +305,23 @@ pub struct ColumnEnd {
     pub values: Vec<F192>,
 }
 
-/// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`.
-pub fn bit_slices_eq(words: &[u64], eq: &[F192]) -> Vec<F192> {
-    let n = words.len().min(eq.len());
+/// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`, for each column's words under its `eq`, in one dispatch.
+pub fn bit_slices_eq(columns: &[(&[u64], &[F192])]) -> Vec<Vec<F192>> {
+    const BLOCK: usize = TASK_PAIRS * 16;
+    let mut first = Vec::with_capacity(columns.len() + 1);
+    first.push(0);
+    for (words, eq) in columns {
+        first.push(first.last().unwrap() + words.len().min(eq.len()).div_ceil(BLOCK));
+    }
     let slices = parallel::fold_reduce(
-        n.div_ceil(TASK_PAIRS * 16),
-        || [F192::ZERO; 64],
+        *first.last().unwrap(),
+        || vec![[F192::ZERO; 64]; columns.len()],
         |acc, task| {
-            for u in task * TASK_PAIRS * 16..n.min((task + 1) * TASK_PAIRS * 16) {
+            let c = first.partition_point(|&f| f <= task) - 1;
+            let (words, eq) = columns[c];
+            let start = (task - first[c]) * BLOCK;
+            let acc = &mut acc[c];
+            for u in start..words.len().min(eq.len()).min(start + BLOCK) {
                 let mut w = words[u];
                 while w != 0 {
                     acc[w.trailing_zeros() as usize] += eq[u];
@@ -321,11 +330,13 @@ pub fn bit_slices_eq(words: &[u64], eq: &[F192]) -> Vec<F192> {
             }
         },
         |mut a, b| {
-            add_into(&mut a, &b);
+            for (a, b) in a.iter_mut().zip(&b) {
+                add_into(a, b);
+            }
             a
         },
     );
-    slices.to_vec()
+    slices.into_iter().map(|s| s.to_vec()).collect()
 }
 
 /// A chunk table at a word's 64 bit-slices: the functional is linear in the bits.
@@ -1889,13 +1900,25 @@ pub fn prove(
     // Each column's values at its table's end come from its bit-slices there, as the verifier's do, so the
     // column rounds see every shift's tables of every column.
     let _ends = tracing::info_span!("Ends").entered();
+    // One eq table per table size, and every column's bit-slices in one dispatch.
+    let mut eqs: Vec<(usize, Vec<F192>)> = Vec::new();
+    for s in &states {
+        if !eqs.iter().any(|(m, _)| *m == s.m) {
+            eqs.push((s.m, primitives::multilinear::eq_table(&point[..s.m])));
+        }
+    }
+    let eq = |m: usize| eqs.iter().find(|(e, _)| *e == m).map(|(_, t)| t.as_slice()).unwrap();
+    let words: Vec<(&[u64], &[F192])> = states
+        .iter()
+        .flat_map(|s| s.columns.iter().map(|c| (c.words, eq(s.m))))
+        .collect();
+    let mut slices = bit_slices_eq(&words).into_iter();
     let ends: Vec<TableEnd> = states
         .iter()
         .map(|s| {
             let mut end = s.end(s.done.map_or(F192::ONE, |(_, corner)| corner));
-            let eq = primitives::multilinear::eq_table(&point[..s.m]);
-            for (column, column_end) in s.columns.iter().zip(&mut end.columns) {
-                let full = ColumnEnd::from_slices(chunks, points, bit_slices_eq(column.words, &eq));
+            for column_end in &mut end.columns {
+                let full = ColumnEnd::from_slices(chunks, points, slices.next().unwrap());
                 debug_assert_eq!(column_end.values[..2 * d], full.values[..2 * d]);
                 *column_end = full;
             }
