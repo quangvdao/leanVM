@@ -1,12 +1,13 @@
 //! Hotwire's index side: the rounds over the index `j` of cycles, memory cells and instructions, lowest bit
 //! first, each of degree 2.
 //!
-//! The summand is a sum of terms `coef·A(j)·B(j)` and `coef·A(j)` over arrays that are zero past their length,
-//! so a cycle table stops at `T + 1` and the program at its size while memory fills `2^W`. A pair of rows of a
-//! term is summed only where both of its arrays have one.
+//! The summand is a sum of terms `coef·A(j)·B(j)` and `coef·A(j)` over arrays. An array stores its first entries
+//! and has a closed form past them ([`Tail`]): zero for a cycle table, which stops at `T + 1`, and the index's power
+//! or `eq` for the tables that pair with it. A pair of rows of a term is summed only where both of its arrays can be
+//! nonzero, so a table need only be stored as far as its partner reaches.
 
 use super::pointer::{Chunks, NO_INDEX};
-use primitives::field::{F192, F192Unreduced};
+use primitives::field::{F64, F192, F192Unreduced};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Pairs per task of a round.
@@ -24,6 +25,118 @@ pub struct IndexEnd {
     pub point: Vec<F192>,
     pub values: Vec<F192>,
     pub claim: F192,
+}
+
+/// What an array holds past its stored entries, at index `j` over the variables still unbound.
+#[derive(Clone, Debug)]
+pub enum Tail {
+    Zero,
+    /// `c·ratio^j`.
+    Powers {
+        c: F192,
+        ratio: F64,
+    },
+    /// `c·eq(point, j)`, the point lowest variable first.
+    Eq {
+        c: F192,
+        point: Vec<F192>,
+    },
+}
+
+impl Tail {
+    #[inline(never)]
+    fn at(&self, j: usize) -> F192 {
+        match self {
+            Self::Zero => F192::ZERO,
+            Self::Powers { c, ratio } => c.mul_base(ratio.pow(j as u128)),
+            Self::Eq { c, point } => point
+                .iter()
+                .enumerate()
+                .fold(*c, |e, (h, &z)| e * if j >> h & 1 == 1 { z } else { F192::ONE + z }),
+        }
+    }
+
+    /// The tail once the lowest variable is bound at `x`.
+    fn fold(&self, x: F192) -> Self {
+        match self {
+            Self::Zero => Self::Zero,
+            Self::Powers { c, ratio } => Self::Powers {
+                c: *c * (F192::ONE + x.mul_base(F64::ONE + *ratio)),
+                ratio: ratio.square(),
+            },
+            Self::Eq { c, point } => Self::Eq {
+                c: *c * (F192::ONE + point[0] + x),
+                point: point[1..].to_vec(),
+            },
+        }
+    }
+}
+
+/// An array of the summand: its stored entries, then its tail.
+pub struct Array {
+    pub head: Vec<F192>,
+    pub tail: Tail,
+}
+
+impl From<Vec<F192>> for Array {
+    fn from(head: Vec<F192>) -> Self {
+        Self { head, tail: Tail::Zero }
+    }
+}
+
+impl Array {
+    /// The indices, of `size`, where it can be nonzero.
+    fn len(&self, size: usize) -> usize {
+        match self.tail {
+            Tail::Zero => self.head.len(),
+            _ => size,
+        }
+    }
+
+    fn get(&self, j: usize) -> F192 {
+        self.head.get(j).copied().unwrap_or_else(|| self.tail.at(j))
+    }
+}
+
+/// The pairs a round sums, given where each array can be nonzero.
+fn task_pairs(lens: &[usize], terms: &[Term]) -> usize {
+    (terms.iter())
+        .map(|&t| match t {
+            Term::Product { a, b, .. } => lens[a].min(lens[b]),
+            Term::Single { a, .. } => lens[a],
+        })
+        .max()
+        .unwrap_or(0)
+        .div_ceil(2)
+}
+
+/// A task's entries of an array, from index `offset`.
+#[derive(Clone, Copy)]
+struct View<'a> {
+    head: &'a [F192],
+    offset: usize,
+    /// The indices from `offset` where the array can be nonzero.
+    len: usize,
+    tail: &'a Tail,
+}
+
+impl View<'_> {
+    #[inline(always)]
+    fn at(&self, i: usize) -> F192 {
+        match self.head.get(i) {
+            Some(&v) => v,
+            None => self.tail.at(self.offset + i),
+        }
+    }
+
+    /// The pairs read from the stored entries alone.
+    #[inline(always)]
+    fn stored_pairs(&self) -> usize {
+        match self.tail {
+            Tail::Zero => self.head.len().div_ceil(2),
+            _ => self.head.len() / 2,
+        }
+    }
 }
 
 #[inline(always)]
@@ -47,18 +160,26 @@ impl Sums {
         }
     }
 
-    /// Add the terms over the pairs `k` in `range` of `arrays`, each array read from index 0.
+    /// Add the terms over the pairs `k` in `range` of `arrays`.
     #[inline(always)]
-    fn add(&mut self, terms: &[Term], arrays: &[&[F192]], range: std::ops::Range<usize>) {
+    fn add(&mut self, terms: &[Term], arrays: &[View], range: std::ops::Range<usize>) {
         let (mut p, mut q) = (0, 0);
         for &term in terms {
             match term {
                 Term::Product { a, b, .. } => {
                     let (a, b) = (arrays[a], arrays[b]);
-                    let end = range.end.min(a.len().div_ceil(2)).min(b.len().div_ceil(2));
+                    let end = range.end.min(a.len.div_ceil(2)).min(b.len.div_ceil(2)).max(range.start);
+                    let stored = end.min(a.stored_pairs()).min(b.stored_pairs()).max(range.start);
                     let acc = &mut self.products[p];
-                    for k in range.start..end.max(range.start) {
-                        let (a0, a1, b0, b1) = (a[2 * k], at(a, 2 * k + 1), b[2 * k], at(b, 2 * k + 1));
+                    let (ah, bh) = (a.head, b.head);
+                    for k in range.start..stored {
+                        let (a0, a1, b0, b1) = (ah[2 * k], at(ah, 2 * k + 1), bh[2 * k], at(bh, 2 * k + 1));
+                        acc[0] ^= a0.mul_unreduced(b0);
+                        acc[1] ^= a1.mul_unreduced(b1);
+                        acc[2] ^= (a0 + a1).mul_unreduced(b0 + b1);
+                    }
+                    for k in stored..end {
+                        let (a0, a1, b0, b1) = (a.at(2 * k), a.at(2 * k + 1), b.at(2 * k), b.at(2 * k + 1));
                         acc[0] ^= a0.mul_unreduced(b0);
                         acc[1] ^= a1.mul_unreduced(b1);
                         acc[2] ^= (a0 + a1).mul_unreduced(b0 + b1);
@@ -66,12 +187,11 @@ impl Sums {
                     p += 1;
                 }
                 Term::Single { a, .. } => {
-                    let a = arrays[a];
-                    let end = range.end.min(a.len().div_ceil(2));
+                    let end = range.end.min(arrays[a].len.div_ceil(2)).max(range.start);
                     let acc = &mut self.singles[q];
-                    for k in range.start..end.max(range.start) {
-                        acc[0] += a[2 * k];
-                        acc[1] += at(a, 2 * k + 1);
+                    for k in range.start..end {
+                        acc[0] += arrays[a].at(2 * k);
+                        acc[1] += arrays[a].at(2 * k + 1);
                     }
                     q += 1;
                 }
@@ -115,12 +235,19 @@ impl Sums {
     }
 }
 
-/// The first round's polynomial.
-fn first_round(arrays: &[Vec<F192>], terms: &[Term]) -> [F192; 3] {
-    let views: Vec<&[F192]> = arrays.iter().map(Vec::as_slice).collect();
-    let pairs = arrays.iter().map(|a| a.len().div_ceil(2)).max().unwrap_or(0);
+/// The first round's polynomial, over `size` indices.
+fn first_round(arrays: &[Array], terms: &[Term], size: usize) -> [F192; 3] {
+    let views: Vec<View> = (arrays.iter())
+        .map(|a| View {
+            head: &a.head,
+            offset: 0,
+            len: a.len(size),
+            tail: &a.tail,
+        })
+        .collect();
+    let lens: Vec<usize> = views.iter().map(|v| v.len).collect();
     parallel::fold_reduce(
-        pairs.div_ceil(TASK_PAIRS),
+        task_pairs(&lens, terms).div_ceil(TASK_PAIRS),
         || Sums::new(terms),
         |acc, task| acc.add(terms, &views, task * TASK_PAIRS..(task + 1) * TASK_PAIRS),
         Sums::combine,
@@ -128,32 +255,49 @@ fn first_round(arrays: &[Vec<F192>], terms: &[Term]) -> [F192; 3] {
     .poly(terms)
 }
 
-/// Bind the lowest variable of every array at `x`, and sum the next round's polynomial, in one pass: a task folds
-/// its range of every array and sums the terms over it while it is in cache.
-fn fold_round(arrays: &[Vec<F192>], terms: &[Term], x: F192) -> (Vec<Vec<F192>>, [F192; 3]) {
-    let lens: Vec<usize> = arrays.iter().map(|a| a.len().div_ceil(2)).collect();
+/// Bind the lowest variable of every array, of `size` indices, at `x`, and sum the next round's polynomial, in one
+/// pass: a task folds its range of every array and sums the terms over it while it is in cache.
+fn fold_round(arrays: &[Array], terms: &[Term], x: F192, size: usize) -> (Vec<Array>, [F192; 3]) {
+    let half = size / 2;
+    let tails: Vec<Tail> = arrays.iter().map(|a| a.tail.fold(x)).collect();
+    let lens: Vec<usize> = arrays.iter().map(|a| a.head.len().div_ceil(2)).collect();
     // SAFETY: the tasks below write every entry, each task its own range, before anything reads it.
     let mut out: Vec<Vec<F192>> = lens.iter().map(|&n| unsafe { primitives::uninit_vec(n) }).collect();
     let ptrs: Vec<parallel::SendPtr<F192>> = out.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
-    let pairs = lens.iter().map(|n| n.div_ceil(2)).max().unwrap_or(0);
+    let summed: Vec<usize> = (lens.iter().zip(&tails))
+        .map(|(&n, tail)| if matches!(tail, Tail::Zero) { n } else { half })
+        .collect();
+    let pairs = (lens.iter().map(|n| n.div_ceil(2)).max().unwrap_or(0)).max(task_pairs(&summed, terms));
     let sums = parallel::fold_reduce(
         pairs.div_ceil(TASK_PAIRS),
         || Sums::new(terms),
         |acc, task| {
             let range = task * TASK_PAIRS..(task + 1) * TASK_PAIRS;
-            let views: Vec<&[F192]> = arrays
-                .iter()
-                .zip(&ptrs)
-                .zip(&lens)
-                .map(|((a, ptr), &n)| {
-                    let (lo, hi) = ((2 * range.start).min(n), (2 * range.end).min(n));
+            let offset = 2 * range.start;
+            let views: Vec<View> = (arrays.iter().zip(&tails))
+                .zip(ptrs.iter().zip(&lens))
+                .map(|((a, tail), (ptr, &n))| {
+                    let (lo, hi) = (offset.min(n), (2 * range.end).min(n));
                     // SAFETY: entries `lo..hi` of this array are this task's alone.
                     let dst = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(lo), hi - lo) };
                     for (j, o) in dst.iter_mut().enumerate() {
-                        let (a0, a1) = (a[2 * (lo + j)], at(a, 2 * (lo + j) + 1));
+                        let i = 2 * (lo + j);
+                        let (a0, a1) = (
+                            a.head[i],
+                            a.head.get(i + 1).copied().unwrap_or_else(|| a.tail.at(i + 1)),
+                        );
                         *o = a0 + x * (a0 + a1);
                     }
-                    &*dst
+                    let len = match tail {
+                        Tail::Zero => dst.len(),
+                        _ => half.saturating_sub(offset),
+                    };
+                    View {
+                        head: dst,
+                        offset,
+                        len,
+                        tail,
+                    }
                 })
                 .collect();
             // The views start at the task's first pair.
@@ -161,32 +305,39 @@ fn fold_round(arrays: &[Vec<F192>], terms: &[Term], x: F192) -> (Vec<Vec<F192>>,
         },
         Sums::combine,
     );
-    (out, sums.poly(terms))
+    let arrays = out
+        .into_iter()
+        .zip(tails)
+        .map(|(head, tail)| Array { head, tail })
+        .collect();
+    (arrays, sums.poly(terms))
 }
 
 /// The index side over `n_vars` variables. `round` takes each round polynomial's coefficients and returns the
 /// challenge.
 pub fn prove(
     n_vars: usize,
-    mut arrays: Vec<Vec<F192>>,
+    mut arrays: Vec<Array>,
     terms: &[Term],
     round: &mut dyn FnMut(&[F192]) -> F192,
 ) -> IndexEnd {
     assert!(
-        arrays.iter().all(|a| a.len() <= 1 << n_vars),
+        arrays.iter().all(|a| a.head.len() <= 1 << n_vars),
         "an array past 2^{n_vars}"
     );
+    let mut size = 1usize << n_vars;
     let mut point = Vec::with_capacity(n_vars);
     let mut claim = None;
-    let mut poly = first_round(&arrays, terms);
+    let mut poly = first_round(&arrays, terms, size);
     for _ in 0..n_vars {
         debug_assert!(claim.is_none_or(|c: F192| c == poly[1] + poly[2]));
         let x = round(&poly);
         claim = Some(primitives::multilinear::poly_eval(&poly, x));
-        (arrays, poly) = fold_round(&arrays, terms, x);
+        (arrays, poly) = fold_round(&arrays, terms, x, size);
+        size /= 2;
         point.push(x);
     }
-    let values: Vec<F192> = arrays.iter().map(|a| at(a, 0)).collect();
+    let values: Vec<F192> = arrays.iter().map(|a| a.get(0)).collect();
     let last = terms
         .iter()
         .map(|&term| match term {
@@ -298,6 +449,7 @@ impl Scatter {
 mod tests {
     use super::super::pointer::{ChunkEq, shifted};
     use super::*;
+    use primitives::field::F64;
     use primitives::multilinear::{eq_table, poly_eval};
     use primitives::test_rng::Rng;
 
@@ -369,18 +521,70 @@ mod tests {
                 .sum()
         };
         let mut claim: F192 = (0..1 << n).map(|j| value(&|a| at(&arrays[a], j))).sum();
-        let end = prove(n, arrays.clone(), &terms, &mut |poly| {
-            assert_eq!(poly.len(), 3);
-            assert_eq!(claim, poly[1] + poly[2], "a round's sum");
-            let x = rng.ext();
-            claim = poly_eval(poly, x);
-            x
-        });
+        let end = prove(
+            n,
+            arrays.iter().cloned().map(Array::from).collect(),
+            &terms,
+            &mut |poly| {
+                assert_eq!(poly.len(), 3);
+                assert_eq!(claim, poly[1] + poly[2], "a round's sum");
+                let x = rng.ext();
+                claim = poly_eval(poly, x);
+                x
+            },
+        );
         assert_eq!(claim, end.claim);
         for (a, &v) in arrays.iter().zip(&end.values) {
             assert_eq!(mle(a, &end.point), v);
         }
         assert_eq!(end.claim, value(&|a| end.values[a]));
+    }
+
+    /// An array with a tail proves as the array it stands for, stored in full.
+    #[test]
+    fn a_tail_proves_as_its_stored_array() {
+        let mut rng = Rng::new(0x7a1);
+        let n = 9;
+        let (c, ratio, zeta) = (rng.ext(), F64::G.pow(3), rng.ext_vec(n));
+        let tails = [
+            Tail::Zero,
+            Tail::Powers { c, ratio },
+            Tail::Eq { c, point: zeta.clone() },
+        ];
+        let heads = [(0, 300), (1, 64), (2, 32), (1, 1), (0, 51), (2, 2), (0, 1)].map(|(t, len)| {
+            let tail = &tails[t];
+            let head: Vec<F192> = (0..len)
+                .map(|j| if j % 7 == 3 { rng.ext() } else { tail.at(j) })
+                .collect();
+            Array {
+                head,
+                tail: tail.clone(),
+            }
+        });
+        let full: Vec<Vec<F192>> = (heads.iter())
+            .map(|a| match a.tail {
+                Tail::Zero => a.head.clone(),
+                _ => (0..1 << n).map(|j| a.get(j)).collect(),
+            })
+            .collect();
+        let terms = [(0, 1), (4, 2), (6, 3), (4, 5), (0, 0)]
+            .map(|(a, b)| Term::Product { coef: rng.ext(), a, b })
+            .into_iter()
+            .chain([
+                Term::Single { coef: rng.ext(), a: 1 },
+                Term::Single { coef: rng.ext(), a: 5 },
+            ])
+            .collect::<Vec<_>>();
+        let run = |arrays: Vec<Array>| {
+            let (mut rng, mut polys) = (Rng::new(0x7a2), Vec::new());
+            let end = prove(n, arrays, &terms, &mut |poly| {
+                polys.push(poly.to_vec());
+                rng.ext()
+            });
+            (polys, end.values)
+        };
+        let stored = run(full.into_iter().map(Array::from).collect());
+        assert_eq!(run(heads.into_iter().collect()), stored);
     }
 
     /// A scattered array at a point is the sum of its rows' `Φ_0` (or `Φ_1`) there, for any words.

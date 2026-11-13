@@ -7,7 +7,7 @@
 //! pointer columns, which become point claims and one ring-switched claim.
 
 use super::base::{Base, Block, Weight};
-use super::index::{self, Scatter, Term};
+use super::index::{self, Array, Scatter, Tail, Term};
 use super::pointer::Chunks;
 use super::row::{self, Coef, RowColumn, RowPoints, RowTable};
 use crate::cpu::{BytecodeColumns, KeccakLane, Layout, MEM_LO, MEM_TOP, keccak_value, schema};
@@ -403,10 +403,19 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
 
         drop(scatter);
         let _tables = tracing::info_span!("Index tables").entered();
-        let idx = index_powers(n);
+        // The memory and program tables are `g^j` terms past their cells and instructions, and `eq(ζ, ·)` is a
+        // product: each is stored only as far as the array it multiplies reaches, rounded to a power of two.
+        let [w_plus, cover, w_mem, w_bc] = [w_plus, cover, w_mem, w_bc].map(Scatter::into_vec);
+        let reach = |own: usize, partner: usize| own.max(partner).max(1).next_power_of_two().min(n);
+        let (mem_len, bc_len, zeta_len) = (
+            reach(1 << log_mem, w_mem.len()),
+            reach(bytecode_size, w_bc.len()),
+            reach(1, cover.len()),
+        );
+        let idx = index_powers(mem_len.max(bc_len));
         let gm = ch.gamma_mem;
         let mem = &columns[MEM_LO..=MEM_TOP];
-        let y_mem = tabulate(n, |j| {
+        let y_mem = tabulate(mem_len, |j| {
             let mut y = gm[0].mul_base(idx[j]);
             if j < 1 << log_mem {
                 y += gm[4] + gm[1].mul_base(mem[0][j]) + gm[2].mul_base(mem[1][j]) + gm[3].mul_base(mem[2][j]);
@@ -414,7 +423,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             y
         });
         let a = &ch.alpha_bc;
-        let x_bc = tabulate(n, |j| {
+        let x_bc = tabulate(bc_len, |j| {
             let mut x = a[1].mul_base(idx[j]);
             if j < bytecode_size {
                 x += a[2];
@@ -437,20 +446,40 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             })
             .collect();
         let payload: F192 = firsts.iter().flat_map(|f| f[1..].iter().copied()).sum();
-        let eq_zeta = eq_table(&ch.zeta);
+        let low = zeta_len.trailing_zeros() as usize;
+        let above = below_power(&ch.zeta, low);
+        // SAFETY: the fill writes every entry.
+        let eq_zeta = unsafe {
+            primitives::filled_vec(zeta_len, |out| {
+                primitives::multilinear::fill_eq_table(&ch.zeta[..low], above, out)
+            })
+        };
         drop(_tables);
         base_firsts = firsts;
+        let powers = |c: F192| Tail::Powers { c, ratio: F64::G };
         let arrays = vec![
-            w_plus.into_vec(),
-            spine,
-            cover.into_vec(),
-            w_mem.into_vec(),
-            y_mem,
-            w_bc.into_vec(),
-            x_bc,
-            eq_zeta,
-            vec![F192::ONE],
-            vec![payload],
+            w_plus.into(),
+            spine.into(),
+            cover.into(),
+            w_mem.into(),
+            Array {
+                head: y_mem,
+                tail: powers(gm[0]),
+            },
+            w_bc.into(),
+            Array {
+                head: x_bc,
+                tail: powers(a[1]),
+            },
+            Array {
+                head: eq_zeta,
+                tail: Tail::Eq {
+                    c: F192::ONE,
+                    point: ch.zeta.clone(),
+                },
+            },
+            vec![F192::ONE].into(),
+            vec![payload].into(),
         ];
         let terms = [
             Term::Product {
