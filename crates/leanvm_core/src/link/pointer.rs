@@ -508,8 +508,17 @@ mod tests {
             let (eq, bar) = (ChunkEq::at(&chunks, &r), ChunkEq::mirrored(&chunks, &r));
             let target = mirror(&r);
             for bits in 0u64..1 << (1 << w) {
-                let at = |t: &ChunkEq| (0..1 << w).filter(|v| bits >> v & 1 == 1).map(|v| t.tables[0][v]).sum::<F192>();
-                assert_eq!(at(&eq) * at(&bar) == target, bits.count_ones() == 1, "width {w}, bits {bits:#x}");
+                let at = |t: &ChunkEq| {
+                    (0..1 << w)
+                        .filter(|v| bits >> v & 1 == 1)
+                        .map(|v| t.tables[0][v])
+                        .sum::<F192>()
+                };
+                assert_eq!(
+                    at(&eq) * at(&bar) == target,
+                    bits.count_ones() == 1,
+                    "width {w}, bits {bits:#x}"
+                );
             }
         }
     }

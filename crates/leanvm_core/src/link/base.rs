@@ -39,10 +39,9 @@ struct Linear {
 impl Linear {
     #[inline(always)]
     fn at(&self, column: impl Fn(usize) -> F64) -> F192 {
-        let sum = self
-            .terms
-            .iter()
-            .fold(F192Unreduced::ZERO, |acc, &(c, w)| acc ^ w.mul_base_unreduced(column(c)));
+        let sum = self.terms.iter().fold(F192Unreduced::ZERO, |acc, &(c, w)| {
+            acc ^ w.mul_base_unreduced(column(c))
+        });
         self.constant + sum.reduce()
     }
 }
@@ -70,7 +69,11 @@ fn factor(prods: &[(usize, usize, F192)]) -> Vec<(usize, Linear)> {
                 *counts.entry(b).or_default() += 1;
             }
         }
-        let column = counts.iter().max_by_key(|&(c, n)| (*n, std::cmp::Reverse(*c))).map(|(&c, _)| c).unwrap();
+        let column = counts
+            .iter()
+            .max_by_key(|&(c, n)| (*n, std::cmp::Reverse(*c)))
+            .map(|(&c, _)| c)
+            .unwrap();
         let mut terms: Vec<(usize, F192)> = Vec::new();
         left.retain(|&(a, b, w)| {
             if a != column && b != column {
@@ -83,7 +86,13 @@ fn factor(prods: &[(usize, usize, F192)]) -> Vec<(usize, Linear)> {
             }
             false
         });
-        out.push((column, Linear { constant: F192::ZERO, terms }));
+        out.push((
+            column,
+            Linear {
+                constant: F192::ZERO,
+                terms,
+            },
+        ));
     }
     out
 }
@@ -194,7 +203,10 @@ impl<'a> Base<'a> {
             })
             .collect();
         let stride = n + linears.len();
-        assert!(stride <= MAX_SLOTS, "a table's base terms use at most {MAX_SLOTS} slots");
+        assert!(
+            stride <= MAX_SLOTS,
+            "a table's base terms use at most {MAX_SLOTS} slots"
+        );
         let mut base = Self {
             blocks,
             factors,

@@ -102,7 +102,11 @@ impl Functionals {
         };
         let mut tables: Vec<(usize, Vec<E>)> = eq.iter().cloned().enumerate().collect();
         // `eq(1 + r_i, v) = eq(r_i, v')` for `v'` the value `v` with its bits flipped.
-        tables.extend(eq.iter().enumerate().map(|(i, e)| (i, e.iter().rev().copied().collect())));
+        tables.extend(
+            eq.iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.iter().rev().copied().collect())),
+        );
         for s in 1..=max_shift {
             tables.extend((0..=carry).map(|c| (0, carry_table(&eq[0], s, c))));
         }

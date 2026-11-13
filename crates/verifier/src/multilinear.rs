@@ -163,14 +163,18 @@ fn arrange(class: &[usize], shared: &[bool], per_lane: usize) -> Vec<usize> {
     if per_lane == 1 || per_lane >= n {
         return (0..n).collect();
     }
-    let mut free: Vec<Vec<usize>> = (0..per_lane).map(|residue| (residue..n).step_by(per_lane).rev().collect()).collect();
+    let mut free: Vec<Vec<usize>> = (0..per_lane)
+        .map(|residue| (residue..n).step_by(per_lane).rev().collect())
+        .collect();
     let mut slots = vec![usize::MAX; n];
     let mut residue: Option<usize> = None;
     for (slot, &index) in slots.iter_mut().zip(class) {
         if shared[index] {
             let at = match residue {
                 Some(at) if !free[at].is_empty() => at,
-                _ => (0..per_lane).max_by_key(|&at| (free[at].len(), std::cmp::Reverse(at))).unwrap_or(0),
+                _ => (0..per_lane)
+                    .max_by_key(|&at| (free[at].len(), std::cmp::Reverse(at)))
+                    .unwrap_or(0),
             };
             residue = Some(at);
             *slot = free[at].pop().unwrap_or(usize::MAX);

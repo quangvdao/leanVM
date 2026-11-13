@@ -557,7 +557,11 @@ fn finish_pointer(acc: &mut Poly, p: &[F192], mut scalar: F192, linear: &[(F192,
         scalar *= p[0];
     }
     let (a, b) = linear[0];
-    let (a, b) = if scalar == F192::ONE { (a, b) } else { (scalar * a, scalar * b) };
+    let (a, b) = if scalar == F192::ONE {
+        (a, b)
+    } else {
+        (scalar * a, scalar * b)
+    };
     let mut r = [F192::ZERO; MAX_COEFFS];
     r[0] = a;
     r[1] = a + b;
@@ -1313,10 +1317,17 @@ impl<'a> State<'a> {
             |acc, coef, groups, act| {
                 if varying.count_ones() <= 1 {
                     let at = |sigma| points.split.at(sigma);
-                    linear_pointer(acc, coef, groups, act, (fold_words(lo, r, at), fold_words(hi, r, at)), |g| {
-                        let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
-                        (fold_words(lo, r, at), fold_words(hi, r, at))
-                    })
+                    linear_pointer(
+                        acc,
+                        coef,
+                        groups,
+                        act,
+                        (fold_words(lo, r, at), fold_words(hi, r, at)),
+                        |g| {
+                            let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
+                            (fold_words(lo, r, at), fold_words(hi, r, at))
+                        },
+                    )
                 } else {
                     pointer_pair(
                         acc,
@@ -1339,7 +1350,9 @@ impl<'a> State<'a> {
                     rest &= rest - 1;
                     let eps = column.cert[i];
                     if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
-                        let t = eps.mul_unreduced(points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)]);
+                        let t = eps.mul_unreduced(
+                            points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)],
+                        );
                         m[1] ^= t;
                         m[2] ^= t;
                     } else {
@@ -1381,7 +1394,19 @@ impl<'a> State<'a> {
             |acc, coef, groups, act| {
                 pointer_pair(acc, slots, coef, groups, act, skip, |i| lo[i] == hi[i], |i| lo[i], pair)
             },
-            |acc| cert_pair(acc, slots, &column.cert, &points.mirrors, skip, clean, |_| false, same, pair),
+            |acc| {
+                cert_pair(
+                    acc,
+                    slots,
+                    &column.cert,
+                    &points.mirrors,
+                    skip,
+                    clean,
+                    |_| false,
+                    same,
+                    pair,
+                )
+            },
         );
     }
 
@@ -1796,7 +1821,9 @@ mod tests {
         let mut rng = Rng::new(0x7a6);
         for _ in 0..10_000 {
             let pick = |rng: &mut Rng| -> u64 {
-                (0..8).fold(0, |t, i| t | u64::from([0u8, 1, 3, 15, MIXED][rng.next_u64() as usize % 5]) << (8 * i))
+                (0..8).fold(0, |t, i| {
+                    t | u64::from([0u8, 1, 3, 15, MIXED][rng.next_u64() as usize % 5]) << (8 * i)
+                })
             };
             let (a, b) = (pick(&mut rng), pick(&mut rng));
             let want = (0..8).fold(0, |t, i| {

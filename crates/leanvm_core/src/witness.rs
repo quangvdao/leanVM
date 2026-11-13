@@ -213,11 +213,22 @@ mod tests {
             let lane = 1usize << (shape.mu - crate::pcs::LOG_BATCH);
             let mut offsets: Vec<usize> = placements.iter().map(|p| p.offset).collect();
             offsets.sort_unstable();
-            assert_eq!(offsets, (0..64).map(|i| i << 8).collect::<Vec<_>>(), "the columns tile from 0");
-            let mut in_lane: Vec<usize> = (0..64).filter(|&i| pointer[i]).map(|i| placements[i].offset % lane).collect();
+            assert_eq!(
+                offsets,
+                (0..64).map(|i| i << 8).collect::<Vec<_>>(),
+                "the columns tile from 0"
+            );
+            let mut in_lane: Vec<usize> = (0..64)
+                .filter(|&i| pointer[i])
+                .map(|i| placements[i].offset % lane)
+                .collect();
             in_lane.sort_unstable();
             in_lane.dedup();
-            assert_eq!(in_lane.len(), n_pointers.div_ceil(64 / (lane >> 8)), "{n_pointers} pointers");
+            assert_eq!(
+                in_lane.len(),
+                n_pointers.div_ceil(64 / (lane >> 8)),
+                "{n_pointers} pointers"
+            );
         }
     }
 }

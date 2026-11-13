@@ -46,8 +46,18 @@ fn ring_weight(groups: &[PointGroup], x: &[E], coefficients: &[E]) -> E {
             .map(|(placement, _)| placement.map_or(ONE, |placement| placement.eq_above(x)))
             .collect();
         E::sum(coefficients.iter().enumerate().map(|(k, &c)| {
-            let product = group.point.iter().zip(&x[..n]).fold(c, |acc, (powers, &x)| acc * (ONE + powers[k] + x));
-            let scales = E::sum(group.pieces.iter().zip(&aboves).map(|((_, powers), &above)| above * powers[k]));
+            let product = group
+                .point
+                .iter()
+                .zip(&x[..n])
+                .fold(c, |acc, (powers, &x)| acc * (ONE + powers[k] + x));
+            let scales = E::sum(
+                group
+                    .pieces
+                    .iter()
+                    .zip(&aboves)
+                    .map(|((_, powers), &above)| above * powers[k]),
+            );
             product * scales
         }))
     }))
