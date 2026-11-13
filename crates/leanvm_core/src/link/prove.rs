@@ -268,16 +268,16 @@ fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usiz
     (e + (e & 1)).min(1 << log_rows)
 }
 
-/// `g^j` for `j < n`.
-fn index_powers(n: usize) -> Vec<F64> {
+/// `f(j, g^j)` for `j < n`, in parallel: each task seeds `g^j` once and steps it by `g`.
+fn tabulate_powers(n: usize, f: impl Fn(usize, F64) -> F192 + Sync) -> Vec<F192> {
     // SAFETY: every entry is written.
     unsafe {
         primitives::filled_vec(n, |out| {
             parallel::chunks_mut(out, TASK, |task, chunk| {
                 let mut g = primitives::field::g_pow(task * TASK);
-                for o in chunk {
-                    *o = g;
-                    g *= F64::G;
+                for (k, o) in chunk.iter_mut().enumerate() {
+                    *o = f(task * TASK + k, g);
+                    g = primitives::field::mul_by_g(g);
                 }
             })
         })
@@ -425,19 +425,18 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             reach(bytecode_size, w_bc.len()),
             reach(1, cover.len()),
         );
-        let idx = index_powers(mem_len.max(bc_len));
         let gm = ch.gamma_mem;
         let mem = &columns[MEM_LO..=MEM_TOP];
-        let y_mem = tabulate(mem_len, |j| {
-            let mut y = gm[0].mul_base(idx[j]);
+        let y_mem = tabulate_powers(mem_len, |j, g_j| {
+            let mut y = gm[0].mul_base(g_j);
             if j < 1 << log_mem {
                 y += gm[4] + gm[1].mul_base(mem[0][j]) + gm[2].mul_base(mem[1][j]) + gm[3].mul_base(mem[2][j]);
             }
             y
         });
         let a = &ch.alpha_bc;
-        let x_bc = tabulate(bc_len, |j| {
-            let mut x = a[1].mul_base(idx[j]);
+        let x_bc = tabulate_powers(bc_len, |j, g_j| {
+            let mut x = a[1].mul_base(g_j);
             if j < bytecode_size {
                 x += a[2];
                 for (s, column) in program.iter().enumerate() {
@@ -446,7 +445,6 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             }
             x
         });
-        drop(idx);
         let firsts: Vec<[F192; 5]> = (0..tables::N_TABLES)
             .map(|t| {
                 let base = Base::new(
