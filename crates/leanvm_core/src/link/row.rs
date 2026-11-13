@@ -50,6 +50,14 @@ const MAX_GROUP: usize = 1 << (WORD_ROUNDS - 1);
 /// A column's slot tables, and each slot's table times each word's fold weight, while the rounds read words.
 type WordTables<'a, 'b> = (&'a [(usize, &'b [F192])], &'a [Vec<F192>]);
 
+/// A table's round sum, set up: [`State::round_setup`].
+struct RoundSetup<'b> {
+    pairs: usize,
+    per_task: usize,
+    tables: Vec<Vec<(usize, &'b [F192])>>,
+    weighted: Vec<Vec<Vec<F192>>>,
+}
+
 /// Chunks of a word, at most.
 const MAX_CHUNKS: usize = 8;
 
@@ -1388,24 +1396,17 @@ impl<'a> State<'a> {
         out
     }
 
-    /// The round polynomial over this table's pairs.
-    fn round(&self, chunks: &Chunks, points: &RowPoints, skip: bool) -> Poly {
+    /// What every task of this round's sum shares: the columns' tables and the pairs each task takes.
+    fn round_setup<'b>(&'b self, points: &'b RowPoints) -> RoundSetup<'b> {
         let pairs = if self.base.as_ref().is_some_and(Base::on_padding) {
             self.explicit.div_ceil(2)
         } else {
             self.support.div_ceil(2)
         };
         let tables: Vec<Vec<(usize, &[F192])>> = self.columns.iter().map(|c| c.tables(points)).collect();
-        // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
-        // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
-        // `eq(τ_h, X)` multiplies their sum once per task.
-        let (whole, tau) = match &self.tau {
-            Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
-            None => (0, F192::ZERO),
-        };
         // While the columns are words, each slot's table times each word's fold weight.
         let weights = fold_weights(&self.bound);
-        let weighted: Vec<Vec<Vec<F192>>> = (self.columns.iter().zip(&tables))
+        let weighted = (self.columns.iter().zip(&tables))
             .map(|(c, t)| {
                 if c.values.is_none() && weights.len() > 1 {
                     weighted_tables(t, &weights)
@@ -1414,78 +1415,94 @@ impl<'a> State<'a> {
                 }
             })
             .collect();
-        let len = (chunks.d() + 2).max(4);
         // A small round still spreads over the workers.
         let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
-        let mut poly = parallel::fold_reduce(
-            pairs.div_ceil(per_task),
-            || [F192::ZERO; MAX_COEFFS],
-            |acc, task| {
-                let mut factored = [F192Unreduced::ZERO; MAX_COEFFS];
-                let mut under_one = [F192Unreduced::ZERO; MAX_COEFFS];
-                let range = task * per_task..pairs.min((task + 1) * per_task);
-                for k in range.clone() {
-                    let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
-                    // The terms under each weight, summed before the weight multiplies them: the base terms' reduced,
-                    // the columns' not.
-                    let mut under_omega = [F192::ZERO; MAX_COEFFS];
-                    let (mut cols_omega, mut cols_act) =
-                        ([F192Unreduced::ZERO; MAX_COEFFS], [F192Unreduced::ZERO; MAX_COEFFS]);
-                    if let Some(base) = &self.base {
-                        let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
-                        if with_omega || base.on_padding() {
-                            base.pair(k, with_omega, &mut under_omega, acc);
-                        }
-                    }
-                    if is_zero_pair(omega) && 2 * k >= self.act.len() {
-                        continue;
-                    }
-                    let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
-                    let aux = self.aux_pair(k);
-                    for ((column, tables), weighted) in self.columns.iter().zip(&tables).zip(&weighted) {
-                        let sums = (&mut cols_omega, &mut cols_act);
-                        let words = (tables.as_slice(), weighted.as_slice());
-                        match &column.values {
-                            None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
-                            Some(values) => Self::pair_folded(column, values, k, &aux, points, chunks, skip, sums),
-                        }
-                    }
-                    for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
-                        *o += c.reduce();
-                    }
-                    if k < whole {
-                        let scale = omega.0 + omega.1;
-                        for (f, &v) in factored.iter_mut().zip(&under_omega[..len]) {
-                            *f ^= scale.mul_unreduced(v);
-                        }
-                        if self.any_act {
-                            for (o, &c) in under_one[..len].iter_mut().zip(&cols_act) {
-                                *o ^= c;
-                            }
-                        }
-                    } else {
-                        add_mul_pair(acc, 0, &under_omega, len, omega);
-                        if self.any_act {
-                            let under_act = cols_act.map(F192Unreduced::reduce);
-                            add_mul_pair(acc, 0, &under_act, len, act);
-                        }
-                    }
-                }
-                if range.start < whole {
-                    let factored = factored.map(F192Unreduced::reduce);
-                    add_mul_pair(acc, 0, &factored, len, (F192::ONE + tau, tau));
-                    add_into(acc, &under_one.map(F192Unreduced::reduce)[..len]);
-                }
-            },
-            |mut a, b| {
-                add_into(&mut a, &b);
-                a
-            },
-        );
-        if let Some(first) = &self.base_first {
-            add_into(&mut poly, first);
+        RoundSetup {
+            pairs,
+            per_task,
+            tables,
+            weighted,
         }
-        poly
+    }
+
+    /// One task's share of the round polynomial over this table's pairs, added to `acc`.
+    fn round_task(
+        &self,
+        setup: &RoundSetup,
+        task: usize,
+        chunks: &Chunks,
+        points: &RowPoints,
+        skip: bool,
+        acc: &mut Poly,
+    ) {
+        let RoundSetup {
+            pairs,
+            per_task,
+            ref tables,
+            ref weighted,
+        } = *setup;
+        // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
+        // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
+        // `eq(τ_h, X)` multiplies their sum once per task.
+        let (whole, tau) = match &self.tau {
+            Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
+            None => (0, F192::ZERO),
+        };
+        let len = (chunks.d() + 2).max(4);
+        let mut factored = [F192Unreduced::ZERO; MAX_COEFFS];
+        let mut under_one = [F192Unreduced::ZERO; MAX_COEFFS];
+        let range = task * per_task..pairs.min((task + 1) * per_task);
+        for k in range.clone() {
+            let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
+            // The terms under each weight, summed before the weight multiplies them: the base terms' reduced,
+            // the columns' not.
+            let mut under_omega = [F192::ZERO; MAX_COEFFS];
+            let (mut cols_omega, mut cols_act) = ([F192Unreduced::ZERO; MAX_COEFFS], [F192Unreduced::ZERO; MAX_COEFFS]);
+            if let Some(base) = &self.base {
+                let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
+                if with_omega || base.on_padding() {
+                    base.pair(k, with_omega, &mut under_omega, acc);
+                }
+            }
+            if is_zero_pair(omega) && 2 * k >= self.act.len() {
+                continue;
+            }
+            let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
+            let aux = self.aux_pair(k);
+            for ((column, tables), weighted) in self.columns.iter().zip(tables).zip(weighted) {
+                let sums = (&mut cols_omega, &mut cols_act);
+                let words = (tables.as_slice(), weighted.as_slice());
+                match &column.values {
+                    None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
+                    Some(values) => Self::pair_folded(column, values, k, &aux, points, chunks, skip, sums),
+                }
+            }
+            for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
+                *o += c.reduce();
+            }
+            if k < whole {
+                let scale = omega.0 + omega.1;
+                for (f, &v) in factored.iter_mut().zip(&under_omega[..len]) {
+                    *f ^= scale.mul_unreduced(v);
+                }
+                if self.any_act {
+                    for (o, &c) in under_one[..len].iter_mut().zip(&cols_act) {
+                        *o ^= c;
+                    }
+                }
+            } else {
+                add_mul_pair(acc, 0, &under_omega, len, omega);
+                if self.any_act {
+                    let under_act = cols_act.map(F192Unreduced::reduce);
+                    add_mul_pair(acc, 0, &under_act, len, act);
+                }
+            }
+        }
+        if range.start < whole {
+            let factored = factored.map(F192Unreduced::reduce);
+            add_mul_pair(acc, 0, &factored, len, (F192::ONE + tau, tau));
+            add_into(acc, &under_one.map(F192Unreduced::reduce)[..len]);
+        }
     }
 
     /// The first rounds: the pair `(2k, 2k + 1)` straight from the words, each folded row its group of words folded
@@ -1871,9 +1888,36 @@ pub fn prove(
         let _round = tracing::info_span!("Row round", round = h).entered();
         let mut poly = [F192::ZERO; MAX_COEFFS];
         tracing::info_span!("Sum").in_scope(|| {
+            // Every live table's tasks in one dispatch.
+            let setups: Vec<Option<RoundSetup>> = states
+                .iter()
+                .map(|s| s.done.is_none().then(|| s.round_setup(points)))
+                .collect();
+            let mut first = vec![0];
+            for setup in &setups {
+                let tasks = setup.as_ref().map_or(0, |r| r.pairs.div_ceil(r.per_task));
+                first.push(first.last().unwrap() + tasks);
+            }
+            poly = parallel::fold_reduce(
+                *first.last().unwrap(),
+                || [F192::ZERO; MAX_COEFFS],
+                |acc, task| {
+                    let t = first.partition_point(|&f| f <= task) - 1;
+                    let setup = setups[t].as_ref().unwrap();
+                    states[t].round_task(setup, task - first[t], chunks, points, skip, acc);
+                },
+                |mut a, b| {
+                    add_into(&mut a, &b);
+                    a
+                },
+            );
             for state in &states {
                 match state.done {
-                    None => add_into(&mut poly, &state.round(chunks, points, skip)),
+                    None => {
+                        if let Some(first) = &state.base_first {
+                            add_into(&mut poly, first);
+                        }
+                    }
                     Some((value, corner)) => {
                         poly[0] += value * corner;
                         poly[1] += value * corner;
