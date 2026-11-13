@@ -287,6 +287,21 @@ impl Slots {
         self.links(i) + 2 * (c - 1) + out
     }
 
+    /// Slot `k`'s chunk.
+    fn chunk(&self, k: usize) -> usize {
+        let d = self.d;
+        if k < 2 * d {
+            return k % d;
+        }
+        let k = k - 2 * d;
+        let n_starts = self.groups * (self.carry + 1);
+        if k < n_starts {
+            0
+        } else {
+            1 + (k - n_starts) / (2 * self.carry)
+        }
+    }
+
     /// Slot `k`'s chunk and table, the group starts read from `starts`.
     #[inline(always)]
     fn table<'b>(&self, k: usize, points: &'b RowPoints, starts: &'b [Vec<F192>]) -> (usize, &'b [F192]) {
@@ -887,6 +902,190 @@ pub fn summand(slots: &Slots, mirrors: &[F192], coef: F192, groups: &[F192], val
 
 // ---- per-table state ----------------------------------------------------------------
 
+/// Where a column's slots sit in a stored row: chunk by chunk, so that a row whose chunks from some `p` on all hold
+/// one-hot values stores only the slots of chunks `0..p` and reads the rest from the tables at its digits.
+struct Layout {
+    /// The tag bytes of the chunks.
+    chunk_bytes: u64,
+    /// Per slot, its chunk.
+    chunk: Vec<u8>,
+    /// Per slot, its place in a stored row.
+    place: Vec<u16>,
+    /// Per place in a stored row, its slot.
+    order: Vec<u16>,
+    /// At `p`, how many values a row stores when it stores chunks `0..p`.
+    stored: [usize; MAX_CHUNKS + 1],
+}
+
+impl Layout {
+    fn new(slots: &Slots) -> Self {
+        let n = slots.n_values();
+        let d = slots.d;
+        let chunk: Vec<u8> = (0..n).map(|k| slots.chunk(k) as u8).collect();
+        let mut order: Vec<u16> = (0..n as u16).collect();
+        order.sort_by_key(|&k| chunk[usize::from(k)]);
+        let mut place = vec![0u16; n];
+        for (j, &k) in order.iter().enumerate() {
+            place[usize::from(k)] = j as u16;
+        }
+        let mut stored = [0; MAX_CHUNKS + 1];
+        for p in 0..=d {
+            stored[p] = chunk.iter().filter(|&&c| usize::from(c) < p).count();
+        }
+        for o in &mut stored[d + 1..] {
+            *o = n;
+        }
+        Self {
+            chunk_bytes: u64::MAX >> (8 * (MAX_CHUNKS - d)),
+            chunk,
+            place,
+            order,
+            stored,
+        }
+    }
+
+    /// How many values a row with tags `t` stores: the slots of every chunk up to its last [`MIXED`] one.
+    #[inline(always)]
+    fn stored_len(&self, t: u64) -> usize {
+        const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        let x = !t;
+        // The high bit of each chunk's byte of `t` that is MIXED.
+        let mixed = !(((x & LOW) + LOW) | x) & !LOW & self.chunk_bytes;
+        self.stored[(64 - mixed.leading_zeros() as usize) / 8]
+    }
+
+    /// A row's value at `slot`: stored, or the slot's table at the chunk's one-hot digit.
+    #[inline(always)]
+    fn read(&self, row: RowView, tables: &[(usize, &[F192])], slot: usize) -> F192 {
+        debug_assert!(slot < self.place.len() && tables.len() == self.place.len());
+        // SAFETY: `slot` is one of the layout's slots, as `tables` has one entry per slot; a stored place is below
+        // the row's length; an unstored chunk's tag is its one-hot digit, below its table's length.
+        unsafe {
+            let j = usize::from(*self.place.get_unchecked(slot));
+            if j < row.values.len() {
+                *row.values.get_unchecked(j)
+            } else {
+                let c = usize::from(*self.chunk.get_unchecked(slot));
+                let table = tables.get_unchecked(slot).1;
+                let v = usize::from((row.tags >> (8 * c)) as u8);
+                debug_assert!(v < table.len());
+                *table.get_unchecked(v)
+            }
+        }
+    }
+}
+
+/// A row of a column's folded values: what it stores, laid out by its [`Layout`], and its tags.
+#[derive(Clone, Copy)]
+struct RowView<'b> {
+    values: &'b [F192],
+    tags: u64,
+}
+
+/// A column's folded values: each explicit row stores its first [`Layout::stored_len`] values, one row after another,
+/// and the tail row past them stores every slot.
+struct Sparse {
+    data: Vec<F192>,
+    /// Where each explicit row starts in `data`, and the end.
+    offsets: Vec<u32>,
+    tail: Vec<F192>,
+}
+
+impl Sparse {
+    #[inline(always)]
+    fn row(&self, k: usize) -> &[F192] {
+        match (self.offsets.get(k), self.offsets.get(k + 1)) {
+            (Some(&a), Some(&b)) => &self.data[a as usize..b as usize],
+            _ => &self.tail,
+        }
+    }
+}
+
+/// Every column's `len` new rows as [`Sparse`] values and tags: `tag(c, k)` is row `k`'s tags in column `c`, and
+/// `fill(c, rows, tags, values)` writes the stored values of column `c`'s `rows`, with tags `tags`, one row after
+/// another. Two dispatches cover every column.
+fn fill_sparse(
+    layouts: &[&Layout],
+    len: usize,
+    tag: impl Fn(usize, usize) -> u64 + Sync,
+    fill: impl Fn(usize, std::ops::Range<usize>, &[u64], &mut [F192]) + Sync,
+) -> Vec<(Sparse, Vec<u64>)> {
+    let per_column = len.div_ceil(TASK_PAIRS);
+    let tasks = layouts.len() * per_column;
+    let rows = |task: usize| {
+        let start = task % per_column * TASK_PAIRS;
+        start..len.min(start + TASK_PAIRS)
+    };
+    // SAFETY: the first dispatch writes every tag and offset past the first, the second every stored value.
+    let mut tags: Vec<Vec<u64>> = layouts.iter().map(|_| unsafe { primitives::uninit_vec(len) }).collect();
+    let mut offsets: Vec<Vec<u32>> = layouts
+        .iter()
+        .map(|_| unsafe { primitives::uninit_vec(len + 1) })
+        .collect();
+    let mut sizes = vec![0usize; tasks];
+    {
+        let tag_ptrs: Vec<_> = tags.iter_mut().map(|t| parallel::SendPtr(t.as_mut_ptr())).collect();
+        let offset_ptrs: Vec<_> = offsets.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
+        let size_ptr = [parallel::SendPtr(sizes.as_mut_ptr())];
+        parallel::for_each(tasks, |task| {
+            let (c, rows) = (task / per_column, rows(task));
+            let (t, o) = (tag_ptrs[c].0, offset_ptrs[c].0);
+            let mut size = 0usize;
+            for k in rows {
+                let v = tag(c, k);
+                size += layouts[c].stored_len(v);
+                // SAFETY: row `k` is this task's, inside column `c`'s `len` rows; its offset is relative to the
+                // task's first row until the second dispatch adds the task's start.
+                unsafe {
+                    *t.add(k) = v;
+                    *o.add(k + 1) = size as u32;
+                }
+            }
+            // SAFETY: each task writes its own size.
+            unsafe { *size_ptr[0].0.add(task) = size };
+        });
+    }
+    // Each task's first value in its column, and each column's length.
+    let mut starts = vec![0usize; tasks];
+    let mut totals = vec![0usize; layouts.len()];
+    for c in 0..layouts.len() {
+        let mut at = 0;
+        for task in c * per_column..(c + 1) * per_column {
+            starts[task] = at;
+            at += sizes[task];
+        }
+        assert!(at < u32::MAX as usize, "a column's stored values fit their offsets");
+        totals[c] = at;
+        offsets[c][0] = 0;
+    }
+    // SAFETY: the second dispatch writes every stored value.
+    let mut data: Vec<Vec<F192>> = totals.iter().map(|&n| unsafe { primitives::uninit_vec(n) }).collect();
+    {
+        let data_ptrs: Vec<_> = data.iter_mut().map(|v| parallel::SendPtr(v.as_mut_ptr())).collect();
+        let offset_ptrs: Vec<_> = offsets.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
+        let tags = &tags;
+        parallel::for_each(tasks, |task| {
+            let (c, rows) = (task / per_column, rows(task));
+            let start = starts[task];
+            // SAFETY: this task's rows and their values are its own, inside column `c`'s.
+            unsafe {
+                let o = offset_ptrs[c].0;
+                for k in rows.clone() {
+                    *o.add(k + 1) += start as u32;
+                }
+                let values = std::slice::from_raw_parts_mut(data_ptrs[c].0.add(start), sizes[task]);
+                fill(c, rows.clone(), &tags[c][rows], values);
+            }
+        });
+    }
+    (data.into_iter().zip(offsets).zip(tags).zip(layouts))
+        .map(|(((data, offsets), tags), layout)| {
+            let tail = vec![F192::ZERO; layout.order.len()];
+            (Sparse { data, offsets, tail }, tags)
+        })
+        .collect()
+}
+
 /// Values in rows of `stride`, explicit on a prefix and one tail row after it.
 struct Strided {
     data: Vec<F192>,
@@ -1036,7 +1235,9 @@ struct Column<'a> {
     split_starts: Vec<Vec<Vec<F192>>>,
     /// Each word's index, or [`NO_INDEX`], while the rounds read words.
     index: Vec<u32>,
-    values: Option<Strided>,
+    /// Where its slots sit in a stored row.
+    layout: Layout,
+    values: Option<Sparse>,
     tags: Vec<u64>,
     omega: Coef,
     act: Coef,
@@ -1083,6 +1284,7 @@ impl<'a> Column<'a> {
             starts,
             split_starts,
             index: column.index,
+            layout: Layout::new(&slots),
             values: None,
             tags: Vec::new(),
             omega: column.omega,
@@ -1108,8 +1310,58 @@ impl<'a> Column<'a> {
             .collect()
     }
 
-    /// Rows `rows` of the folded values and tags, row `k` its group of `n` words `k·n..(k + 1)·n` folded by the
-    /// bound challenges, with `tables` from [`Self::tables`] and `weighted` from [`weighted_tables`].
+    /// Row `k`'s tags after the word rounds, its group of `n` words `k·n..(k + 1)·n`: per chunk its digit where the
+    /// whole group holds one one-hot value there, [`MIXED`] elsewhere.
+    #[inline(always)]
+    fn materialize_tag(&self, n: usize, k: usize, chunks: &Chunks) -> u64 {
+        let mut t = ALL_MIXED;
+        match self.group_sigmas(n, k) {
+            Some((sigmas, diff)) => {
+                for i in 0..chunks.d() {
+                    if chunks.digit(diff, i) == 0 {
+                        t ^= u64::from(MIXED ^ chunks.digit(sigmas[0] as usize, i) as u8) << (8 * i);
+                    }
+                }
+            }
+            None => {
+                let group = self.group_words(n, k);
+                let uniform = uniform_chunks(chunks, &group[..n]);
+                for (i, u) in uniform.iter().enumerate().take(chunks.d()) {
+                    if let Some(b) = u.filter(|b| b.is_power_of_two()) {
+                        t ^= u64::from(MIXED ^ b.trailing_zeros() as u8) << (8 * i);
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// Row `k`'s group of `n` indices and the bits where they differ, when every word of the group is one-hot.
+    #[inline(always)]
+    fn group_sigmas(&self, n: usize, k: usize) -> Option<([u32; 2 * MAX_GROUP], usize)> {
+        let mut sigmas = [0u32; 2 * MAX_GROUP];
+        for (o, s) in sigmas[..n].iter_mut().enumerate() {
+            *s = self.index.get(k * n + o).copied().unwrap_or(NO_INDEX);
+        }
+        if sigmas[..n].contains(&NO_INDEX) {
+            return None;
+        }
+        let diff = sigmas[..n].iter().fold(0, |d, &s| d | (s ^ sigmas[0])) as usize;
+        Some((sigmas, diff))
+    }
+
+    /// Row `k`'s group of `n` words.
+    #[inline(always)]
+    fn group_words(&self, n: usize, k: usize) -> [u64; 2 * MAX_GROUP] {
+        let mut group = [0u64; 2 * MAX_GROUP];
+        for (o, u) in group[..n].iter_mut().enumerate() {
+            *u = self.words.get(k * n + o).copied().unwrap_or(0);
+        }
+        group
+    }
+
+    /// The stored values of rows `rows` after the word rounds, one row after another, each its group of `n` words
+    /// folded by the bound challenges, with `tables` from [`Self::tables`] and `weighted` from [`weighted_tables`].
     #[allow(clippy::too_many_arguments)]
     fn materialize_rows(
         &self,
@@ -1117,73 +1369,96 @@ impl<'a> Column<'a> {
         weighted: &[Vec<F192>],
         n: usize,
         rows: std::ops::Range<usize>,
-        values: &mut [F192],
-        tags: &mut [u64],
+        tags: &[u64],
+        mut values: &mut [F192],
         chunks: &Chunks,
     ) {
-        let mut group = [0u64; 2 * MAX_GROUP];
-        let mut sigmas = [0u32; 2 * MAX_GROUP];
-        for ((row, t), k) in values.chunks_mut(tables.len()).zip(tags).zip(rows) {
-            for (o, s) in sigmas[..n].iter_mut().enumerate() {
-                *s = self.index.get(k * n + o).copied().unwrap_or(NO_INDEX);
-            }
+        let layout = &self.layout;
+        for (&t, k) in tags.iter().zip(rows) {
+            let len = layout.stored_len(t);
+            let (row, rest) = values.split_at_mut(len);
+            values = rest;
+            let order = &layout.order[..len];
             // Every word one-hot: a chunk is uniform where its digit agrees across the group's indices.
-            if !sigmas[..n].contains(&NO_INDEX) {
+            if let Some((sigmas, diff)) = self.group_sigmas(n, k) {
                 let sigmas = &sigmas[..n];
-                let diff = sigmas.iter().fold(0, |d, &s| d | (s ^ sigmas[0])) as usize;
                 let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
-                for ((o, &(i, table)), weighted) in row.iter_mut().zip(tables).zip(weighted) {
+                for (o, &slot) in row.iter_mut().zip(order) {
+                    let (i, table) = tables[usize::from(slot)];
                     *o = if chunks.digit(diff, i) == 0 {
                         table[digit(sigmas[0], i)]
                     } else {
-                        let len = table.len();
+                        let (len, weighted) = (table.len(), &weighted[usize::from(slot)]);
                         (sigmas.iter().enumerate())
                             .fold(F192::ZERO, |sum, (t, &s)| sum + weighted[t * len + digit(s, i)])
                     };
                 }
-                *t = ALL_MIXED;
-                for i in 0..chunks.d() {
-                    if chunks.digit(diff, i) == 0 {
-                        *t ^= u64::from(MIXED ^ digit(sigmas[0], i) as u8) << (8 * i);
-                    }
-                }
                 continue;
             }
-            for (o, u) in group[..n].iter_mut().enumerate() {
-                *u = self.words.get(k * n + o).copied().unwrap_or(0);
-            }
+            let group = self.group_words(n, k);
             let group = &group[..n];
             let uniform = uniform_chunks(chunks, group);
-            for ((o, &(i, table)), weighted) in row.iter_mut().zip(tables).zip(weighted) {
-                *o = weighted_value(chunks, table, weighted, i, group, uniform[i]);
-            }
-            *t = ALL_MIXED;
-            for (i, u) in uniform.iter().enumerate().take(chunks.d()) {
-                if let Some(b) = u.filter(|b| b.is_power_of_two()) {
-                    *t ^= u64::from(MIXED ^ b.trailing_zeros() as u8) << (8 * i);
-                }
+            for (o, &slot) in row.iter_mut().zip(order) {
+                let (i, table) = tables[usize::from(slot)];
+                *o = weighted_value(chunks, table, &weighted[usize::from(slot)], i, group, uniform[i]);
             }
         }
     }
 
-    /// Rows `rows` of the values and tags with the lowest variable bound at `x`.
-    fn fold_rows(&self, rows: std::ops::Range<usize>, values: &mut [F192], tags: &mut [u64], x: F192) {
-        let old = self.values.as_ref().expect("the values are written out");
-        for ((row, t), k) in values.chunks_mut(old.stride).zip(tags).zip(rows) {
-            let (lo, hi) = (old.row(2 * k), old.row(2 * k + 1));
-            for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
+    /// The stored values of rows `rows`, with tags `tags`, one row after another, with the lowest variable bound at
+    /// `x`, and `tables` from [`Self::tables`] for the chunks a row reads from its digits.
+    fn fold_rows(
+        &self,
+        tables: &[(usize, &[F192])],
+        rows: std::ops::Range<usize>,
+        tags: &[u64],
+        mut values: &mut [F192],
+        x: F192,
+    ) {
+        let layout = &self.layout;
+        for (&t, k) in tags.iter().zip(rows) {
+            let len = layout.stored_len(t);
+            let (row, rest) = values.split_at_mut(len);
+            values = rest;
+            let (lo, hi) = (self.view(2 * k), self.view(2 * k + 1));
+            let (lo_len, hi_len) = (lo.values.len(), hi.values.len());
+            for (j, o) in row.iter_mut().enumerate() {
+                let a = if j < lo_len {
+                    lo.values[j]
+                } else {
+                    layout.read(lo, tables, usize::from(layout.order[j]))
+                };
+                let b = if j < hi_len {
+                    hi.values[j]
+                } else {
+                    layout.read(hi, tables, usize::from(layout.order[j]))
+                };
                 *o = if a == b { a } else { a + x * (a + b) };
             }
-            *t = fold_tags(row_tags(&self.tags, 2 * k), row_tags(&self.tags, 2 * k + 1));
         }
     }
 
-    fn set_values(&mut self, data: Vec<F192>, tags: Vec<u64>, stride: usize) {
-        self.values = Some(Strided {
-            data,
-            tail: vec![F192::ZERO; stride],
-            stride,
-        });
+    /// Row `k` of the folded values: what it stores and its tags.
+    #[inline(always)]
+    fn view(&self, k: usize) -> RowView<'_> {
+        let values = self.values.as_ref().expect("the values are written out");
+        RowView {
+            values: values.row(k),
+            tags: row_tags(&self.tags, k),
+        }
+    }
+
+    /// Row `k`'s value at every slot, in slot order.
+    fn dense_row(&self, k: usize, points: &RowPoints) -> Vec<F192> {
+        let tables = self.tables(points);
+        let row = self.view(k);
+        (0..self.slots.n_values())
+            .map(|slot| self.layout.read(row, &tables, slot))
+            .collect()
+    }
+
+    fn set_values(&mut self, values: Sparse, tags: Vec<u64>) {
+        self.values = Some(values);
         self.tags = tags;
     }
 
@@ -1224,39 +1499,6 @@ impl<'a> Column<'a> {
         let certs = self.cert.iter().map(|&e| end.corner * end.omega * e).collect();
         (coef, shifts, certs)
     }
-}
-
-/// Every column's `len` new rows, in rows of `strides[c]` values and one tag word for column `c`: `fill(c, rows,
-/// values, tags)` writes each value and tag of column `c`'s `rows`. One dispatch covers every column.
-fn fill_columns(
-    strides: &[usize],
-    len: usize,
-    fill: impl Fn(usize, std::ops::Range<usize>, &mut [F192], &mut [u64]) + Sync,
-) -> Vec<(Vec<F192>, Vec<u64>)> {
-    // SAFETY: the tasks cover every row of every column once, and `fill` writes each value and tag of its rows.
-    let mut out: Vec<(Vec<F192>, Vec<u64>)> = strides
-        .iter()
-        .map(|&s| unsafe { (primitives::uninit_vec(len * s), primitives::uninit_vec(len)) })
-        .collect();
-    let ptrs: Vec<_> = out
-        .iter_mut()
-        .map(|(v, t)| (parallel::SendPtr(v.as_mut_ptr()), parallel::SendPtr(t.as_mut_ptr())))
-        .collect();
-    let per_column = len.div_ceil(TASK_PAIRS);
-    parallel::for_each(strides.len() * per_column, |task| {
-        let (c, start) = (task / per_column, task % per_column * TASK_PAIRS);
-        let rows = start..len.min(start + TASK_PAIRS);
-        let s = strides[c];
-        // SAFETY: each task's rows are its own, inside column `c`'s `len` rows.
-        let (values, tags) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(ptrs[c].0.0.add(rows.start * s), rows.len() * s),
-                std::slice::from_raw_parts_mut(ptrs[c].1.0.add(rows.start), rows.len()),
-            )
-        };
-        fill(c, rows, values, tags);
-    });
-    out
 }
 
 struct State<'a> {
@@ -1351,23 +1593,28 @@ impl<'a> State<'a> {
     /// Write out every column's values and tags at `len` folded rows, from its words and the bound challenges.
     fn materialize(&mut self, len: usize, chunks: &Chunks, points: &RowPoints) {
         let tables: Vec<_> = self.columns.iter().map(|c| c.tables(points)).collect();
-        let strides: Vec<usize> = tables.iter().map(Vec::len).collect();
         let weights = fold_weights(&self.bound);
         let weighted: Vec<_> = tables.iter().map(|t| weighted_tables(t, &weights)).collect();
         let (columns, n) = (&self.columns, weights.len());
-        let out = fill_columns(&strides, len, |c, rows, values, tags| {
-            columns[c].materialize_rows(&tables[c], &weighted[c], n, rows, values, tags, chunks);
-        });
+        let layouts: Vec<&Layout> = columns.iter().map(|c| &c.layout).collect();
+        let out = fill_sparse(
+            &layouts,
+            len,
+            |c, k| columns[c].materialize_tag(n, k, chunks),
+            |c, rows, tags, values| {
+                columns[c].materialize_rows(&tables[c], &weighted[c], n, rows, tags, values, chunks);
+            },
+        );
         drop(tables);
-        for ((column, (values, tags)), s) in self.columns.iter_mut().zip(out).zip(strides) {
-            column.set_values(values, tags, s);
+        for (column, (values, tags)) in self.columns.iter_mut().zip(out) {
+            column.set_values(values, tags);
             column.index = Vec::new();
         }
     }
 
     /// Rows bound: the table's value at its end.
     fn finish(&mut self, points: &RowPoints) {
-        let end = self.end(F192::ONE);
+        let end = self.end(F192::ONE, points);
         let weight = |c: Coef| c.constant + c.aux.map_or(F192::ZERO, |(a, s)| s * end.aux[a]);
         let value: F192 = self
             .columns
@@ -1471,7 +1718,7 @@ impl<'a> State<'a> {
                 let words = (tables.as_slice(), weighted.as_slice());
                 match &column.values {
                     None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
-                    Some(values) => Self::pair_folded(column, values, k, &aux, points, chunks, skip, sums),
+                    Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, skip, sums),
                 }
             }
             for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
@@ -1725,7 +1972,7 @@ impl<'a> State<'a> {
     #[allow(clippy::too_many_arguments)]
     fn pair_folded(
         column: &Column,
-        values: &Strided,
+        tables: &[(usize, &[F192])],
         k: usize,
         aux: &[(F192, F192)],
         points: &RowPoints,
@@ -1734,9 +1981,10 @@ impl<'a> State<'a> {
         (omega, act): (&mut Acc, &mut Acc),
     ) {
         let slots = &column.slots;
-        let (lo, hi) = (values.row(2 * k), values.row(2 * k + 1));
-        let pair = |slot: usize| (lo[slot], hi[slot]);
-        let (lo_tags, hi_tags) = (row_tags(&column.tags, 2 * k), row_tags(&column.tags, 2 * k + 1));
+        let (lo_row, hi_row) = (column.view(2 * k), column.view(2 * k + 1));
+        let read = |row: RowView, slot: usize| column.layout.read(row, tables, slot);
+        let pair = |slot: usize| (read(lo_row, slot), read(hi_row, slot));
+        let (lo_tags, hi_tags) = (lo_row.tags, hi_row.tags);
         if skip && column.shifts.is_empty() {
             let chunk = |i: usize| {
                 let (a, b) = ((lo_tags >> (8 * i)) as u8, (hi_tags >> (8 * i)) as u8);
@@ -1752,7 +2000,10 @@ impl<'a> State<'a> {
             let t = (lo_tags >> (8 * i)) as u8;
             t != MIXED && t == (hi_tags >> (8 * i)) as u8
         };
-        let same = |i: usize| lo[slots.eq(i)] == hi[slots.eq(i)] && lo[slots.bar(i)] == hi[slots.bar(i)];
+        let same = |i: usize| {
+            let (e, b) = (pair(slots.eq(i)), pair(slots.bar(i)));
+            e.0 == e.1 && b.0 == b.1
+        };
         column.add_terms(
             aux,
             omega,
@@ -1762,8 +2013,23 @@ impl<'a> State<'a> {
                     let t = (lo_tags >> (8 * i)) as u8;
                     (skip && t != MIXED && t == (hi_tags >> (8 * i)) as u8).then_some(t)
                 };
-                let (clean, same) = ((&points.clean, digit), |i| lo[i] == hi[i]);
-                pointer_pair(acc, slots, coef, groups, act, skip, clean, same, |i| lo[i], pair)
+                let same = |i: usize| {
+                    let e = pair(i);
+                    e.0 == e.1
+                };
+                let first = |i: usize| read(lo_row, i);
+                pointer_pair(
+                    acc,
+                    slots,
+                    coef,
+                    groups,
+                    act,
+                    skip,
+                    (&points.clean, digit),
+                    same,
+                    first,
+                    pair,
+                )
             },
             |acc| {
                 cert_pair(
@@ -1811,13 +2077,18 @@ impl<'a> State<'a> {
             self.bound.push(x);
         }
         if !words {
-            let strides: Vec<usize> = self.columns.iter().map(|c| c.slots.n_values()).collect();
             let columns = &self.columns;
-            let out = fill_columns(&strides, explicit, |c, rows, values, tags| {
-                columns[c].fold_rows(rows, values, tags, x);
-            });
-            for ((column, (values, tags)), s) in self.columns.iter_mut().zip(out).zip(strides) {
-                column.set_values(values, tags, s);
+            let tables: Vec<_> = columns.iter().map(|c| c.tables(points)).collect();
+            let layouts: Vec<&Layout> = columns.iter().map(|c| &c.layout).collect();
+            let out = fill_sparse(
+                &layouts,
+                explicit,
+                |c, k| fold_tags(row_tags(&columns[c].tags, 2 * k), row_tags(&columns[c].tags, 2 * k + 1)),
+                |c, rows, tags, values| columns[c].fold_rows(&tables[c], rows, tags, values, x),
+            );
+            drop(tables);
+            for (column, (values, tags)) in self.columns.iter_mut().zip(out) {
+                column.set_values(values, tags);
             }
         } else if self.bound.len() == WORD_ROUNDS || self.log_rows == 1 {
             self.materialize(explicit, chunks, points);
@@ -1831,7 +2102,7 @@ impl<'a> State<'a> {
         }
     }
 
-    fn end(&self, corner: F192) -> TableEnd {
+    fn end(&self, corner: F192, points: &RowPoints) -> TableEnd {
         TableEnd {
             omega: at(&self.omega, 0),
             act: at(&self.act, 0),
@@ -1841,7 +2112,11 @@ impl<'a> State<'a> {
                 .columns
                 .iter()
                 .map(|c| {
-                    let mut values = c.values.as_ref().map_or(Vec::new(), |v| v.row(0).to_vec());
+                    let mut values = if c.values.is_some() {
+                        c.dense_row(0, points)
+                    } else {
+                        Vec::new()
+                    };
                     let d = c.slots.d;
                     for (v, &e) in values.iter_mut().skip(d).take(d).zip(&c.cert) {
                         *v *= bar_scale(e).inv();
@@ -1957,7 +2232,7 @@ pub fn prove(
     let ends: Vec<TableEnd> = states
         .iter()
         .map(|s| {
-            let mut end = s.end(s.done.map_or(F192::ONE, |(_, corner)| corner));
+            let mut end = s.end(s.done.map_or(F192::ONE, |(_, corner)| corner), points);
             for column_end in &mut end.columns {
                 let full = ColumnEnd::from_slices(chunks, points, slices.next().unwrap());
                 debug_assert_eq!(column_end.values[..2 * d], full.values[..2 * d]);
