@@ -50,6 +50,9 @@ const WORD_ROUNDS: usize = 2;
 /// Words in a folded row's group before the values are written out.
 const MAX_GROUP: usize = 1 << (WORD_ROUNDS - 1);
 
+/// A column's slot tables, and each slot's table times each word's fold weight, while the rounds read words.
+type WordTables<'a, 'b> = (&'a [(usize, &'b [F192])], &'a [Vec<F192>]);
+
 /// Chunks of a word, at most.
 const MAX_CHUNKS: usize = 8;
 
@@ -1151,6 +1154,17 @@ impl<'a> State<'a> {
             Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
             None => (0, F192::ZERO),
         };
+        // While the columns are words, each slot's table times each word's fold weight.
+        let weights = fold_weights(&self.bound);
+        let weighted: Vec<Vec<Vec<F192>>> = (self.columns.iter().zip(&tables))
+            .map(|(c, t)| {
+                if c.values.is_none() && weights.len() > 1 {
+                    weighted_tables(t, &weights)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
         let len = (chunks.d() + 2).max(4);
         // A small round still spreads over the workers.
         let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
@@ -1173,10 +1187,11 @@ impl<'a> State<'a> {
                     }
                     let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
                     let aux = self.aux_pair(k);
-                    for (column, tables) in self.columns.iter().zip(&tables) {
+                    for ((column, tables), weighted) in self.columns.iter().zip(&tables).zip(&weighted) {
                         let sums = (&mut under_omega, &mut under_act);
+                        let words = (tables.as_slice(), weighted.as_slice());
                         match &column.values {
-                            None => Self::pair_words(column, tables, &self.bound, k, &aux, chunks, points, skip, sums),
+                            None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
                             Some(values) => Self::pair_folded(column, values, k, &aux, points, skip, sums),
                         }
                     }
@@ -1213,7 +1228,7 @@ impl<'a> State<'a> {
     #[allow(clippy::too_many_arguments)]
     fn pair_words(
         column: &Column,
-        tables: &[(usize, &[F192])],
+        (tables, weighted): WordTables<'_, '_>,
         r: &[F192],
         k: usize,
         aux: &[(F192, F192)],
@@ -1226,8 +1241,8 @@ impl<'a> State<'a> {
         if skip {
             let sums = (&mut *omega, &mut *act);
             let done = match n {
-                1 => Self::try_indices::<1>(column, tables, r, k, aux, chunks, points, sums),
-                2 => Self::try_indices::<2>(column, tables, r, k, aux, chunks, points, sums),
+                1 => Self::try_indices::<1>(column, (tables, weighted), r, k, aux, chunks, points, sums),
+                2 => Self::try_indices::<2>(column, (tables, weighted), r, k, aux, chunks, points, sums),
                 _ => false,
             };
             if done {
@@ -1292,7 +1307,7 @@ impl<'a> State<'a> {
     #[inline(always)]
     fn try_indices<const N: usize>(
         column: &Column,
-        tables: &[(usize, &[F192])],
+        tables: WordTables<'_, '_>,
         r: &[F192],
         k: usize,
         aux: &[(F192, F192)],
@@ -1316,7 +1331,7 @@ impl<'a> State<'a> {
     #[allow(clippy::too_many_arguments)]
     fn pair_indices<const N: usize>(
         column: &Column,
-        tables: &[(usize, &[F192])],
+        (tables, weighted): WordTables<'_, '_>,
         r: &[F192],
         sigmas: [[u32; N]; 2],
         aux: &[(F192, F192)],
@@ -1333,29 +1348,19 @@ impl<'a> State<'a> {
         let diff = lo_diff | hi_diff | (lo[0] ^ hi[0]);
         let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
         let varying = chunks.varying(diff);
-        // Chunk `i`'s table at a folded row of `side`: one lookup when its digit agrees across the side.
-        let value = |table: &[F192], i: usize, side: &[u32], side_diff: u32| {
+        // Slot `slot`'s value at a folded row of `side`: one lookup when its chunk's digit agrees across the side,
+        // else each word's lookup in the weighted tables.
+        let value = |slot: usize, side: &[u32], side_diff: u32| {
+            let (i, table) = tables[slot];
             if digit(side_diff, i) == 0 {
                 return table[digit(side[0], i)];
             }
-            let mut values = [F192::ZERO; MAX_GROUP];
-            for (v, &sigma) in values.iter_mut().zip(side) {
-                *v = table[digit(sigma, i)];
-            }
-            let mut len = side.len();
-            for &x in r {
-                len /= 2;
-                for t in 0..len {
-                    let (a, b) = (values[2 * t], values[2 * t + 1]);
-                    values[t] = if a == b { a } else { a + x * (a + b) };
-                }
-            }
-            values[0]
+            let len = table.len();
+            (side.iter().enumerate()).fold(F192::ZERO, |sum, (t, &sigma)| {
+                sum + weighted[slot][t * len + digit(sigma, i)]
+            })
         };
-        let pair = |slot: usize| {
-            let (i, table) = tables[slot];
-            (value(table, i, lo, lo_diff), value(table, i, hi, hi_diff))
-        };
+        let pair = |slot: usize| (value(slot, lo, lo_diff), value(slot, hi, hi_diff));
         let slots = &column.slots;
         column.add_terms(
             aux,
