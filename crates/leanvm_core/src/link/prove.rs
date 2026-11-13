@@ -23,6 +23,13 @@ use std::borrow::Cow;
 /// Entries per task when filling an array over the index.
 const TASK: usize = 1 << 12;
 
+/// Indices each worker holds back while it scatters memory accesses ([`Scatter::add_repeated_words`]).
+const MEMORY_SLOTS: usize = 256;
+
+/// Indices each worker holds back while it scatters instructions: more than for memory, since a loop's
+/// instructions recur only once per pass through it and every worker runs the same hot loops.
+const PROGRAM_SLOTS: usize = 4096;
+
 /// The words of a pointer column.
 fn words(column: &[F64]) -> &[u64] {
     // SAFETY: `F64` is `#[repr(transparent)]` over `u64`.
@@ -379,14 +386,14 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
                     let ((words, at), s) = (pointer(access.pointer), access.shift);
                     match access.gate {
-                        None => w_mem.add_repeated_words(&chunks, &words, &at, s, |u| mu * omega[u]),
-                        Some(g) => {
-                            w_mem.add_repeated_words(&chunks, &words, &at, s, |u| (mu * omega[u]).mul_base(cols[g][u]))
-                        }
+                        None => w_mem.add_repeated_words::<MEMORY_SLOTS>(&chunks, &words, &at, s, |u| mu * omega[u]),
+                        Some(g) => w_mem.add_repeated_words::<MEMORY_SLOTS>(&chunks, &words, &at, s, |u| {
+                            (mu * omega[u]).mul_base(cols[g][u])
+                        }),
                     }
                 }
                 let (bc, at) = pointer(plan.links.bytecode.pointer);
-                w_bc.add_repeated_words(&chunks, &bc, &at, 0, |u| omega[u]);
+                w_bc.add_repeated_words::<PROGRAM_SLOTS>(&chunks, &bc, &at, 0, |u| omega[u]);
             }
             arrays
         };

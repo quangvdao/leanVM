@@ -413,8 +413,8 @@ impl Scatter {
     }
 
     /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: each worker sums the
-    /// adds to an index that rows hit again soon after ([`Combine`]).
-    pub fn add_repeated_words(
+    /// adds to an index that rows hit again soon after, holding back up to `SLOTS` indices ([`Combine`]).
+    pub fn add_repeated_words<const SLOTS: usize>(
         &self,
         chunks: &Chunks,
         words: &[u64],
@@ -422,7 +422,7 @@ impl Scatter {
         shift: usize,
         weight: impl Fn(usize) -> F192 + Sync,
     ) {
-        self.add_words_with(chunks, words, index, shift, weight, || Combine::new(self));
+        self.add_words_with(chunks, words, index, shift, weight, || Combine::<SLOTS>::new(self));
     }
 
     fn add_words_with<A: Adder>(
@@ -492,33 +492,30 @@ impl Adder for Direct<'_> {
     fn flush(self) {}
 }
 
-/// Slots in a [`Combine`].
-const COMBINE: usize = 256;
-
-/// The adds of one worker into a [`Scatter`], with the latest index at each of [`COMBINE`] slots (by its low
-/// bits) held back and summed: an index that rows hit again soon after, such as a loop's instruction or a hot
+/// The adds of one worker into a [`Scatter`], with the latest index at each of `N` slots (by its low bits) held
+/// back and summed: an index that rows hit again soon after, such as a loop's instruction or a hot
 /// memory cell, takes one atomic add per run of hits instead of one per row, and the workers no longer contend
 /// for its cache line.
-struct Combine<'a> {
+struct Combine<'a, const N: usize> {
     scatter: &'a Scatter,
-    keys: [u32; COMBINE],
-    values: [F192; COMBINE],
+    keys: Box<[u32; N]>,
+    values: Box<[F192; N]>,
 }
 
-impl<'a> Combine<'a> {
+impl<'a, const N: usize> Combine<'a, N> {
     fn new(scatter: &'a Scatter) -> Self {
         Self {
             scatter,
-            keys: [u32::MAX; COMBINE],
-            values: [F192::ZERO; COMBINE],
+            keys: vec![u32::MAX; N].into_boxed_slice().try_into().unwrap(),
+            values: vec![F192::ZERO; N].into_boxed_slice().try_into().unwrap(),
         }
     }
 }
 
-impl Adder for Combine<'_> {
+impl<const N: usize> Adder for Combine<'_, N> {
     #[inline(always)]
     fn add(&mut self, j: usize, value: F192) {
-        let slot = j % COMBINE;
+        let slot = j % N;
         let key = u32::try_from(j).expect("an index below 2^32");
         if self.keys[slot] == key {
             self.values[slot] += value;
@@ -533,7 +530,7 @@ impl Adder for Combine<'_> {
 
     /// Add what is held back.
     fn flush(self) {
-        for (&key, &value) in self.keys.iter().zip(&self.values) {
+        for (&key, &value) in self.keys.iter().zip(self.values.iter()) {
             if key != u32::MAX {
                 self.scatter.add(key as usize, value);
             }
