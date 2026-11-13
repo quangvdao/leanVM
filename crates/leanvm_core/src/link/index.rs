@@ -412,6 +412,35 @@ impl Scatter {
         self.add_words_with(chunks, words, index, shift, weight, || Direct(self));
     }
 
+    /// [`Scatter::add_words`] into several arrays in one pass over the words: `weights(u)[a]` at the index plus
+    /// `targets[a].1` in `targets[a].0`.
+    pub fn add_words_to<const K: usize>(
+        chunks: &Chunks,
+        words: &[u64],
+        index: &[u32],
+        targets: [(&Scatter, usize); K],
+        weights: impl Fn(usize) -> [F192; K] + Sync,
+    ) {
+        assert_eq!(index.len(), words.len(), "an index per word");
+        let top = 1usize << chunks.width;
+        parallel::for_each(words.len().div_ceil(TASK_PAIRS), |task| {
+            for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
+                let w = weights(u);
+                let mut add = |j: usize| {
+                    for (&(array, shift), &w) in targets.iter().zip(&w) {
+                        if !w.is_zero() && j + shift < top {
+                            array.add(j + shift, w);
+                        }
+                    }
+                };
+                match index[u] {
+                    NO_INDEX => chunks.indices(words[u], &mut add),
+                    j => add(j as usize),
+                }
+            }
+        });
+    }
+
     /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: each worker sums the
     /// adds to an index that rows hit again soon after, holding back up to `SLOTS` indices ([`Combine`]).
     pub fn add_repeated_words<const SLOTS: usize>(

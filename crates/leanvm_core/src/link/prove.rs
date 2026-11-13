@@ -384,9 +384,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                     }
                 };
                 let (cycle, at) = pointer(plan.links.state.cycle);
-                w_plus.add_words(&chunks, &cycle, &at, 1, |u| omega[u]);
-                spine.add_words(&chunks, &cycle, &at, 0, |u| state_at(t, u));
-                cover.add_words(&chunks, &cycle, &at, 0, |_| F192::ONE);
+                let targets = [(w_plus, 1), (spine, 0), (cover, 0)];
+                Scatter::add_words_to(&chunks, &cycle, &at, targets, |u| [omega[u], state_at(t, u), F192::ONE]);
                 for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
                     let ((words, at), s) = (pointer(access.pointer), access.shift);
                     match access.gate {
