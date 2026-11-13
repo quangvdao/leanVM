@@ -357,14 +357,12 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     // The base terms' `ω` blocks' first row round, which also gives the index side its payload.
     let mut base_firsts = Vec::new();
     // Each pointer column's indices, in `Plan::pointers` order, decoded once for both sides.
+    let pointer_words: Vec<&[u64]> = (0..tables::N_TABLES)
+        .flat_map(|t| plans[t].pointers.iter().map(move |&c| words(local(t)[c])))
+        .collect();
+    let mut decoded = chunks.decode_many(&pointer_words).into_iter();
     let mut indices: Vec<Vec<Vec<u32>>> = (0..tables::N_TABLES)
-        .map(|t| {
-            plans[t]
-                .pointers
-                .iter()
-                .map(|&c| chunks.decode_all(words(local(t)[c])))
-                .collect()
-        })
+        .map(|t| decoded.by_ref().take(plans[t].pointers.len()).collect())
         .collect();
     let index_end = tracing::info_span!("Index side").in_scope(|| {
         let scatter = tracing::info_span!("Scatter").entered();
