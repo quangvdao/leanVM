@@ -379,12 +379,14 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
                     let ((words, at), s) = (pointer(access.pointer), access.shift);
                     match access.gate {
-                        None => w_mem.add_words(&chunks, &words, &at, s, |u| mu * omega[u]),
-                        Some(g) => w_mem.add_words(&chunks, &words, &at, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
+                        None => w_mem.add_repeated_words(&chunks, &words, &at, s, |u| mu * omega[u]),
+                        Some(g) => {
+                            w_mem.add_repeated_words(&chunks, &words, &at, s, |u| (mu * omega[u]).mul_base(cols[g][u]))
+                        }
                     }
                 }
                 let (bc, at) = pointer(plan.links.bytecode.pointer);
-                w_bc.add_words(&chunks, &bc, &at, 0, |u| omega[u]);
+                w_bc.add_repeated_words(&chunks, &bc, &at, 0, |u| omega[u]);
             }
             arrays
         };

@@ -399,6 +399,8 @@ impl Scatter {
     /// Add `weight(u)` at the index of each row's word plus `shift`, dropping indices past `2^W`, with `index` the
     /// words' indices ([`Chunks::decode_all`]). A word whose chunks are not all one-hot adds at every index of it
     /// ([`Chunks::indices`]), which is what the row side's `Φ_s` of that word sums to.
+    ///
+    /// For words that are mostly distinct, such as cycles; [`Scatter::add_repeated_words`] is for words that repeat.
     pub fn add_words(
         &self,
         chunks: &Chunks,
@@ -407,9 +409,35 @@ impl Scatter {
         shift: usize,
         weight: impl Fn(usize) -> F192 + Sync,
     ) {
+        self.add_words_with(chunks, words, index, shift, weight, || Direct(self));
+    }
+
+    /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: each worker sums the
+    /// adds to an index that rows hit again soon after ([`Combine`]).
+    pub fn add_repeated_words(
+        &self,
+        chunks: &Chunks,
+        words: &[u64],
+        index: &[u32],
+        shift: usize,
+        weight: impl Fn(usize) -> F192 + Sync,
+    ) {
+        self.add_words_with(chunks, words, index, shift, weight, || Combine::new(self));
+    }
+
+    fn add_words_with<A: Adder>(
+        &self,
+        chunks: &Chunks,
+        words: &[u64],
+        index: &[u32],
+        shift: usize,
+        weight: impl Fn(usize) -> F192 + Sync,
+        adder: impl Fn() -> A + Sync,
+    ) {
         assert_eq!(index.len(), words.len(), "an index per word");
         let top = 1usize << chunks.width;
         parallel::for_each_chunk(words.len().div_ceil(TASK_PAIRS), |start, end| {
+            let mut combine = adder();
             for task in start..end {
                 for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
                     let w = weight(u);
@@ -419,7 +447,7 @@ impl Scatter {
                     let mut add = |j: usize| {
                         let j = j + shift;
                         if j < top {
-                            self.add(j, w);
+                            combine.add(j, w);
                         }
                     };
                     match index[u] {
@@ -428,6 +456,7 @@ impl Scatter {
                     }
                 }
             }
+            combine.flush();
         });
     }
 
@@ -442,6 +471,73 @@ impl Scatter {
         let last = out.iter().rposition(|v| !v.is_zero()).map_or(0, |j| j + 1);
         out.truncate(last);
         out
+    }
+}
+
+/// Where a worker of [`Scatter::add_words_with`] sends its adds.
+trait Adder {
+    fn add(&mut self, j: usize, value: F192);
+    fn flush(self);
+}
+
+/// Each add straight into the [`Scatter`].
+struct Direct<'a>(&'a Scatter);
+
+impl Adder for Direct<'_> {
+    #[inline(always)]
+    fn add(&mut self, j: usize, value: F192) {
+        self.0.add(j, value);
+    }
+
+    fn flush(self) {}
+}
+
+/// Slots in a [`Combine`].
+const COMBINE: usize = 256;
+
+/// The adds of one worker into a [`Scatter`], with the latest index at each of [`COMBINE`] slots (by its low
+/// bits) held back and summed: an index that rows hit again soon after, such as a loop's instruction or a hot
+/// memory cell, takes one atomic add per run of hits instead of one per row, and the workers no longer contend
+/// for its cache line.
+struct Combine<'a> {
+    scatter: &'a Scatter,
+    keys: [u32; COMBINE],
+    values: [F192; COMBINE],
+}
+
+impl<'a> Combine<'a> {
+    fn new(scatter: &'a Scatter) -> Self {
+        Self {
+            scatter,
+            keys: [u32::MAX; COMBINE],
+            values: [F192::ZERO; COMBINE],
+        }
+    }
+}
+
+impl Adder for Combine<'_> {
+    #[inline(always)]
+    fn add(&mut self, j: usize, value: F192) {
+        let slot = j % COMBINE;
+        let key = u32::try_from(j).expect("an index below 2^32");
+        if self.keys[slot] == key {
+            self.values[slot] += value;
+            return;
+        }
+        if self.keys[slot] != u32::MAX {
+            self.scatter.add(self.keys[slot] as usize, self.values[slot]);
+        }
+        self.keys[slot] = key;
+        self.values[slot] = value;
+    }
+
+    /// Add what is held back.
+    fn flush(self) {
+        for (&key, &value) in self.keys.iter().zip(&self.values) {
+            if key != u32::MAX {
+                self.scatter.add(key as usize, value);
+            }
+        }
     }
 }
 
