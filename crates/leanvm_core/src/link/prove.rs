@@ -17,7 +17,7 @@ use crate::tables::{self, Links, Table};
 use crate::transcript::ProverState;
 use ::pcs::stack_open::{RingPiece, SumPart};
 use primitives::field::{F64, F192};
-use primitives::multilinear::{eq_table, mle_eval_par};
+use primitives::multilinear::{eq_table, mle_eval_many_par};
 use std::borrow::Cow;
 
 /// Entries per task when filling an array over the index.
@@ -534,7 +534,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     let (w_plus_r, spine_r) = (index_end.values[0], index_end.values[1]);
     let r_mem = &r[..log_mem];
     let below_mem = below_power(r, log_mem);
-    let mem_values: Vec<F192> = (MEM_LO..=MEM_TOP).map(|c| mle_eval_par(columns[c], r_mem)).collect();
+    let mem_values = mle_eval_many_par(&columns[MEM_LO..=MEM_TOP], r_mem);
     let m1: F192 = (0..3).map(|c| ch.gamma_mem[1 + c] * mem_values[c]).sum::<F192>() * below_mem;
     let y_mem_r = index_end.values[4];
     let x_bc_r = index_end.values[6];
@@ -631,7 +631,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     for t in 0..tables::N_TABLES {
         let point = &chi[..taus[t]];
         let cols = local(t);
-        let values: Vec<F192> = plans[t].values.iter().map(|&c| mle_eval_par(cols[c], point)).collect();
+        let values = mle_eval_many_par(&plans[t].values.iter().map(|&c| cols[c]).collect::<Vec<_>>(), point);
         ps.add_scalars(&values);
         for (&c, &value) in plans[t].values.iter().zip(&values) {
             let col = sch.base[t] + c;
