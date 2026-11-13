@@ -102,15 +102,30 @@ pub const SPARSE_BITS: usize = 12;
 /// have few bits set, as one-hot words do.
 pub fn fold_set_bits(weights: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
     assert_eq!(weights.len(), words.len(), "a weight per word");
+    add_set_bits(weights, words.iter().copied(), out);
+}
+
+/// [`fold_set_bits`] from the suffix sums of the weights, `suffix[x] = sum_{y >= x} weights[y]`. Bit `p` of word `x`
+/// is the sum of bit `p` of the differences `words[y] + words[y - 1]` for `y <= x` (with `words[-1] = 0`), so
+/// `out[p]` sums `suffix[y]` over the differences whose bit `p` is set: one addition per bit that differs from the word
+/// before. Cheaper than [`fold_set_bits`] for words that change slowly, such as counters.
+pub fn fold_changed_bits(suffix: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
+    assert_eq!(suffix.len(), words.len(), "a weight per word");
+    let diffs = words.iter().scan(0, |prev, &w| Some(w ^ std::mem::replace(prev, w)));
+    add_set_bits(suffix, diffs, out);
+}
+
+/// `out[p]` sums `weights[x]` over the words `x` whose bit `p` is set.
+#[inline(always)]
+fn add_set_bits(weights: &[F192], words: impl Iterator<Item = u64>, out: &mut [F192; BLOCK]) {
     // Two banks, so neighbouring words that set the same bit do not wait on each other's addition.
     let mut banks = [[F192::ZERO; BLOCK]; 2];
-    for (pair, weights) in words.chunks(2).zip(weights.chunks(2)) {
-        for ((bank, &word), &w) in banks.iter_mut().zip(pair).zip(weights) {
-            let mut bits = word;
-            while bits != 0 {
-                bank[bits.trailing_zeros() as usize] += w;
-                bits &= bits - 1;
-            }
+    for (x, (word, &w)) in words.zip(weights).enumerate() {
+        let bank = &mut banks[x & 1];
+        let mut bits = word;
+        while bits != 0 {
+            bank[bits.trailing_zeros() as usize] += w;
+            bits &= bits - 1;
         }
     }
     for ((o, &a), &b) in out.iter_mut().zip(&banks[0]).zip(&banks[1]) {
@@ -996,6 +1011,19 @@ mod tests {
             fold.fold_columns(&cols, &mut want);
             fold_set_bits(&weights, &words, &mut got);
             assert_eq!(got, want, "dense {dense}");
+            let suffix: Vec<F192> = weights
+                .iter()
+                .rev()
+                .scan(F192::ZERO, |sum, &w| {
+                    *sum += w;
+                    Some(*sum)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            fold_changed_bits(&suffix, &words, &mut got);
+            assert_eq!(got, want, "changed bits, dense {dense}");
         }
     }
 

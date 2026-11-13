@@ -13,7 +13,7 @@
 //! `b(l, x) = sum_t A(l, t) * K_t(x)` over one term per claim and 192 per ring claim, and the table
 //! `P(l, t) = sum_x stack(l, x) * K_t(x)` takes the stack's place in the lane rounds.
 
-use primitives::bit_fold::{BitFold, SPARSE_BITS, fold_set_bits};
+use primitives::bit_fold::{BitFold, SPARSE_BITS, fold_changed_bits, fold_set_bits};
 use primitives::bits::bit_transpose_64bytes;
 use primitives::field::{Acc8, F64, F192, F192x8, Weights8, dot_base, msg_lone8_ext, xor_into8};
 
@@ -140,32 +140,67 @@ struct RingLow {
     fold: BitFold,
     /// `e_lo(x)` for every word of a block.
     e_lo: Vec<F192>,
+    /// `sum_{y >= x} e_lo(y)` for every word of a block.
+    suffix: Vec<F192>,
+}
+
+/// How a block's bit rows fold, chosen once per block for every low table.
+enum Form<const CHUNKS: usize> {
+    /// An addition per set bit of the words.
+    Bits,
+    /// An addition per bit that differs from the word before.
+    Changes,
+    /// The byte tables over the block's bit-transposed columns.
+    Columns([[u8; ROWS]; CHUNKS]),
+}
+
+impl<const CHUNKS: usize> Form<CHUNKS> {
+    /// The cheapest form for `block`: an addition per bit while the words average at most [`SPARSE_BITS`] set or
+    /// changed bits, else the byte tables.
+    fn of(block: &[F64]) -> Self {
+        let words = primitives::cast_slice::<F64, u64>(block);
+        let (mut set, mut changed, mut prev) = (0, 0, 0);
+        for &w in words {
+            set += w.count_ones() as usize;
+            changed += (w ^ prev).count_ones() as usize;
+            prev = w;
+        }
+        match set.min(changed) <= SPARSE_BITS * words.len() {
+            true if set <= changed => Form::Bits,
+            true => Form::Changes,
+            false => {
+                let mut cols = [[0u8; ROWS]; CHUNKS];
+                for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
+                    bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
+                }
+                Form::Columns(cols)
+            }
+        }
+    }
 }
 
 impl RingLow {
-    /// Each bit row of `block` folded against `e_lo`: an addition per set bit for sparse words such as one-hot
-    /// pointers, else the byte tables over the block's bit-transposed `cols`, transposed on first use.
-    fn fold_block<const CHUNKS: usize>(
-        &self,
-        block: &[F64],
-        sparse: &mut Option<bool>,
-        cols: &mut Option<[[u8; ROWS]; CHUNKS]>,
-    ) -> [F192; ROWS] {
-        let words = primitives::cast_slice::<F64, u64>(block);
-        let few = || words.iter().map(|w| w.count_ones() as usize).sum::<usize>() <= SPARSE_BITS * words.len();
-        let mut folded = [F192::ZERO; ROWS];
-        if *sparse.get_or_insert_with(few) {
-            fold_set_bits(&self.e_lo, words, &mut folded);
-            return folded;
+    fn new(e_lo: Vec<F192>) -> Self {
+        let mut suffix = e_lo.clone();
+        for x in (0..suffix.len().saturating_sub(1)).rev() {
+            suffix[x] = suffix[x] + suffix[x + 1];
         }
-        let cols = cols.get_or_insert_with(|| {
-            let mut cols = [[0u8; ROWS]; CHUNKS];
-            for (col, group) in cols.iter_mut().zip(block.as_chunks::<8>().0) {
-                bit_transpose_64bytes(&primitives::cast_slice::<F64, [u8; 64]>(group)[0], col);
-            }
-            cols
-        });
-        self.fold.fold_columns(cols, &mut folded);
+        RingLow {
+            fold: BitFold::new(&e_lo),
+            e_lo,
+            suffix,
+        }
+    }
+
+    /// Each bit row of `block` folded against `e_lo`, in the block's `form`.
+    fn fold_block<const CHUNKS: usize>(&self, block: &[F64], form: &Form<CHUNKS>) -> [F192; ROWS] {
+        let words = primitives::cast_slice::<F64, u64>(block);
+        let mut folded = [F192::ZERO; ROWS];
+        match form {
+            Form::Bits => fold_set_bits(&self.e_lo, words, &mut folded),
+            Form::Changes => fold_changed_bits(&self.suffix, words, &mut folded),
+            Form::Columns(cols) => self.fold.fold_columns(cols, &mut folded),
+        }
         folded
     }
 }
@@ -251,7 +286,7 @@ impl Terms {
                     flush(&mut folds, &mut masses, &mut sigmas);
                     low_folds.fill(None);
                 }
-                let (mut sparse, mut cols) = (None, None);
+                let mut form = None;
                 for ((ring, fold), mass) in self.rings.iter().zip(&mut folds).zip(&mut masses) {
                     let e_hi = ring.e_hi[h];
                     if e_hi == F192::ZERO {
@@ -260,7 +295,8 @@ impl Terms {
                     *mass += e_hi;
                     fold.get_or_insert_with(|| {
                         *low_folds[ring.low].get_or_insert_with(|| {
-                            self.ring_lows[ring.low].fold_block::<CHUNKS>(block(h), &mut sparse, &mut cols)
+                            let form = form.get_or_insert_with(|| Form::<CHUNKS>::of(block(h)));
+                            self.ring_lows[ring.low].fold_block(block(h), form)
                         })
                     });
                 }
@@ -481,10 +517,7 @@ pub(super) fn initial_basis(
                     let low = match terms.ring_lows.iter().position(|r| r.e_lo == e_lo) {
                         Some(k) => k,
                         None => {
-                            terms.ring_lows.push(RingLow {
-                                fold: BitFold::new(&e_lo),
-                                e_lo,
-                            });
+                            terms.ring_lows.push(RingLow::new(e_lo));
                             terms.ring_lows.len() - 1
                         }
                     };
