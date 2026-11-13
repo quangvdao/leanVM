@@ -746,6 +746,51 @@ fn group_value(chunks: &Chunks, table: &[F192], i: usize, group: &[u64], uniform
     values[0]
 }
 
+/// The weights the bound challenges `r` fold a group of words by, the first for adjacent words: word `t`'s is
+/// `Π_j r_j` over the bits `j` set in `t` times `Π_j (1 + r_j)` over the others.
+fn fold_weights(r: &[F192]) -> Vec<F192> {
+    let mut weights = vec![F192::ONE];
+    for &x in r {
+        let low: Vec<F192> = weights.iter().map(|&w| w * (F192::ONE + x)).collect();
+        weights = low.into_iter().chain(weights.iter().map(|&w| w * x)).collect();
+    }
+    weights
+}
+
+/// Each slot's table times each word's fold weight in turn, `weights.len()` copies of the table.
+fn weighted_tables(tables: &[(usize, &[F192])], weights: &[F192]) -> Vec<Vec<F192>> {
+    tables
+        .iter()
+        .map(|&(_, table)| {
+            weights
+                .iter()
+                .flat_map(|&w| table.iter().map(move |&v| w * v))
+                .collect()
+        })
+        .collect()
+}
+
+/// [`group_value`] as a sum of lookups: each word's value read from `weighted`, the table times that word's fold
+/// weight from [`weighted_tables`], so a group costs no product.
+#[inline(always)]
+fn weighted_value(
+    chunks: &Chunks,
+    table: &[F192],
+    weighted: &[F192],
+    i: usize,
+    group: &[u64],
+    uniform: Option<u64>,
+) -> F192 {
+    if uniform.is_some() {
+        return eval_chunk(chunks, table, group[0], i);
+    }
+    let len = table.len();
+    group
+        .iter()
+        .zip(weighted.chunks_exact(len))
+        .fold(F192::ZERO, |sum, (&u, w)| sum + eval_chunk(chunks, w, u, i))
+}
+
 /// Row `k`'s tags, chunk `i` in byte `i`.
 #[inline(always)]
 fn row_tags(tags: &[u64], k: usize) -> u64 {
@@ -835,19 +880,19 @@ impl<'a> Column<'a> {
             .collect()
     }
 
-    /// Rows `rows` of the folded values and tags, row `k` its group of words `k·n..(k + 1)·n` folded by the bound
-    /// challenges `r`, with `tables` from [`Self::tables`].
+    /// Rows `rows` of the folded values and tags, row `k` its group of `n` words `k·n..(k + 1)·n` folded by the
+    /// bound challenges, with `tables` from [`Self::tables`] and `weighted` from [`weighted_tables`].
     #[allow(clippy::too_many_arguments)]
     fn materialize_rows(
         &self,
         tables: &[(usize, &[F192])],
+        weighted: &[Vec<F192>],
+        n: usize,
         rows: std::ops::Range<usize>,
         values: &mut [F192],
         tags: &mut [u64],
-        r: &[F192],
         chunks: &Chunks,
     ) {
-        let n = 1 << r.len();
         let mut group = [0u64; 2 * MAX_GROUP];
         for ((row, t), k) in values.chunks_mut(tables.len()).zip(tags).zip(rows) {
             for (o, u) in group[..n].iter_mut().enumerate() {
@@ -855,8 +900,8 @@ impl<'a> Column<'a> {
             }
             let group = &group[..n];
             let uniform = uniform_chunks(chunks, group);
-            for (o, &(i, table)) in row.iter_mut().zip(tables) {
-                *o = group_value(chunks, table, i, group, uniform[i], r);
+            for ((o, &(i, table)), weighted) in row.iter_mut().zip(tables).zip(weighted) {
+                *o = weighted_value(chunks, table, weighted, i, group, uniform[i]);
             }
             *t = ALL_MIXED;
             for (i, u) in uniform.iter().enumerate().take(chunks.d()) {
@@ -1050,9 +1095,11 @@ impl<'a> State<'a> {
     fn materialize(&mut self, len: usize, chunks: &Chunks, points: &RowPoints) {
         let tables: Vec<_> = self.columns.iter().map(|c| c.tables(points)).collect();
         let strides: Vec<usize> = tables.iter().map(Vec::len).collect();
-        let (columns, bound) = (&self.columns, &self.bound);
+        let weights = fold_weights(&self.bound);
+        let weighted: Vec<_> = tables.iter().map(|t| weighted_tables(t, &weights)).collect();
+        let (columns, n) = (&self.columns, weights.len());
         let out = fill_columns(&strides, len, |c, rows, values, tags| {
-            columns[c].materialize_rows(&tables[c], rows, values, tags, bound, chunks);
+            columns[c].materialize_rows(&tables[c], &weighted[c], n, rows, values, tags, chunks);
         });
         drop(tables);
         for ((column, (values, tags)), s) in self.columns.iter_mut().zip(out).zip(strides) {
