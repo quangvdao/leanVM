@@ -13,7 +13,7 @@
 //! `b(l, x) = sum_t A(l, t) * K_t(x)` over one term per claim and 192 per ring claim, and the table
 //! `P(l, t) = sum_x stack(l, x) * K_t(x)` takes the stack's place in the lane rounds.
 
-use primitives::bit_fold::{BitFold, SPARSE_BITS, fold_changed_bits, fold_set_bits};
+use primitives::bit_fold::{BitFold, SPARSE_BITS, bit_counts, fold_changed_bits, fold_set_bits};
 use primitives::bits::bit_transpose_64bytes;
 use primitives::field::{Acc8, F64, F192, F192x8, Weights8, dot_base, msg_lone8_ext, xor_into8};
 
@@ -159,12 +159,7 @@ impl<const CHUNKS: usize> Form<CHUNKS> {
     /// changed bits, else the byte tables.
     fn of(block: &[F64]) -> Self {
         let words = primitives::cast_slice::<F64, u64>(block);
-        let (mut set, mut changed, mut prev) = (0, 0, 0);
-        for &w in words {
-            set += w.count_ones() as usize;
-            changed += (w ^ prev).count_ones() as usize;
-            prev = w;
-        }
+        let (set, changed) = bit_counts(words);
         match set.min(changed) <= SPARSE_BITS * words.len() {
             true if set <= changed => Form::Bits,
             true => Form::Changes,

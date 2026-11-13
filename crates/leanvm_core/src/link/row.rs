@@ -26,6 +26,7 @@
 
 use super::base::Base;
 use super::pointer::{ChunkEq, Chunks, NO_INDEX, Shifts, SplitEq, chain, eval_chunk, mirror};
+use primitives::bit_fold::fold_sparse_bits;
 use primitives::field::{F192, F192Unreduced};
 
 /// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 10`.
@@ -328,14 +329,10 @@ pub fn bit_slices_eq(columns: &[(&[u64], &[F192])]) -> Vec<Vec<F192>> {
             let c = first.partition_point(|&f| f <= task) - 1;
             let (words, eq) = columns[c];
             let start = (task - first[c]) * BLOCK;
-            let acc = &mut acc[c];
-            for u in start..words.len().min(eq.len()).min(start + BLOCK) {
-                let mut w = words[u];
-                while w != 0 {
-                    acc[w.trailing_zeros() as usize] += eq[u];
-                    w &= w - 1;
-                }
-            }
+            let end = words.len().min(eq.len()).min(start + BLOCK);
+            let mut slices = [F192::ZERO; 64];
+            fold_sparse_bits(&eq[start..end], &words[start..end], &mut slices);
+            add_into(&mut acc[c], &slices);
         },
         |mut a, b| {
             for (a, b) in a.iter_mut().zip(&b) {

@@ -102,7 +102,7 @@ pub const SPARSE_BITS: usize = 12;
 /// have few bits set, as one-hot words do.
 pub fn fold_set_bits(weights: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
     assert_eq!(weights.len(), words.len(), "a weight per word");
-    add_set_bits(weights, words.iter().copied(), out);
+    add_set_bits(words.iter().copied().zip(weights.iter().copied()), out);
 }
 
 /// [`fold_set_bits`] from the suffix sums of the weights, `suffix[x] = sum_{y >= x} weights[y]`. Bit `p` of word `x`
@@ -112,15 +112,45 @@ pub fn fold_set_bits(weights: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
 pub fn fold_changed_bits(suffix: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
     assert_eq!(suffix.len(), words.len(), "a weight per word");
     let diffs = words.iter().scan(0, |prev, &w| Some(w ^ std::mem::replace(prev, w)));
-    add_set_bits(suffix, diffs, out);
+    add_set_bits(diffs.zip(suffix.iter().copied()), out);
 }
 
-/// `out[p]` sums `weights[x]` over the words `x` whose bit `p` is set.
+/// [`fold_set_bits`] by whichever of set bits and changed bits the words have fewer of, the suffix sums for the
+/// changed bits summed as it goes.
+pub fn fold_sparse_bits(weights: &[F192], words: &[u64], out: &mut [F192; BLOCK]) {
+    assert_eq!(weights.len(), words.len(), "a weight per word");
+    let (set, changed) = bit_counts(words);
+    if set <= changed {
+        return add_set_bits(words.iter().copied().zip(weights.iter().copied()), out);
+    }
+    // From the last word down, so the running sum of the weights is the suffix sum.
+    let diffs = (0..words.len())
+        .rev()
+        .map(|x| words[x] ^ x.checked_sub(1).map_or(0, |y| words[y]));
+    let suffix = weights.iter().rev().scan(F192::ZERO, |sum, &w| {
+        *sum += w;
+        Some(*sum)
+    });
+    add_set_bits(diffs.zip(suffix), out);
+}
+
+/// The words' set bits and the bits each changes from the word before (the first from zero), each summed.
+pub fn bit_counts(words: &[u64]) -> (usize, usize) {
+    let (mut set, mut changed, mut prev) = (0, 0, 0);
+    for &w in words {
+        set += w.count_ones() as usize;
+        changed += (w ^ prev).count_ones() as usize;
+        prev = w;
+    }
+    (set, changed)
+}
+
+/// `out[p]` sums the weights of the words whose bit `p` is set, over the `(word, weight)` pairs.
 #[inline(always)]
-fn add_set_bits(weights: &[F192], words: impl Iterator<Item = u64>, out: &mut [F192; BLOCK]) {
+fn add_set_bits(words: impl Iterator<Item = (u64, F192)>, out: &mut [F192; BLOCK]) {
     // Two banks, so neighbouring words that set the same bit do not wait on each other's addition.
     let mut banks = [[F192::ZERO; BLOCK]; 2];
-    for (x, (word, &w)) in words.zip(weights).enumerate() {
+    for (x, (word, w)) in words.enumerate() {
         let bank = &mut banks[x & 1];
         let mut bits = word;
         while bits != 0 {
@@ -1024,6 +1054,14 @@ mod tests {
                 .collect();
             fold_changed_bits(&suffix, &words, &mut got);
             assert_eq!(got, want, "changed bits, dense {dense}");
+            fold_sparse_bits(&weights, &words, &mut got);
+            assert_eq!(got, want, "sparse bits, dense {dense}");
+            // A counter changes few bits per word, so the changed bits win.
+            let counter: Vec<u64> = (0..1024u64).map(|x| x + 77).collect();
+            assert!(bit_counts(&counter).1 < bit_counts(&counter).0);
+            fold_set_bits(&weights, &counter, &mut want);
+            fold_sparse_bits(&weights, &counter, &mut got);
+            assert_eq!(got, want, "sparse bits of a counter");
         }
     }
 
