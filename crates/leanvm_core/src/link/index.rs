@@ -468,7 +468,18 @@ impl Scatter {
         // SAFETY: `F192` is `repr(C)` over three `u64` limbs in this order, and `AtomicU64` is a `u64`; the
         // allocation holds `cap / 3` of them at `u64`'s alignment, which is `F192`'s.
         let mut out: Vec<F192> = unsafe { Vec::from_raw_parts(limbs.as_mut_ptr().cast(), len, cap / 3) };
-        let last = out.iter().rposition(|v| !v.is_zero()).map_or(0, |j| j + 1);
+        // The last nonzero entry, each task searching one block from its end.
+        let block = TASK_PAIRS * 16;
+        let last = parallel::map_reduce(
+            len.div_ceil(block),
+            || 0,
+            |b| {
+                let start = b * block;
+                let tail = &out[start..len.min(start + block)];
+                tail.iter().rposition(|v| !v.is_zero()).map_or(0, |j| start + j + 1)
+            },
+            usize::max,
+        );
         out.truncate(last);
         out
     }
