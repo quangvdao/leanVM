@@ -5,7 +5,7 @@
 //! so a cycle table stops at `T + 1` and the program at its size while memory fills `2^W`. A pair of rows of a
 //! term is summed only where both of its arrays have one.
 
-use super::pointer::Chunks;
+use super::pointer::{Chunks, NO_INDEX};
 use primitives::field::{F192, F192Unreduced};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -245,10 +245,18 @@ impl Scatter {
         }
     }
 
-    /// Add `weight(u)` at the index of each row's word plus `shift`, dropping indices past `2^W`. A word whose
-    /// chunks are not all one-hot adds at every index of it ([`Chunks::indices`]), which is what the row side's
-    /// `Φ_s` of that word sums to.
-    pub fn add_words(&self, chunks: &Chunks, words: &[u64], shift: usize, weight: impl Fn(usize) -> F192 + Sync) {
+    /// Add `weight(u)` at the index of each row's word plus `shift`, dropping indices past `2^W`, with `index` the
+    /// words' indices ([`Chunks::decode_all`]). A word whose chunks are not all one-hot adds at every index of it
+    /// ([`Chunks::indices`]), which is what the row side's `Φ_s` of that word sums to.
+    pub fn add_words(
+        &self,
+        chunks: &Chunks,
+        words: &[u64],
+        index: &[u32],
+        shift: usize,
+        weight: impl Fn(usize) -> F192 + Sync,
+    ) {
+        assert_eq!(index.len(), words.len(), "an index per word");
         let top = 1usize << chunks.width;
         parallel::for_each_chunk(words.len().div_ceil(TASK_PAIRS), |start, end| {
             for task in start..end {
@@ -263,9 +271,9 @@ impl Scatter {
                             self.add(j, w);
                         }
                     };
-                    match chunks.decode(words[u]) {
-                        Some(j) => add(j),
-                        None => chunks.indices(words[u], &mut add),
+                    match index[u] {
+                        NO_INDEX => chunks.indices(words[u], &mut add),
+                        j => add(j as usize),
                     }
                 }
             }
@@ -302,10 +310,11 @@ mod tests {
         let chunks = Chunks::new(9);
         let words: Vec<u64> = [3, 7, 2].iter().map(|&s| chunks.encode(s)).collect();
         let fits = Scatter::new(8);
-        fits.add_words(&chunks, &words, 0, |_| F192::ONE);
+        let index = chunks.decode_all(&words);
+        fits.add_words(&chunks, &words, &index, 0, |_| F192::ONE);
         assert!(!fits.overflowed());
         let short = Scatter::new(7);
-        short.add_words(&chunks, &words, 0, |_| F192::ONE);
+        short.add_words(&chunks, &words, &index, 0, |_| F192::ONE);
         assert!(short.overflowed());
         assert_eq!(short.into_vec(), [0, 0, 1, 1].map(|b| F192::new(b, 0, 0)));
     }
@@ -402,9 +411,10 @@ mod tests {
             let r = rng.ext_vec(width);
             let eq = ChunkEq::at(&chunks, &r);
             let (low, carry) = ChunkEq::shift(&chunks, &r);
+            let index = chunks.decode_all(&words);
             for shift in [false, true] {
                 let scatter = Scatter::new(top);
-                scatter.add_words(&chunks, &words, usize::from(shift), |u| weights[u]);
+                scatter.add_words(&chunks, &words, &index, usize::from(shift), |u| weights[u]);
                 let array = scatter.into_vec();
                 let rows: F192 = words
                     .iter()

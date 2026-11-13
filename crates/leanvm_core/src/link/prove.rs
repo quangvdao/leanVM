@@ -18,6 +18,7 @@ use crate::transcript::ProverState;
 use ::pcs::stack_open::{RingPiece, SumPart};
 use primitives::field::{F64, F192};
 use primitives::multilinear::{eq_table, mle_eval_par};
+use std::borrow::Cow;
 
 /// Entries per task when filling an array over the index.
 const TASK: usize = 1 << 12;
@@ -30,20 +31,20 @@ fn words(column: &[F64]) -> &[u64] {
 
 /// The words of a table's pointer column that the index side scatters: the column's own.
 #[cfg(not(test))]
-fn index_words(_: usize, _: usize, words: &[u64]) -> std::borrow::Cow<'_, [u64]> {
-    std::borrow::Cow::Borrowed(words)
+fn index_words(_: usize, _: usize, words: &[u64]) -> Cow<'_, [u64]> {
+    Cow::Borrowed(words)
 }
 
 /// The words of a table's pointer column that the index side scatters: the column's own, unless a test cheats.
 #[cfg(test)]
-fn index_words(t: usize, column: usize, words: &[u64]) -> std::borrow::Cow<'_, [u64]> {
+fn index_words(t: usize, column: usize, words: &[u64]) -> Cow<'_, [u64]> {
     match cheat::INDEX_WORD.get() {
         Some((ct, cc, u, word)) if (ct, cc) == (t, column) && u < words.len() => {
             let mut words = words.to_vec();
             words[u] = word;
-            std::borrow::Cow::Owned(words)
+            Cow::Owned(words)
         }
-        _ => std::borrow::Cow::Borrowed(words),
+        _ => Cow::Borrowed(words),
     }
 }
 
@@ -344,6 +345,16 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
 
     // The base terms' `ω` blocks' first row round, which also gives the index side its payload.
     let mut base_firsts = Vec::new();
+    // Each pointer column's indices, in `Plan::pointers` order, decoded once for both sides.
+    let mut indices: Vec<Vec<Vec<u32>>> = (0..tables::N_TABLES)
+        .map(|t| {
+            plans[t]
+                .pointers
+                .iter()
+                .map(|&c| chunks.decode_all(words(local(t)[c])))
+                .collect()
+        })
+        .collect();
     let index_end = tracing::info_span!("Index side").in_scope(|| {
         let scatter = tracing::info_span!("Scatter").entered();
         let fill = |lens: [usize; 5]| {
@@ -351,19 +362,29 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             let [w_plus, spine, cover, w_mem, w_bc] = &arrays;
             for t in 0..tables::N_TABLES {
                 let (plan, cols, omega, n_t) = (&plans[t], local(t), &omegas[t], rows[t]);
-                let pointer = |c: usize| index_words(t, c, &words(cols[c])[..n_t]);
-                let cycle = pointer(plan.links.state.cycle);
-                w_plus.add_words(&chunks, &cycle, 1, |u| omega[u]);
-                spine.add_words(&chunks, &cycle, 0, |u| state_at(t, u));
-                cover.add_words(&chunks, &cycle, 0, |_| F192::ONE);
+                let pointer = |c: usize| {
+                    let k = plan.pointers.iter().position(|&p| p == c).expect("a pointer column");
+                    match index_words(t, c, &words(cols[c])[..n_t]) {
+                        Cow::Borrowed(w) => (Cow::Borrowed(w), Cow::Borrowed(&indices[t][k][..n_t])),
+                        Cow::Owned(w) => {
+                            let index = chunks.decode_all(&w);
+                            (Cow::Owned(w), Cow::Owned(index))
+                        }
+                    }
+                };
+                let (cycle, at) = pointer(plan.links.state.cycle);
+                w_plus.add_words(&chunks, &cycle, &at, 1, |u| omega[u]);
+                spine.add_words(&chunks, &cycle, &at, 0, |u| state_at(t, u));
+                cover.add_words(&chunks, &cycle, &at, 0, |_| F192::ONE);
                 for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
-                    let (words, s) = (pointer(access.pointer), access.shift);
+                    let ((words, at), s) = (pointer(access.pointer), access.shift);
                     match access.gate {
-                        None => w_mem.add_words(&chunks, &words, s, |u| mu * omega[u]),
-                        Some(g) => w_mem.add_words(&chunks, &words, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
+                        None => w_mem.add_words(&chunks, &words, &at, s, |u| mu * omega[u]),
+                        Some(g) => w_mem.add_words(&chunks, &words, &at, s, |u| (mu * omega[u]).mul_base(cols[g][u])),
                     }
                 }
-                w_bc.add_words(&chunks, &pointer(plan.links.bytecode.pointer), 0, |u| omega[u]);
+                let (bc, at) = pointer(plan.links.bytecode.pointer);
+                w_bc.add_words(&chunks, &bc, &at, 0, |u| omega[u]);
             }
             arrays
         };
@@ -524,6 +545,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 };
                 row_columns.push(RowColumn {
                     words: words(cols[pointer]),
+                    index: std::mem::take(&mut indices[t][k]),
                     omega,
                     act,
                     shifts,

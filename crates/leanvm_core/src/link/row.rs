@@ -25,7 +25,7 @@
 //! like any summand, and the column rounds carry their total `B` as `eq(0, q)·B`.
 
 use super::base::Base;
-use super::pointer::{ChunkEq, Chunks, Shifts, SplitEq, chain, eval_chunk, mirror};
+use super::pointer::{ChunkEq, Chunks, NO_INDEX, Shifts, SplitEq, chain, eval_chunk, mirror};
 use primitives::field::{F192, F192Unreduced};
 
 /// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 10`.
@@ -36,9 +36,6 @@ const MIXED: u8 = u8::MAX;
 
 /// A row past the explicit ones: every chunk [`MIXED`].
 const ALL_MIXED: u64 = u64::MAX;
-
-/// No index: a word some chunk of which is not one-hot.
-const NO_INDEX: u32 = u32::MAX;
 
 /// Pairs per task of a round.
 const TASK_PAIRS: usize = 256;
@@ -91,6 +88,8 @@ pub struct ShiftGroup {
 pub struct RowColumn<'a> {
     /// The words, one per row of the table.
     pub words: &'a [u64],
+    /// Each word's index, or [`NO_INDEX`] ([`Chunks::decode_all`]).
+    pub index: Vec<u32>,
     /// Coefficient on `ω_F` of the pointer itself, `Φ_0`.
     pub omega: Coef,
     /// Coefficient on `act_F` of `Φ_0`.
@@ -875,22 +874,13 @@ impl<'a> Column<'a> {
             .map(|g| points.split.shifted_tables(&g.weights))
             .collect();
         let words = column.words;
-        // SAFETY: every entry is written.
-        let index = unsafe {
-            primitives::filled_vec(words.len(), |index| {
-                parallel::chunks_mut(index, TASK_PAIRS * 16, |task, chunk| {
-                    for (o, &w) in chunk.iter_mut().zip(&words[task * TASK_PAIRS * 16..]) {
-                        *o = chunks.decode(w).map_or(NO_INDEX, |sigma| sigma as u32);
-                    }
-                });
-            })
-        };
+        assert_eq!(column.index.len(), words.len(), "an index per word");
         Self {
             words,
             slots,
             starts,
             split_starts,
-            index,
+            index: column.index,
             values: None,
             tags: Vec::new(),
             omega: column.omega,
@@ -1978,6 +1968,7 @@ mod tests {
                             q += 1;
                             RowColumn {
                                 words: w,
+                                index: chunks.decode_all(w),
                                 omega: *o,
                                 act: *a,
                                 shifts: g.clone(),

@@ -14,6 +14,9 @@ use primitives::multilinear::eq_table;
 /// The widest pointer one `K` word holds: eight chunks of three bits.
 pub const MAX_WIDTH: usize = 24;
 
+/// No index: a word some chunk of which is not one-hot.
+pub const NO_INDEX: u32 = u32::MAX;
+
 /// The chunk layout of `W`-bit pointers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chunks {
@@ -155,6 +158,21 @@ impl Chunks {
             sigma |= (b.trailing_zeros() as usize) << self.index_shifts[i];
         }
         Some(sigma)
+    }
+
+    /// Each word's index ([`Self::decode`]), or [`NO_INDEX`], in parallel.
+    pub fn decode_all(&self, words: &[u64]) -> Vec<u32> {
+        const TASK: usize = 1 << 12;
+        // SAFETY: every entry is written.
+        unsafe {
+            primitives::filled_vec(words.len(), |index| {
+                parallel::chunks_mut(index, TASK, |task, chunk| {
+                    for (o, &w) in chunk.iter_mut().zip(&words[task * TASK..]) {
+                        *o = self.decode(w).map_or(NO_INDEX, |sigma| sigma as u32);
+                    }
+                });
+            })
+        }
     }
 
     /// Every index of a word: one per choice of a set bit in each chunk, so none when a chunk has no bit set.
