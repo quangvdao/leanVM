@@ -505,37 +505,65 @@ impl Scatter {
         self.add_words_with(chunks, &[(words, index, shift)], |_, u| weight(u), || Direct(self));
     }
 
-    /// [`Scatter::add_words`] into several arrays in one pass over the words: `weights(u)[a]` at the index plus
-    /// `targets[a].1` in `targets[a].0`.
-    pub fn add_words_to<const K: usize>(
+    /// [`Scatter::add_words`] of several tables' words into several arrays in one pass: row `u` of table `t` adds
+    /// `weights(t, u)[a]` at its index plus `targets[a].1` in `targets[a].0`. A task takes a range of indices and,
+    /// from each table, the rows from the first whose index reaches the range to the first past it, so for words
+    /// sorted by index, such as each table's cycles, a task's adds stay in its own stretch of every array and each
+    /// array is swept once rather than once a table. Any order of words still adds each row once.
+    pub fn add_sorted_words_to<const K: usize>(
         chunks: &Chunks,
-        words: &[u64],
-        index: &[u32],
+        tables: &[(&[u64], &[u32])],
         targets: [(&Scatter, usize); K],
-        weights: impl Fn(usize) -> [F192; K] + Sync,
+        weights: impl Fn(usize, usize) -> [F192; K] + Sync,
     ) {
-        assert_eq!(index.len(), words.len(), "an index per word");
+        for &(words, index) in tables {
+            assert_eq!(index.len(), words.len(), "an index per word");
+        }
         let top = 1usize << chunks.width;
-        parallel::for_each(words.len().div_ceil(TASK_PAIRS), |task| {
-            for u in task * TASK_PAIRS..words.len().min((task + 1) * TASK_PAIRS) {
-                if let Some(&j) = index.get(u + PREFETCH)
-                    && j != NO_INDEX
-                {
-                    for &(array, shift) in &targets {
-                        array.prefetch(j as usize + shift);
-                    }
+        let len = targets
+            .iter()
+            .map(|(array, _)| array.limbs.len() / 3)
+            .max()
+            .unwrap_or(0);
+        let ranges = len.div_ceil(TASK_PAIRS).max(1);
+        // Each table's first row per range, kept nondecreasing so the ranges split its rows whatever their order.
+        let starts: Vec<Vec<usize>> = (tables.iter())
+            .map(|&(_, index)| {
+                let mut starts: Vec<usize> = (0..ranges)
+                    .map(|r| index.partition_point(|&j| (j as usize) < r * TASK_PAIRS))
+                    .chain([index.len()])
+                    .collect();
+                starts[0] = 0;
+                for r in 1..=ranges {
+                    starts[r] = starts[r].max(starts[r - 1]);
                 }
-                let w = weights(u);
-                let mut add = |j: usize| {
-                    for (&(array, shift), &w) in targets.iter().zip(&w) {
-                        if !w.is_zero() && j + shift < top {
-                            array.add(j + shift, w);
+                starts
+            })
+            .collect();
+        parallel::for_each(ranges, |r| {
+            for (t, &(words, index)) in tables.iter().enumerate() {
+                let rows = starts[t][r]..starts[t][r + 1];
+                for u in rows.clone() {
+                    if u + PREFETCH < rows.end
+                        && let j = index[u + PREFETCH]
+                        && j != NO_INDEX
+                    {
+                        for &(array, shift) in &targets {
+                            array.prefetch(j as usize + shift);
                         }
                     }
-                };
-                match index[u] {
-                    NO_INDEX => chunks.indices(words[u], &mut add),
-                    j => add(j as usize),
+                    let w = weights(t, u);
+                    let mut add = |j: usize| {
+                        for (&(array, shift), &w) in targets.iter().zip(&w) {
+                            if !w.is_zero() && j + shift < top {
+                                array.add(j + shift, w);
+                            }
+                        }
+                    };
+                    match index[u] {
+                        NO_INDEX => chunks.indices(words[u], &mut add),
+                        j => add(j as usize),
+                    }
                 }
             }
         });
@@ -847,6 +875,50 @@ mod tests {
         };
         let stored = run(full.into_iter().map(Array::from).collect());
         assert_eq!(run(heads.into_iter().collect()), stored);
+    }
+
+    /// Scattering several tables' words by index range adds what scattering each table's words alone adds, whether
+    /// the words are sorted, shuffled or not one-hot.
+    #[test]
+    fn sorted_scatter_adds_each_row_once() {
+        let mut rng = Rng::new(0x50d);
+        let chunks = Chunks::new(14);
+        let top = 1usize << chunks.width;
+        let tables: Vec<Vec<u64>> = (0..3)
+            .map(|t| {
+                let mut sigmas: Vec<usize> = (0..5000 + 1000 * t).map(|_| rng.next_u64() as usize % top).collect();
+                if t != 1 {
+                    sigmas.sort_unstable();
+                }
+                (sigmas.iter().enumerate())
+                    .map(|(u, &s)| {
+                        let word = chunks.encode(s);
+                        if t == 2 && u % 97 == 0 {
+                            word | rng.next_u64() & rng.next_u64()
+                        } else {
+                            word
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let indices: Vec<Vec<u32>> = tables.iter().map(|w| chunks.decode_all(w)).collect();
+        let weights: Vec<Vec<[F192; 2]>> = (tables.iter())
+            .map(|w| w.iter().map(|_| [rng.ext(), rng.ext()]).collect())
+            .collect();
+        for len in [top, 3000] {
+            let (a, b) = (Scatter::new(len), Scatter::new(len));
+            let words: Vec<(&[u64], &[u32])> = tables.iter().zip(&indices).map(|(w, i)| (&w[..], &i[..])).collect();
+            Scatter::add_sorted_words_to(&chunks, &words, [(&a, 1), (&b, 0)], |t, u| weights[t][u]);
+            let (c, d) = (Scatter::new(len), Scatter::new(len));
+            for (t, (w, i)) in tables.iter().zip(&indices).enumerate() {
+                c.add_words(&chunks, w, i, 1, |u| weights[t][u][0]);
+                d.add_words(&chunks, w, i, 0, |u| weights[t][u][1]);
+            }
+            assert_eq!(a.overflowed(), c.overflowed());
+            assert_eq!(a.into_vec(), c.into_vec(), "length {len}");
+            assert_eq!(b.into_vec(), d.into_vec(), "length {len}");
+        }
     }
 
     /// A scattered array at a point is the sum of its rows' `Φ_0` (or `Φ_1`) there, for any words.

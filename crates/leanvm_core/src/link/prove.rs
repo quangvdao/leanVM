@@ -366,24 +366,32 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
         .collect();
     let index_end = tracing::info_span!("Index side").in_scope(|| {
         let scatter = tracing::info_span!("Scatter").entered();
+        let pointer = |t: usize, c: usize| {
+            let (plan, cols, n_t) = (&plans[t], local(t), rows[t]);
+            let k = plan.pointers.iter().position(|&p| p == c).expect("a pointer column");
+            match index_words(t, c, &words(cols[c])[..n_t]) {
+                Cow::Borrowed(w) => (Cow::Borrowed(w), Cow::Borrowed(&indices[t][k][..n_t])),
+                Cow::Owned(w) => {
+                    let index = chunks.decode_all(&w);
+                    (Cow::Owned(w), Cow::Owned(index))
+                }
+            }
+        };
+        let cycles_at: Vec<_> = (0..tables::N_TABLES)
+            .map(|t| pointer(t, plans[t].links.state.cycle))
+            .collect();
         let fill = |lens: [usize; 5]| {
             let arrays = lens.map(Scatter::new);
             let [w_plus, spine, cover, w_mem, w_bc] = &arrays;
+            // Every table's cycles in one pass over the cycle-indexed arrays.
+            let cycle_words: Vec<(&[u64], &[u32])> = cycles_at.iter().map(|(w, at)| (&w[..], &at[..])).collect();
+            let targets = [(w_plus, 1), (spine, 0), (cover, 0)];
+            Scatter::add_sorted_words_to(&chunks, &cycle_words, targets, |t, u| {
+                [omegas[t][u], state_at(t, u), F192::ONE]
+            });
             for t in 0..tables::N_TABLES {
-                let (plan, cols, omega, n_t) = (&plans[t], local(t), &omegas[t], rows[t]);
-                let pointer = |c: usize| {
-                    let k = plan.pointers.iter().position(|&p| p == c).expect("a pointer column");
-                    match index_words(t, c, &words(cols[c])[..n_t]) {
-                        Cow::Borrowed(w) => (Cow::Borrowed(w), Cow::Borrowed(&indices[t][k][..n_t])),
-                        Cow::Owned(w) => {
-                            let index = chunks.decode_all(&w);
-                            (Cow::Owned(w), Cow::Owned(index))
-                        }
-                    }
-                };
-                let (cycle, at) = pointer(plan.links.state.cycle);
-                let targets = [(w_plus, 1), (spine, 0), (cover, 0)];
-                Scatter::add_words_to(&chunks, &cycle, &at, targets, |u| [omega[u], state_at(t, u), F192::ONE]);
+                let (plan, cols, omega) = (&plans[t], local(t), &omegas[t]);
+                let pointer = |c: usize| pointer(t, c);
                 // Every access of the table in one pass over its rows.
                 let memory = &plan.links.memory[..plan.links.memory.len().min(ch.mu[t].len())];
                 let pointers: Vec<_> = memory.iter().map(|access| pointer(access.pointer)).collect();
