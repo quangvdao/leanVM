@@ -412,6 +412,32 @@ type Poly = [F192; MAX_COEFFS];
 /// A round's terms under one weight at a pair, unreduced.
 type Acc = [F192Unreduced; MAX_COEFFS];
 
+/// The most coefficients the base terms under `ω` have at a pair: a gate times a quadratic form.
+const BASE_COEFFS: usize = 4;
+
+/// A certificate's terms at a pair, unreduced: three coefficients.
+type CertAcc = [F192Unreduced; 3];
+
+/// Where a column's terms at a pair go: those under `ω` times `scale` to `omega`, those under `act` to `act`, and the
+/// certificate's, which are under `ω` too but unscaled, to `cert`.
+struct Sums<'s> {
+    omega: &'s mut Acc,
+    act: &'s mut Acc,
+    cert: &'s mut CertAcc,
+    scale: F192,
+}
+
+impl Sums<'_> {
+    fn reborrow(&mut self) -> Sums<'_> {
+        Sums {
+            omega: &mut *self.omega,
+            act: &mut *self.act,
+            cert: &mut *self.cert,
+            scale: self.scale,
+        }
+    }
+}
+
 /// `p ← p·(a + b·X)` for `p` of `len` coefficients; the new length.
 #[inline(always)]
 fn mul_linear(p: &mut Poly, len: usize, a: F192, b: F192) -> usize {
@@ -658,7 +684,7 @@ fn fold_words(index: &[u32], r: &[F192], at: impl Fn(usize) -> F192) -> F192 {
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn cert_pair(
-    acc: &mut Acc,
+    acc: &mut CertAcc,
     slots: &Slots,
     cert: &[F192],
     cert_mirrors: &[F192],
@@ -692,7 +718,7 @@ fn cert_pair(
 
 /// `acc ← acc + m + constant`, `m` of three coefficients.
 #[inline(always)]
-fn add_cert(acc: &mut Acc, m: [F192Unreduced; 3], constant: F192) {
+fn add_cert(acc: &mut CertAcc, m: [F192Unreduced; 3], constant: F192) {
     acc[0] ^= m[0] ^ F192Unreduced::from(constant);
     acc[1] ^= m[1];
     acc[2] ^= m[2];
@@ -792,7 +818,7 @@ fn plain_terms(
     aux: &[(F192, F192)],
     points: &RowPoints,
     widths: &[usize],
-    (omega, act): (&mut Acc, &mut Acc),
+    sums: Sums<'_>,
     chunk: impl Fn(usize) -> ChunkPair,
 ) {
     let mut codes = [0u32; CLEAN_BLOCKS];
@@ -824,7 +850,7 @@ fn plain_terms(
             }
         }
     }
-    add_cert(omega, m, constant);
+    add_cert(sums.cert, m, constant);
     let (coef, len) = coef_linear(column.omega, aux);
     let live = !(coef[0].is_zero() && coef[1].is_zero());
     if !live && column.act.is_zero() {
@@ -834,11 +860,11 @@ fn plain_terms(
     let p = product(&factors[..n]);
     let p = &p[..n + 1];
     if live {
-        add_scaled(omega, s, &coef[..len], p);
+        add_scaled(sums.omega, s * sums.scale, &coef[..len], p);
     }
     if !column.act.is_zero() {
         let (c, len) = coef_linear(column.act, aux);
-        add_scaled(act, s, &c[..len], p);
+        add_scaled(sums.act, s, &c[..len], p);
     }
 }
 
@@ -1462,26 +1488,38 @@ impl<'a> Column<'a> {
         self.tags = tags;
     }
 
-    /// Add the column's terms at a pair: those under `ω` to `omega`, those under `act` to `act`, each without its
-    /// weight. `pointer(acc, coef, groups)` adds a pointer term, `cert(acc)` the certificate's.
+    /// Add the column's terms at a pair to `sums`, each without its weight: the pointer's under `ω`, its
+    /// coefficients times `sums.scale`, to `omega`, and under `act` to `act`. `pointer(acc, coef, groups)` adds a
+    /// pointer term, `cert(acc)` the certificate's, unscaled.
     #[inline(always)]
     fn add_terms(
         &self,
         aux: &[(F192, F192)],
-        omega: &mut Acc,
-        act: &mut Acc,
+        sums: Sums<'_>,
         pointer: impl FnOnce(&mut Acc, &[F192], &[[F192; 2]], Option<(&mut Acc, &[F192])>),
-        cert: impl FnOnce(&mut Acc),
+        cert: impl FnOnce(&mut CertAcc),
     ) {
+        let scale = sums.scale;
+        let scaled = |c: Coef| {
+            let (mut v, len) = coef_linear(c, aux);
+            for x in &mut v[..len] {
+                *x *= scale;
+            }
+            (v, len)
+        };
         let mut groups = [[F192::ZERO; 2]; 4];
         for (o, g) in groups.iter_mut().zip(&self.shifts) {
-            *o = coef_linear(g.coef, aux).0;
+            *o = scaled(g.coef).0;
         }
-        let (coef, len) = coef_linear(self.omega, aux);
+        let (coef, len) = if self.omega.is_zero() {
+            ([F192::ZERO; 2], 1)
+        } else {
+            scaled(self.omega)
+        };
         let (act_coef, act_len) = coef_linear(self.act, aux);
-        let act = (!self.act.is_zero()).then_some((act, &act_coef[..act_len]));
-        pointer(omega, &coef[..len], &groups[..self.shifts.len()], act);
-        cert(omega);
+        let act = (!self.act.is_zero()).then_some((sums.act, &act_coef[..act_len]));
+        pointer(sums.omega, &coef[..len], &groups[..self.shifts.len()], act);
+        cert(sums.cert);
     }
 
     /// The coefficient of `Φ_0`, of each shift `s` (at `s - 1`), and the certificate weights at a table's end, times
@@ -1687,7 +1725,8 @@ impl<'a> State<'a> {
         } = *setup;
         // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
         // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
-        // `eq(τ_h, X)` multiplies their sum once per task.
+        // `eq(τ_h, X)` multiplies their sum once per task. The columns' terms take that scale through their
+        // coefficients, so only the base and certificate terms, a few coefficients, are scaled per pair.
         let (whole, tau) = match &self.tau {
             Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
             None => (0, F192::ZERO),
@@ -1698,10 +1737,8 @@ impl<'a> State<'a> {
         let range = task * per_task..pairs.min((task + 1) * per_task);
         for k in range.clone() {
             let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
-            // The terms under each weight, summed before the weight multiplies them: the base terms' reduced,
-            // the columns' not.
+            // The base terms under `ω`, reduced: at most `BASE_COEFFS` coefficients.
             let mut under_omega = [F192::ZERO; MAX_COEFFS];
-            let (mut cols_omega, mut cols_act) = ([F192Unreduced::ZERO; MAX_COEFFS], [F192Unreduced::ZERO; MAX_COEFFS]);
             if let Some(base) = &self.base {
                 let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
                 if with_omega || base.on_padding() {
@@ -1713,28 +1750,49 @@ impl<'a> State<'a> {
             }
             let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
             let aux = self.aux_pair(k);
-            for ((column, tables), weighted) in self.columns.iter().zip(tables).zip(weighted) {
-                let sums = (&mut cols_omega, &mut cols_act);
-                let words = (tables.as_slice(), weighted.as_slice());
-                match &column.values {
-                    None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
-                    Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, skip, sums),
-                }
-            }
-            for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
-                *o += c.reduce();
-            }
-            if k < whole {
-                let scale = omega.0 + omega.1;
-                for (f, &v) in factored.iter_mut().zip(&under_omega[..len]) {
-                    *f ^= scale.mul_unreduced(v);
-                }
-                if self.any_act {
-                    for (o, &c) in under_one[..len].iter_mut().zip(&cols_act) {
-                        *o ^= c;
+            let mut cert = [F192Unreduced::ZERO; 3];
+            let add_columns = |sums: &mut Sums| {
+                for ((column, tables), weighted) in self.columns.iter().zip(tables).zip(weighted) {
+                    let words = (tables.as_slice(), weighted.as_slice());
+                    let sums = sums.reborrow();
+                    match &column.values {
+                        None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
+                        Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, skip, sums),
                     }
                 }
+            };
+            if k < whole {
+                // The columns scale their terms under `ω` by `ω_0 + ω_1` and add them to `factored` and those under
+                // `act` to `under_one`; the base and certificate terms take the scale here.
+                let scale = omega.0 + omega.1;
+                add_columns(&mut Sums {
+                    omega: &mut factored,
+                    act: &mut under_one,
+                    cert: &mut cert,
+                    scale,
+                });
+                for (o, c) in under_omega.iter_mut().zip(&cert) {
+                    *o += c.reduce();
+                }
+                debug_assert!(under_omega[BASE_COEFFS..].iter().all(|c| c.is_zero()));
+                for (f, &v) in factored.iter_mut().zip(&under_omega[..BASE_COEFFS]) {
+                    *f ^= scale.mul_unreduced(v);
+                }
             } else {
+                let (mut cols_omega, mut cols_act) =
+                    ([F192Unreduced::ZERO; MAX_COEFFS], [F192Unreduced::ZERO; MAX_COEFFS]);
+                add_columns(&mut Sums {
+                    omega: &mut cols_omega,
+                    act: &mut cols_act,
+                    cert: &mut cert,
+                    scale: F192::ONE,
+                });
+                for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
+                    *o += c.reduce();
+                }
+                for (o, c) in under_omega.iter_mut().zip(&cert) {
+                    *o += c.reduce();
+                }
                 add_mul_pair(acc, 0, &under_omega, len, omega);
                 if self.any_act {
                     let under_act = cols_act.map(F192Unreduced::reduce);
@@ -1761,11 +1819,11 @@ impl<'a> State<'a> {
         chunks: &Chunks,
         points: &RowPoints,
         skip: bool,
-        (omega, act): (&mut Acc, &mut Acc),
+        mut sums: Sums<'_>,
     ) {
         let n = 1 << r.len();
         if skip {
-            let sums = (&mut *omega, &mut *act);
+            let sums = sums.reborrow();
             let done = match n {
                 1 => Self::try_indices::<1>(column, (tables, weighted), r, k, aux, chunks, points, sums),
                 2 => Self::try_indices::<2>(column, (tables, weighted), r, k, aux, chunks, points, sums),
@@ -1796,8 +1854,7 @@ impl<'a> State<'a> {
         let slots = &column.slots;
         column.add_terms(
             aux,
-            omega,
-            act,
+            sums,
             |acc, coef, groups, act| {
                 pointer_pair(
                     acc,
@@ -1843,7 +1900,7 @@ impl<'a> State<'a> {
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
-        sums: (&mut Acc, &mut Acc),
+        sums: Sums<'_>,
     ) -> bool {
         let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
         let sigmas: [[u32; N]; 2] = [0, 1].map(|side| std::array::from_fn(|t| index((2 * k + side) * N + t)));
@@ -1867,7 +1924,7 @@ impl<'a> State<'a> {
         aux: &[(F192, F192)],
         chunks: &Chunks,
         points: &RowPoints,
-        (omega, act): (&mut Acc, &mut Acc),
+        sums: Sums<'_>,
     ) {
         let (lo, hi) = (&sigmas[0], &sigmas[1]);
         let (mut lo_diff, mut hi_diff) = (0, 0);
@@ -1903,12 +1960,11 @@ impl<'a> State<'a> {
                     ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i)))
                 }
             };
-            return plain_terms(column, aux, points, &chunks.widths, (omega, act), chunk);
+            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
         }
         column.add_terms(
             aux,
-            omega,
-            act,
+            sums,
             |acc, coef, groups, act| {
                 if varying.count_ones() <= 1 {
                     let at = |sigma| points.split.at(sigma);
@@ -1978,7 +2034,7 @@ impl<'a> State<'a> {
         points: &RowPoints,
         chunks: &Chunks,
         skip: bool,
-        (omega, act): (&mut Acc, &mut Acc),
+        sums: Sums<'_>,
     ) {
         let slots = &column.slots;
         let (lo_row, hi_row) = (column.view(2 * k), column.view(2 * k + 1));
@@ -1994,7 +2050,7 @@ impl<'a> State<'a> {
                     _ => ChunkPair::OneHot(a, b),
                 }
             };
-            return plain_terms(column, aux, points, &chunks.widths, (omega, act), chunk);
+            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
         }
         let clean = |i: usize| {
             let t = (lo_tags >> (8 * i)) as u8;
@@ -2006,8 +2062,7 @@ impl<'a> State<'a> {
         };
         column.add_terms(
             aux,
-            omega,
-            act,
+            sums,
             |acc, coef, groups, act| {
                 let digit = |i: usize| {
                     let t = (lo_tags >> (8 * i)) as u8;
