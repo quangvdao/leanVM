@@ -87,7 +87,7 @@ impl BitFold {
 pub const SPARSE_BITS: usize = 0;
 /// The most set bits a word may average for [`fold_set_bits`] to beat [`BitFold::fold_columns`] and its transpose.
 #[cfg(target_arch = "aarch64")]
-pub const SPARSE_BITS: usize = 8;
+pub const SPARSE_BITS: usize = 4;
 /// The most set bits a word may average for [`fold_set_bits`] to beat [`BitFold::fold_columns`] and its transpose.
 #[cfg(not(any(
     all(
