@@ -37,6 +37,9 @@ pub struct Chunks {
     split: usize,
     low_words: Vec<u64>,
     high_words: Vec<u64>,
+    /// [`Self::varying`] of the low `split` bits of a difference and of its high bits.
+    low_varying: Vec<u8>,
+    high_varying: Vec<u8>,
 }
 
 impl Chunks {
@@ -113,6 +116,8 @@ impl Chunks {
             split,
             low_words: Vec::new(),
             high_words: Vec::new(),
+            low_varying: Vec::new(),
+            high_varying: Vec::new(),
         };
         let low_chunks = chunks.index_shifts.iter().filter(|&&at| at < split).count();
         let words = |chunks: &Self, range: std::ops::Range<usize>, sigma: usize| {
@@ -126,6 +131,11 @@ impl Chunks {
         chunks.high_words = (0..1usize << (width - split))
             .map(|s| words(&chunks, low_chunks..d, s << split))
             .collect();
+        let varying = |chunks: &Self, diff: usize| {
+            (0..d).fold(0u8, |out, i| out | u8::from(chunks.digit(diff, i) != 0) << i)
+        };
+        chunks.low_varying = (0..1usize << split).map(|s| varying(&chunks, s)).collect();
+        chunks.high_varying = (0..1usize << (width - split)).map(|s| varying(&chunks, s << split)).collect();
         chunks
     }
 
@@ -152,15 +162,18 @@ impl Chunks {
         ((sigma as u32 >> self.digit_shifts[i & 7]) & self.digit_masks[i & 7]) as usize
     }
 
+    /// The shift of chunk `i`'s digit in an index.
+    pub fn digit_shift(&self, i: usize) -> usize {
+        self.index_shifts[i]
+    }
+
     /// Bit `i` set for each chunk `i` whose digit in `diff` is nonzero: the chunks two indices differ in, for `diff`
     /// their XOR.
     #[inline(always)]
     pub fn varying(&self, diff: u32) -> u32 {
-        let mut out = 0;
-        for i in 0..8 {
-            out |= u32::from(diff >> self.digit_shifts[i] & self.digit_masks[i] != 0) << i;
-        }
-        out
+        let diff = diff as usize;
+        debug_assert!(diff >> self.width == 0);
+        u32::from(self.low_varying[diff & ((1 << self.split) - 1)] | self.high_varying[diff >> self.split])
     }
 
     /// The index of a word whose chunks are all one-hot.

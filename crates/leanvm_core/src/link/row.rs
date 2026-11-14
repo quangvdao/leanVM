@@ -163,10 +163,13 @@ struct CleanEq {
     /// Per chunk, its block and the place value of its code there.
     place: [(usize, u32); MAX_CHUNKS],
     blocks: Vec<Vec<F128>>,
+    /// Per block, the shift and mask of the index bits its chunks cover, and the block's code with each of those
+    /// chunks at its digit, by those bits.
+    full: Vec<(u32, u32, Vec<u32>)>,
 }
 
 impl CleanEq {
-    fn new(tables: &[Vec<F128>]) -> Self {
+    fn new(chunks: &Chunks, tables: &[Vec<F128>]) -> Self {
         let mut place = [(0, 0); MAX_CHUNKS];
         let mut blocks: Vec<Vec<F128>> = vec![vec![F128::ONE]];
         for (i, table) in tables.iter().enumerate() {
@@ -182,7 +185,38 @@ impl CleanEq {
             block.extend(table.iter().flat_map(|&t| low.iter().map(move |&v| v * t)));
         }
         assert!(blocks.len() <= CLEAN_BLOCKS);
-        Self { place, blocks }
+        let full = (0..blocks.len())
+            .map(|b| {
+                let members: Vec<usize> = (0..tables.len()).filter(|&i| place[i].0 == b).collect();
+                let shift = chunks.digit_shift(members[0]);
+                let bits: usize = members.iter().map(|&i| chunks.widths[i]).sum();
+                let codes = (0..1usize << bits)
+                    .map(|s| {
+                        let sigma = s << shift;
+                        (members.iter()).map(|&i| (chunks.digit(sigma, i) as u32 + 1) * place[i].1).sum()
+                    })
+                    .collect();
+                (shift as u32, (1u32 << bits) - 1, codes)
+            })
+            .collect();
+        Self { place, blocks, full }
+    }
+
+    /// The set of every chunk at its digit in `sigma` but those in `varying`.
+    #[inline(always)]
+    fn codes_except(&self, chunks: &Chunks, sigma: u32, varying: u32) -> [u32; CLEAN_BLOCKS] {
+        let mut codes = [0u32; CLEAN_BLOCKS];
+        for (c, (shift, mask, table)) in codes.iter_mut().zip(&self.full) {
+            *c = table[(sigma >> shift & mask) as usize];
+        }
+        let mut rest = varying;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let (block, stride) = self.place[i];
+            codes[block] -= (chunks.digit(sigma as usize, i) as u32 + 1) * stride;
+        }
+        codes
     }
 
     /// Put chunk `i` at digit `v` into the set `codes`.
@@ -222,7 +256,7 @@ impl RowPoints {
             })
             .collect();
         Self {
-            clean: CleanEq::new(&eq.tables),
+            clean: CleanEq::new(chunks, &eq.tables),
             shifts: Shifts::new(chunks, &eq, max_shift),
             mirrors: (0..chunks.d()).map(|i| mirror(chunks.part(r, i))).collect(),
             eq,
@@ -811,7 +845,8 @@ fn add_scaled(acc: &mut Acc, s: F128, c: &[F128], p: &[F128]) {
 
 /// [`Column::add_terms`] for a column without shift groups, from how each of its chunks stands at the pair:
 /// `c(X)·Φ_0(X)` under each weight and the certificate under `ω`. The chunks that stand constant at one-hot values
-/// give one lookup in [`CleanEq`], the rest one product of linear factors, which both weights share.
+/// give one lookup in [`CleanEq`], already in `codes`, and the chunks in `varying` one product of linear factors,
+/// which both weights share.
 #[inline(always)]
 fn plain_terms(
     column: &Column,
@@ -819,14 +854,18 @@ fn plain_terms(
     points: &RowPoints,
     widths: &[usize],
     sums: Sums<'_>,
+    (mut codes, varying): ([u32; CLEAN_BLOCKS], u32),
     chunk: impl Fn(usize) -> ChunkPair,
 ) {
-    let mut codes = [0u32; CLEAN_BLOCKS];
     let mut factors = [(F128::ZERO, F128::ZERO); MAX_CHUNKS];
     let mut n = 0;
     let mut m = [F128Unreduced::ZERO; 3];
     let mut constant = F128::ZERO;
-    for (i, &eps) in column.cert.iter().enumerate() {
+    let mut rest = varying;
+    while rest != 0 {
+        let i = rest.trailing_zeros() as usize;
+        rest &= rest - 1;
+        let eps = column.cert[i];
         match chunk(i) {
             ChunkPair::Constant(v) => points.clean.add(&mut codes, i, v),
             ChunkPair::OneHot(a, b) => {
@@ -1952,15 +1991,14 @@ impl<'a> State<'a> {
         if column.shifts.is_empty() && (N > 1 || varying.count_ones() > 1) {
             let chunk = |i: usize| {
                 let v = |sigma: u32| digit(sigma, i) as u8;
-                if varying >> i & 1 == 0 {
-                    ChunkPair::Constant(v(lo[0]))
-                } else if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
+                if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
                     ChunkPair::OneHot(v(lo[0]), v(hi[0]))
                 } else {
                     ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i)))
                 }
             };
-            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
+            let codes = points.clean.codes_except(chunks, lo[0], varying);
+            return plain_terms(column, aux, points, &chunks.widths, sums, (codes, varying), chunk);
         }
         column.add_terms(
             aux,
@@ -2050,7 +2088,16 @@ impl<'a> State<'a> {
                     _ => ChunkPair::OneHot(a, b),
                 }
             };
-            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
+            let (mut codes, mut varying) = ([0u32; CLEAN_BLOCKS], 0u32);
+            for i in 0..chunks.d() {
+                let (a, b) = ((lo_tags >> (8 * i)) as u8, (hi_tags >> (8 * i)) as u8);
+                if a == b && a != MIXED {
+                    points.clean.add(&mut codes, i, a);
+                } else {
+                    varying |= 1 << i;
+                }
+            }
+            return plain_terms(column, aux, points, &chunks.widths, sums, (codes, varying), chunk);
         }
         let clean = |i: usize| {
             let t = (lo_tags >> (8 * i)) as u8;
