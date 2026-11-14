@@ -28,7 +28,7 @@ pub use layout::{
     min_execution_stacked_log,
 };
 pub use merkle::MerklePath;
-pub use multilinear::stack_offsets;
+pub use multilinear::{Spot, stack_offsets};
 pub use transcript::Proof;
 pub use transcript::SECURITY_BITS;
 pub use whir::{BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, OOD_GRINDING_BITS, QUERY_GRINDING_BITS, whir_queries};

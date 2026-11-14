@@ -14,6 +14,7 @@ use crate::layout::{Access, BUS_BITS, GLOBAL_COLUMN_BASES, K_BITS, Layout, N_TAB
 use crate::multilinear::{eq_eval, eq_kernel, index_mle, log2_ceil, padding_weight};
 use crate::ring_switch::{RingClaim, RingPiece};
 use crate::transcript::{Transcript, grinding_bits, sumcheck};
+use crate::whir::INITIAL_FOLDING_FACTOR;
 use crate::{VerifierError, require};
 
 /// The widest pointer one word holds.
@@ -388,11 +389,15 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
             for (c, &epsilon) in certs.iter_mut().zip(&eps[q]) {
                 *c += e * omega * cert * epsilon;
             }
-            pieces.push(RingPiece {
-                placement: layout.placements[GLOBAL_COLUMN_BASES[t] + pointer],
-                point: point.clone(),
-                scale: eq_q[q],
-            });
+            // A split column (the band layout) is its pieces, each at the low end of the row point.
+            let placement = layout.placements[GLOBAL_COLUMN_BASES[t] + pointer].expect("a pointer column is committed");
+            for (piece, weight) in placement.pieces(layout.stack_log - INITIAL_FOLDING_FACTOR, &point) {
+                pieces.push(RingPiece {
+                    placement: Some(piece),
+                    point: point[..piece.variables].to_vec(),
+                    scale: eq_q[q] * weight,
+                });
+            }
             q += 1;
         }
         columns.push((point, sent));

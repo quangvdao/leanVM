@@ -654,11 +654,17 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             for (s, &v) in slices.iter_mut().zip(&end.slices) {
                 *s += eq_q[q] * v;
             }
-            pieces.push(RingPiece {
-                offset: layout.placements[sch.base[t] + pointer].offset,
-                point: point.to_vec(),
-                scale: eq_q[q],
-            });
+            // A split column (the band layout) is its pieces, each at the low end of the row point.
+            let placement = &layout.placements[sch.base[t] + pointer];
+            let lane = layout.shape.mu - crate::pcs::LOG_BATCH;
+            let weights = primitives::multilinear::eq_table_serial(&point[placement.piece_vars..]);
+            for (offset, &weight) in placement.piece_offsets(lane).zip(&weights) {
+                pieces.push(RingPiece {
+                    offset,
+                    point: point[..placement.piece_vars].to_vec(),
+                    scale: eq_q[q] * weight,
+                });
+            }
             q += 1;
         }
     }
@@ -666,7 +672,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     let memory = SlotClaim::Sum {
         parts: (MEM_LO..=MEM_HI)
             .map(|c| SumPart {
-                offset: layout.placements[c].offset,
+                offset: layout.placements[c].whole(),
                 low_point: r_mem.to_vec(),
                 scale: ch.gamma_mem[1 + c - MEM_LO] * below_mem,
             })

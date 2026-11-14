@@ -158,7 +158,8 @@ pub struct Layout {
 pub(crate) struct Witness {
     pub(crate) q: Vec<F64>,
     /// The KECCAK output lanes' values as `(global column index, values)`. The links read
-    /// them but they are not committed, so they are not in `q`.
+    /// them but they are not committed, so they are not in `q`. A split pointer column
+    /// (the band layout) is here too, contiguous for the link, as well as in pieces in `q`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
     pub(crate) layout: Layout,
     pub(crate) log_mem: usize,
@@ -181,6 +182,7 @@ impl Witness {
             .map(|(i, p)| match keccak_value(i) {
                 Some(KeccakLane::Slot(slot)) => &self.q[q_keccak + slot * steps..][..steps],
                 _ if p.is_virtual() => &[][..],
+                _ if p.is_split() => &[][..],
                 _ => &self.q[p.offset..][..1 << p.n_vars],
             })
             .collect();
@@ -531,9 +533,10 @@ impl Program {
         // time for no gain: nothing folds the K-columns
         // in place, so the stack can be their only home.
         //
-        // SAFETY: the allocation is uninitialized. `split_stack` zeroes the pad tail
-        // and hands out windows tiling the rest; `fill_table` checks that each table
-        // wrote every window it was given, and the shared columns below write theirs.
+        // SAFETY: the allocation is uninitialized. `split_stack` zeroes every word no
+        // column covers and hands out a window per whole column, and `scatter` below
+        // writes the split columns' pieces; `fill_table` checks that each table wrote
+        // every window it was given, and the shared columns below write theirs.
         let mut q = unsafe { witness::alloc_stack(l.shape) };
         // An output lane is neither in the stack nor in `q_keccak`, so its values need
         // storage of their own: it carries data for the bus. Every other column `q_keccak`
@@ -545,7 +548,13 @@ impl Program {
             // `fill_table` asserts each table wrote all of its windows.
             .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
             .collect();
-        let mut windows = witness::split_stack(&mut q, &l.placements);
+        // A split pointer column is filled contiguously, for the link to read, and then
+        // scattered into its pieces of the stack.
+        let lane = l.shape.mu - crate::pcs::LOG_BATCH;
+        let split: Vec<usize> = (0..sch.n).filter(|&i| l.placements[i].is_split()).collect();
+        // SAFETY: as for the output lanes.
+        virt.extend(split.iter().map(|&i| (i, unsafe { primitives::uninit_vec::<F64>(1 << l.placements[i].n_vars) })));
+        let mut windows = witness::split_stack(&mut q, &l.placements, lane);
         for (i, buf) in virt.iter_mut() {
             windows[*i] = buf;
         }
@@ -635,6 +644,11 @@ impl Program {
         // (`execute` already asserts the run halts at the sentinel (pc, fp) =
         // (g^{B-1}, 0), exactly the boundary the public layout derives.)
         drop(windows); // release the borrow of `q` and of the output lanes' buffers
+        crate::stage!("Scatter split columns", || {
+            for (i, column) in virt.iter().filter(|(i, _)| l.placements[*i].is_split()) {
+                witness::scatter(&mut q, &l.placements[*i], lane, column);
+            }
+        });
         Witness {
             q,
             virt,

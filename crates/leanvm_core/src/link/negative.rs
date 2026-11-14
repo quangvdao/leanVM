@@ -116,7 +116,8 @@ const PI: [F128; 2] = [F128::new(7, 0), F128::new(11, 0)];
 /// A pointer column's words, or any column's values, in the witness.
 fn column(w: &mut Witness, t: usize, c: usize) -> &mut [F64] {
     let p = w.layout.placements[schema().base[t] + c];
-    &mut w.q[p.offset..p.offset + (1 << p.n_vars)]
+    let offset = p.whole();
+    &mut w.q[offset..offset + (1 << p.n_vars)]
 }
 
 fn plan(t: usize) -> Plan {

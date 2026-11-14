@@ -4,7 +4,7 @@ use crate::bytecode::Bytecode;
 use crate::field::{E, GEN, ONE, ZERO};
 use crate::hash::{STATE_LANES, keccak_f};
 use crate::keccak::KeccakShape;
-use crate::multilinear::{Placement, log2_ceil, log2_strict, stack_offsets};
+use crate::multilinear::{Placement, Spot, log2_ceil, log2_strict, stack_offsets};
 use crate::whir::INITIAL_FOLDING_FACTOR;
 use crate::{VerifierError, require};
 use std::collections::BTreeMap;
@@ -559,7 +559,7 @@ fn stacked_blocks(columns: usize) -> Vec<usize> {
 
 /// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
 /// The pointer columns are [`stack_offsets`]'s shared blocks, the opening reading them all at one point.
-fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, u64>, usize) {
+fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
     let blocks = stacked_blocks(kappas.len());
     let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
     let mut pointer = vec![false; kappas.len()];
@@ -608,13 +608,16 @@ pub fn build_layout<'a>(
     let kappas = column_kappas(&tables, log_memory, &table_log_heights);
     let (offsets, stack_log) = stack(&tables, &kappas);
     let placement = |(column, &kappa): (usize, &usize)| {
-        let index = match qkeccak_slot(column) {
-            Some(slot) => offsets[&QKECCAK] + ((slot as u64) << kappa),
-            None => *offsets.get(&column)?,
-        };
-        Some(Placement {
-            variables: kappa,
-            index,
+        Some(match qkeccak_slot(column) {
+            Some(slot) => Placement::whole(kappa, offsets[&QKECCAK].offset + ((slot as u64) << kappa)),
+            None => {
+                let spot = offsets.get(&column)?;
+                Placement {
+                    variables: kappa,
+                    index: spot.offset,
+                    piece_variables: spot.piece,
+                }
+            }
         })
     };
     let placements = kappas.iter().enumerate().map(placement).collect();

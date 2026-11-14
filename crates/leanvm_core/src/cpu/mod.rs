@@ -426,7 +426,7 @@ pub(crate) fn prove_tampered(
     // PCS below in the SAME WHIR as every leanVM point claim: one ring-switched,
     // one appended to the point claims.
     let keccak_reduction = w.keccak_reduction;
-    let witness::Placement { offset, n_vars } = w.layout.placements[QKECCAK];
+    let witness::Placement { offset, n_vars, .. } = w.layout.placements[QKECCAK];
     let q_keccak = &w.q[offset..][..1 << n_vars];
     let openings = crate::stage!("Keccak reduction", || {
         keccak_reduction.prove(&mut ps, q_keccak, &link.output)
@@ -540,7 +540,7 @@ fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::SlotClaim> {
                 };
             }
             pcs::SlotClaim::Point {
-                offset: l.placements[c.col].offset,
+                offset: l.placements[c.col].whole(),
                 low_point: c.point,
                 value: c.value,
             }
