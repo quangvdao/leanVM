@@ -7,7 +7,7 @@
 //! pointer columns, which become point claims and one ring-switched claim.
 
 use super::base::{Base, Block, Weight};
-use super::index::{self, Array, Scatter, Tail, Term};
+use super::index::{self, Array, Scatter, SplitEq, Tail, Term};
 use super::pointer::Chunks;
 use super::row::{self, Coef, RowColumn, RowPoints, RowTable};
 use crate::cpu::{BytecodeColumns, KeccakLane, Layout, MEM_LO, MEM_TOP, keccak_value, schema};
@@ -417,15 +417,11 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
 
         drop(scatter);
         let _tables = tracing::info_span!("Index tables").entered();
-        // The memory and program tables are `g^j` terms past their cells and instructions, and `eq(ζ, ·)` is a
-        // product: each is stored only as far as the array it multiplies reaches, rounded to a power of two.
+        // The memory and program tables are `g^j` terms past their cells and instructions: each is stored only as
+        // far as the array it multiplies reaches, rounded to a power of two. `eq(ζ, ·)` is not stored at all.
         let [w_plus, cover, w_mem, w_bc] = [w_plus, cover, w_mem, w_bc].map(Scatter::into_vec);
         let reach = |own: usize, partner: usize| own.max(partner).max(1).next_power_of_two().min(n);
-        let (mem_len, bc_len, zeta_len) = (
-            reach(1 << log_mem, w_mem.len()),
-            reach(bytecode_size, w_bc.len()),
-            reach(1, cover.len()),
-        );
+        let (mem_len, bc_len) = (reach(1 << log_mem, w_mem.len()), reach(bytecode_size, w_bc.len()));
         let gm = ch.gamma_mem;
         let mem = &columns[MEM_LO..=MEM_TOP];
         let y_mem = tabulate_powers(mem_len, |j, g_j| {
@@ -458,14 +454,6 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             })
             .collect();
         let payload: F192 = firsts.iter().flat_map(|f| f[1..].iter().copied()).sum();
-        let low = zeta_len.trailing_zeros() as usize;
-        let above = below_power(&ch.zeta, low);
-        // SAFETY: the fill writes every entry.
-        let eq_zeta = unsafe {
-            primitives::filled_vec(zeta_len, |out| {
-                primitives::multilinear::fill_eq_table(&ch.zeta[..low], above, out)
-            })
-        };
         drop(_tables);
         base_firsts = firsts;
         let powers = |c: F192| Tail::Powers { c, ratio: F64::G };
@@ -484,11 +472,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 tail: powers(a[1]),
             },
             Array {
-                head: eq_zeta,
-                tail: Tail::Eq {
-                    c: F192::ONE,
-                    point: ch.zeta.clone(),
-                },
+                head: Vec::new(),
+                tail: Tail::Eq(SplitEq::new(F192::ONE, ch.zeta.clone())),
             },
             vec![F192::ONE].into(),
             vec![payload].into(),

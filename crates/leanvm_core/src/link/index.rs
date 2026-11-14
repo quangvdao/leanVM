@@ -40,10 +40,42 @@ pub enum Tail {
         ratio: F64,
     },
     /// `c·eq(point, j)`, the point lowest variable first.
-    Eq {
-        c: F192,
-        point: Vec<F192>,
-    },
+    Eq(SplitEq),
+}
+
+/// `c·eq(point, j)` as the product of two small tables, `eq` of the low half of the point's variables at `j`'s low
+/// bits and `c·eq` of the high half at its high bits, so an array that is all tail costs no memory and no fold.
+#[derive(Clone, Debug)]
+pub struct SplitEq {
+    c: F192,
+    point: Vec<F192>,
+    /// The variables `low` covers.
+    bits: usize,
+    low: Vec<F192>,
+    high: Vec<F192>,
+}
+
+impl SplitEq {
+    pub fn new(c: F192, point: Vec<F192>) -> Self {
+        let bits = point.len().div_ceil(2);
+        let low = primitives::multilinear::eq_table_serial(&point[..bits]);
+        let high = (primitives::multilinear::eq_table_serial(&point[bits..]).into_iter())
+            .map(|e| c * e)
+            .collect();
+        Self {
+            c,
+            point,
+            bits,
+            low,
+            high,
+        }
+    }
+
+    /// The value at `j`, whose bits past the point's are ignored.
+    #[inline(always)]
+    fn at(&self, j: usize) -> F192 {
+        self.low[j & (self.low.len() - 1)] * self.high[(j >> self.bits) & (self.high.len() - 1)]
+    }
 }
 
 impl Tail {
@@ -52,10 +84,7 @@ impl Tail {
         match self {
             Self::Zero => F192::ZERO,
             Self::Powers { c, ratio } => c.mul_base(ratio.pow(j as u128)),
-            Self::Eq { c, point } => point
-                .iter()
-                .enumerate()
-                .fold(*c, |e, (h, &z)| e * if j >> h & 1 == 1 { z } else { F192::ONE + z }),
+            Self::Eq(eq) => eq.at(j),
         }
     }
 
@@ -67,10 +96,10 @@ impl Tail {
                 c: *c * (F192::ONE + x.mul_base(F64::ONE + *ratio)),
                 ratio: ratio.square(),
             },
-            Self::Eq { c, point } => Self::Eq {
-                c: *c * (F192::ONE + point[0] + x),
-                point: point[1..].to_vec(),
-            },
+            Self::Eq(eq) => Self::Eq(SplitEq::new(
+                eq.c * (F192::ONE + eq.point[0] + x),
+                eq.point[1..].to_vec(),
+            )),
         }
     }
 }
@@ -132,6 +161,15 @@ impl View<'_> {
         }
     }
 
+    /// The split `eq` of an array that is all `eq` tail.
+    #[inline(always)]
+    fn split_eq(&self) -> Option<&SplitEq> {
+        match self.tail {
+            Tail::Eq(eq) if self.head.is_empty() && eq.bits > 0 => Some(eq),
+            _ => None,
+        }
+    }
+
     /// The pairs read from the stored entries alone.
     #[inline(always)]
     fn stored_pairs(&self) -> usize {
@@ -139,6 +177,32 @@ impl View<'_> {
             Tail::Zero => self.head.len().div_ceil(2),
             _ => self.head.len() / 2,
         }
+    }
+}
+
+/// A product term's sums over the pairs `k` in `pairs` of `other` and an array that is all `eq` tail: the pairs
+/// that share `j`'s high bits take `eq`'s low table alone, and one product by the high table's entry per run.
+#[inline(always)]
+fn add_eq_product(acc: &mut [F192Unreduced; 3], eq: &SplitEq, other: View, pairs: std::ops::Range<usize>) {
+    let mask = (1 << eq.bits) - 1;
+    let mut k = pairs.start;
+    while k < pairs.end {
+        // `bits ≥ 1` and `offset` is even, so a pair never crosses a run.
+        let j = other.offset + 2 * k;
+        let run = pairs.end.min(k + ((mask + 1) - (j & mask)) / 2);
+        let mut sums = [F192Unreduced::ZERO; 3];
+        for k in k..run {
+            let l = (other.offset + 2 * k) & mask;
+            let (e0, e1, o0, o1) = (eq.low[l], eq.low[l + 1], other.at(2 * k), other.at(2 * k + 1));
+            sums[0] ^= e0.mul_unreduced(o0);
+            sums[1] ^= e1.mul_unreduced(o1);
+            sums[2] ^= (e0 + e1).mul_unreduced(o0 + o1);
+        }
+        let h = eq.high[j >> eq.bits];
+        for (a, s) in acc.iter_mut().zip(sums) {
+            *a ^= s.reduce().mul_unreduced(h);
+        }
+        k = run;
     }
 }
 
@@ -172,8 +236,13 @@ impl Sums {
                 Term::Product { a, b, .. } => {
                     let (a, b) = (arrays[a], arrays[b]);
                     let end = range.end.min(a.len.div_ceil(2)).min(b.len.div_ceil(2)).max(range.start);
-                    let stored = end.min(a.stored_pairs()).min(b.stored_pairs()).max(range.start);
                     let acc = &mut self.products[p];
+                    p += 1;
+                    if let Some((eq, other)) = a.split_eq().map(|e| (e, b)).or_else(|| b.split_eq().map(|e| (e, a))) {
+                        add_eq_product(acc, eq, other, range.start..end);
+                        continue;
+                    }
+                    let stored = end.min(a.stored_pairs()).min(b.stored_pairs()).max(range.start);
                     let (ah, bh) = (a.head, b.head);
                     for k in range.start..stored {
                         let (a0, a1, b0, b1) = (ah[2 * k], at(ah, 2 * k + 1), bh[2 * k], at(bh, 2 * k + 1));
@@ -187,7 +256,6 @@ impl Sums {
                         acc[1] ^= a1.mul_unreduced(b1);
                         acc[2] ^= (a0 + a1).mul_unreduced(b0 + b1);
                     }
-                    p += 1;
                 }
                 Term::Single { a, .. } => {
                     let end = range.end.min(arrays[a].len.div_ceil(2)).max(range.start);
@@ -743,9 +811,9 @@ mod tests {
         let tails = [
             Tail::Zero,
             Tail::Powers { c, ratio },
-            Tail::Eq { c, point: zeta.clone() },
+            Tail::Eq(SplitEq::new(c, zeta.clone())),
         ];
-        let heads = [(0, 300), (1, 64), (2, 32), (1, 1), (0, 51), (2, 2), (0, 1)].map(|(t, len)| {
+        let heads = [(0, 300), (1, 64), (2, 32), (1, 1), (0, 51), (2, 2), (0, 1), (2, 0)].map(|(t, len)| {
             let tail = &tails[t];
             let head: Vec<F192> = (0..len)
                 .map(|j| if j % 7 == 3 { rng.ext() } else { tail.at(j) })
@@ -761,7 +829,7 @@ mod tests {
                 _ => (0..1 << n).map(|j| a.get(j)).collect(),
             })
             .collect();
-        let terms = [(0, 1), (4, 2), (6, 3), (4, 5), (0, 0)]
+        let terms = [(0, 1), (4, 2), (6, 3), (4, 5), (0, 0), (7, 4), (1, 7)]
             .map(|(a, b)| Term::Product { coef: rng.ext(), a, b })
             .into_iter()
             .chain([
