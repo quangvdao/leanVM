@@ -487,7 +487,7 @@ fn table_placeholders(ps: &mut impl FnMut(&str, String)) {
     let form_base = leanvm_core::cpu::xi_form_base();
     ps("ETA_OFFSET", literals(xi_offsets(n_id.iter().copied())));
     ps("ETA_FORM_BASE", form_base.to_string());
-    ps("N_ETA_POWS", leanvm_core::cpu::n_xi_powers().to_string());
+    ps("N_ETA_POWS", bus_era::n_xi_powers().to_string());
     let committed: Vec<usize> = leanvm_core::tables::tables()
         .iter()
         .map(|t| t.n_committed_columns())
@@ -501,9 +501,8 @@ fn table_placeholders(ps: &mut impl FnMut(&str, String)) {
 /// The outer protocol's grinds, each `grinding_bits` of its challenge's numerator as the prover takes it (zero bits
 /// is no nonce): a sumcheck round of degree `d`, eq factor included, then each other challenge the guest grinds for.
 fn grind_placeholders(bus_min_mu: usize, ps: &mut impl FnMut(&str, String)) {
+    use bus_era::{N_BUS_TREES, ROUND_GRIND, bus_grinding_bits, n_xi_powers, y_grind};
     use fiat_shamir::grinding_bits;
-    use leanvm_core::gkr::{ROUND_GRIND, y_grind};
-    use leanvm_core::leaf::{N_BUS_TREES, bus_grinding_bits};
     // The bus grind's bits by the push depth mu, from `bus_min_mu` on. It sends a nonce at every depth the guest
     // admits, which it absorbs with the OOD sample's value.
     assert!(bus_grinding_bits(bus_min_mu) > 0);
@@ -523,10 +522,7 @@ fn grind_placeholders(bus_min_mu: usize, ps: &mut impl FnMut(&str, String)) {
     ps("GKR_Y1_GRIND_BITS", y_grind(1, false).to_string());
     ps("GKR_Y_GRIND_BITS", y_grind(2, false).to_string());
     ps("GKR_Y_LAST_GRIND_BITS", y_grind(2, true).to_string());
-    ps(
-        "XI_GRIND_BITS",
-        grinding_bits(leanvm_core::cpu::n_xi_powers() as u128 - 1).to_string(),
-    );
+    ps("XI_GRIND_BITS", grinding_bits(n_xi_powers() as u128 - 1).to_string());
     let shape = keccak_gkr::Shape::new(leanvm_core::keccak::MIN_STEPS, leanvm_core::keccak::DEPTH);
     // The segment then the lane, 25 lanes in five coordinates.
     ps(
@@ -1035,5 +1031,33 @@ fn signature_placeholders(ps: &mut impl FnMut(&str, String)) {
         ("SP_WOTS_ENC", lean_sphincs::WOTS_ENC),
     ] {
         ps(name, cell(at.with_type(t), 1));
+    }
+}
+
+/// The bus's grinds and sizes, which the guest's verifier still checks and Hotwire's prover no longer has: main's
+/// `leanvm_core::gkr::{ROUND_GRIND, y_grind}`, `leanvm_core::leaf::{N_BUS_TREES, bus_grinding_bits}` and
+/// `leanvm_core::cpu::n_xi_powers` at f5f3672f2.
+mod bus_era {
+    use fiat_shamir::grinding_bits;
+
+    /// The bus's grand products: push, pull, count.
+    pub const N_BUS_TREES: usize = 3;
+
+    /// A GKR sumcheck round: degree four, the eq factor one more.
+    pub const ROUND_GRIND: u32 = grinding_bits(4 + 1);
+
+    /// The grind before a GKR layer's `y`, its `step` coordinates, the last layer's doubled.
+    pub fn y_grind(step: usize, last: bool) -> u32 {
+        grinding_bits((step << usize::from(last)) as u128)
+    }
+
+    /// The bus grind at push depth `mu`.
+    pub fn bus_grinding_bits(mu: usize) -> u32 {
+        grinding_bits(1 << mu)
+    }
+
+    /// The `ξ` powers: the constraint forms, then one per bus tree.
+    pub fn n_xi_powers() -> usize {
+        leanvm_core::cpu::xi_form_base() + N_BUS_TREES
     }
 }

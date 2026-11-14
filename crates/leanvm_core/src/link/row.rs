@@ -1,0 +1,2773 @@
+//! Hotwire's row side: one sum-check over every table's rows, then over the pointer columns.
+//!
+//! The rows are bound lowest variable first, so a round pairs consecutive rows of a table, which are consecutive
+//! executions of its opcode. A table of `2^m` rows takes part from round 1 and is finished after `m` rounds; from
+//! then on its value is multiplied by the all-zeros corner factor `1 + x_h` of each further row variable, once.
+//! The pointer-column variables `q` come last.
+//!
+//! A pointer column `q` of table `F` contributes, at row `u`,
+//!
+//! `c_q(u)·Φ_0(u; r) + c⁺_q(u)·Φ_1(u; r) + ω_F(u)·Σ_i ε_{q,i}·(D_i(u; r_i)·D_i(u; 1 + r_i) + π_{w_i}(r_i))`,
+//!
+//! the column's coefficient `c_q = ω_F·(constant + aux) + act_F·(constant + aux)` times the pointer at the index
+//! point `r`, the cycle pointer's `c⁺_q = α_+·ω_F` times the pointer shifted by one (carry matrices, from Binary
+//! Jolt's precompile link), plus the mirror certificate (the mirror test of Emile Wambsgans), which vanishes on every executed row whose chunks
+//! are one-hot. The certificate reads chunk `i` at the same coordinates `r_i` as the pointer, so the two share
+//! `D_i(r_i)`. Two rows whose chunk agrees make that chunk's factor constant in the round that pairs them, and
+//! leave its certificate term zero: the prover skips both (equal-value skipping), and a chunk that agrees across a
+//! whole folded group keeps a tag saying so.
+//!
+//! Rows from `explicit` on hold the padrow, whose pointer words are zero, so every folded group of them holds the
+//! padrow's values: the prover keeps them as one tail rather than folding them. The coefficients vanish past the
+//! executed rows, so only the pairs up to there are summed, unless a table's base terms reach its padding rows.
+//!
+//! A table's base terms (see [`super::base`]) belong to the pointer-column index `q = 0`: the row rounds add them
+//! like any summand, and the column rounds carry their total `B` as `eq(0, q)·B`.
+
+use super::base::Base;
+use super::pointer::{ChunkEq, Chunks, NO_INDEX, Shifts, SplitEq, chain, eval_chunk, mirror};
+use primitives::bit_fold::fold_sparse_bits;
+use primitives::field::{F128, F128Unreduced};
+
+/// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 10`.
+pub const MAX_COEFFS: usize = 12;
+
+/// No one-hot value: a tag for a chunk that is not one value across its group.
+const MIXED: u8 = u8::MAX;
+
+/// A row past the explicit ones: every chunk [`MIXED`].
+const ALL_MIXED: u64 = u64::MAX;
+
+/// Pairs per task of a round.
+const TASK_PAIRS: usize = 256;
+
+/// Rounds a table's pointer columns stay words, each folded row read as an `eq`-weighted sum over its group of
+/// words, before the prover writes out their values.
+const WORD_ROUNDS: usize = 2;
+
+/// Words in a folded row's group before the values are written out.
+const MAX_GROUP: usize = 1 << (WORD_ROUNDS - 1);
+
+/// A column's slot tables, and each slot's table times each word's fold weight, while the rounds read words.
+type WordTables<'a, 'b> = (&'a [(usize, &'b [F128])], &'a [Vec<F128>]);
+
+/// A table's round sum, set up: [`State::round_setup`].
+struct RoundSetup<'b> {
+    pairs: usize,
+    per_task: usize,
+    tables: Vec<Vec<(usize, &'b [F128])>>,
+    weighted: Vec<Vec<Vec<F128>>>,
+}
+
+/// Chunks of a word, at most.
+const MAX_CHUNKS: usize = 8;
+
+/// A column's coefficient on one of its table's two row weights: `constant`, plus a scale times a linear form of the
+/// table's columns when `aux` names one.
+#[derive(Clone, Copy, Debug)]
+pub struct Coef {
+    pub constant: F128,
+    pub aux: Option<(usize, F128)>,
+}
+
+impl Coef {
+    pub const ZERO: Self = Self {
+        constant: F128::ZERO,
+        aux: None,
+    };
+
+    pub fn constant(constant: F128) -> Self {
+        Self { constant, aux: None }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.constant.is_zero() && self.aux.is_none()
+    }
+}
+
+/// Shifted reads of a pointer column that share a coefficient on `ω_F`: `coef·Σ_s μ_s·Φ_s`, the pointer shifted by
+/// each `s ≥ 1` of `weights = [(s, μ_s)]`.
+#[derive(Clone, Debug)]
+pub struct ShiftGroup {
+    pub coef: Coef,
+    pub weights: Vec<(usize, F128)>,
+}
+
+/// One pointer column, as the row side reads it.
+pub struct RowColumn<'a> {
+    /// The words, one per row of the table.
+    pub words: &'a [u64],
+    /// Each word's index, or [`NO_INDEX`] ([`Chunks::decode_all`]).
+    pub index: Vec<u32>,
+    /// Coefficient on `ω_F` of the pointer itself, `Φ_0`.
+    pub omega: Coef,
+    /// Coefficient on `act_F` of `Φ_0`.
+    pub act: Coef,
+    /// The shifted reads.
+    pub shifts: Vec<ShiftGroup>,
+    /// The certificate's coefficient per chunk.
+    pub cert: Vec<F128>,
+    /// The column's index in the pointer-column rounds.
+    pub q: usize,
+}
+
+/// One table, as the row side reads it.
+pub struct RowTable<'a> {
+    pub log_rows: usize,
+    /// Executed rows, the support of `ω_F` and `act_F`.
+    pub rows: usize,
+    /// Rows from here on hold the padrow.
+    pub explicit: usize,
+    /// `ω_F` on the executed rows.
+    pub omega: Vec<F128>,
+    /// `τ` when `ω_F = θ·eq(τ, ·)` on the executed rows, which lets each round factor `eq(τ_h, X)` out.
+    pub tau: Option<Vec<F128>>,
+    /// The linear forms the coefficients name, each on the explicit rows, and their values on the padrow.
+    pub aux: Vec<Vec<F128>>,
+    pub aux_tail: Vec<F128>,
+    pub columns: Vec<RowColumn<'a>>,
+    /// The table's base terms, at `q = 0`.
+    pub base: Option<Base<'a>>,
+    /// The first round's polynomial of `base`'s `ω` blocks ([`Base::omega_round`]), which that round then adds in
+    /// place of summing them.
+    pub base_first: Option<[F128; 5]>,
+}
+
+/// The functionals the row side evaluates pointers with: `D_i` at the index point `r`, the shift tables there, and
+/// `D_i` at `1 + r` for the certificate.
+pub struct RowPoints {
+    pub eq: ChunkEq,
+    pub bar: ChunkEq,
+    pub shifts: Shifts,
+    /// `π_{w_i}(r_i)` per chunk.
+    pub mirrors: Vec<F128>,
+    /// Per chunk, `D_i(r_i)·D_i(1 + r_i)` over a pair of one-hot values `v ≠ v'` in `X + X²`: entry
+    /// `v·2^{w_i} + v'` is `e_v·ē_{v'} + e_{v'}·ē_v` for the tables `e` at `r_i` and `ē` at `1 + r_i`.
+    pub cert_pairs: Vec<Vec<F128>>,
+    /// `eq(r, ·)` over whole pointers.
+    pub split: SplitEq,
+    /// `Π_i D_i(r_i)` over sets of chunks at one-hot values.
+    clean: CleanEq,
+}
+
+/// Entries of one block of [`CleanEq`], at most.
+const CLEAN_BLOCK: usize = 1 << 13;
+
+/// Blocks of [`CleanEq`], at most.
+const CLEAN_BLOCKS: usize = 4;
+
+/// The products of the chunk tables at one-hot values over any set of chunks: per block of consecutive chunks, a
+/// table over the block's codes, a chunk's code its digit plus one when it is in the set and zero when not, so a
+/// product over chunks whose digits are known is one lookup per block.
+struct CleanEq {
+    /// Per chunk, its block and the place value of its code there.
+    place: [(usize, u32); MAX_CHUNKS],
+    blocks: Vec<Vec<F128>>,
+}
+
+impl CleanEq {
+    fn new(tables: &[Vec<F128>]) -> Self {
+        let mut place = [(0, 0); MAX_CHUNKS];
+        let mut blocks: Vec<Vec<F128>> = vec![vec![F128::ONE]];
+        for (i, table) in tables.iter().enumerate() {
+            let radix = table.len() + 1;
+            if blocks.last().unwrap().len() * radix > CLEAN_BLOCK {
+                blocks.push(vec![F128::ONE]);
+            }
+            let block = blocks.last_mut().unwrap();
+            let stride = block.len();
+            place[i] = (blocks.len() - 1, stride as u32);
+            let block = blocks.last_mut().unwrap();
+            let low = block.clone();
+            block.extend(table.iter().flat_map(|&t| low.iter().map(move |&v| v * t)));
+        }
+        assert!(blocks.len() <= CLEAN_BLOCKS);
+        Self { place, blocks }
+    }
+
+    /// Put chunk `i` at digit `v` into the set `codes`.
+    #[inline(always)]
+    fn add(&self, codes: &mut [u32; CLEAN_BLOCKS], i: usize, v: u8) {
+        let (block, stride) = self.place[i];
+        codes[block] += (u32::from(v) + 1) * stride;
+    }
+
+    /// The product over the set `codes`.
+    #[inline(always)]
+    fn at(&self, codes: &[u32; CLEAN_BLOCKS]) -> F128 {
+        match self.blocks.as_slice() {
+            [a] => a[codes[0] as usize],
+            [a, b] => a[codes[0] as usize] * b[codes[1] as usize],
+            blocks => (blocks.iter().zip(codes)).map(|(b, &c)| b[c as usize]).product(),
+        }
+    }
+}
+
+impl RowPoints {
+    pub fn new(chunks: &Chunks, r: &[F128], max_shift: usize) -> Self {
+        let eq = ChunkEq::at(chunks, r);
+        let bar = ChunkEq::mirrored(chunks, r);
+        let cert_pairs = eq
+            .tables
+            .iter()
+            .zip(&bar.tables)
+            .map(|(e, f)| {
+                let n = e.len();
+                (0..n * n)
+                    .map(|k| {
+                        let (v, w) = (k / n, k % n);
+                        e[v] * f[w] + e[w] * f[v]
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            clean: CleanEq::new(&eq.tables),
+            shifts: Shifts::new(chunks, &eq, max_shift),
+            mirrors: (0..chunks.d()).map(|i| mirror(chunks.part(r, i))).collect(),
+            eq,
+            bar,
+            cert_pairs,
+            split: SplitEq::new(r, max_shift),
+        }
+    }
+
+    /// The layout of a column's values over every shift up to the largest, as the column rounds and the verifier
+    /// read them.
+    pub fn all_shifts(&self, d: usize) -> Slots {
+        Slots::new(d, self.shifts.max_shift, self.shifts.carry)
+    }
+}
+
+/// Where a column's chunk functionals sit among its values: `D_i` at `r` and at `1 + r` (`d` each), then
+/// per shift group chunk 0's table for each carry it passes on, then per later chunk its carry tables.
+#[derive(Clone, Copy, Debug)]
+pub struct Slots {
+    d: usize,
+    groups: usize,
+    carry: usize,
+}
+
+impl Slots {
+    pub fn new(d: usize, groups: usize, carry: usize) -> Self {
+        Self { d, groups, carry }
+    }
+
+    pub fn n_values(&self) -> usize {
+        if self.groups == 0 {
+            2 * self.d
+        } else {
+            self.links(1) + 2 * self.carry * (self.d - 1)
+        }
+    }
+
+    #[inline(always)]
+    fn eq(&self, i: usize) -> usize {
+        i
+    }
+
+    #[inline(always)]
+    fn bar(&self, i: usize) -> usize {
+        self.d + i
+    }
+
+    #[inline(always)]
+    fn start(&self, g: usize, c: usize) -> usize {
+        2 * self.d + g * (self.carry + 1) + c
+    }
+
+    /// The first carry table of chunk `i ≥ 1`; carry `c ≥ 1` in and `out` on is `2·(c − 1) + out` past it.
+    #[inline(always)]
+    fn links(&self, i: usize) -> usize {
+        2 * self.d + self.groups * (self.carry + 1) + (i - 1) * 2 * self.carry
+    }
+
+    #[inline(always)]
+    fn link(&self, i: usize, c: usize, out: usize) -> usize {
+        self.links(i) + 2 * (c - 1) + out
+    }
+
+    /// Slot `k`'s chunk.
+    fn chunk(&self, k: usize) -> usize {
+        let d = self.d;
+        if k < 2 * d {
+            return k % d;
+        }
+        let k = k - 2 * d;
+        let n_starts = self.groups * (self.carry + 1);
+        if k < n_starts {
+            0
+        } else {
+            1 + (k - n_starts) / (2 * self.carry)
+        }
+    }
+
+    /// Slot `k`'s chunk and table, the group starts read from `starts`.
+    #[inline(always)]
+    fn table<'b>(&self, k: usize, points: &'b RowPoints, starts: &'b [Vec<F128>]) -> (usize, &'b [F128]) {
+        let d = self.d;
+        if k < 2 * d {
+            let t = [&points.eq, &points.bar][k / d];
+            return (k % d, &t.tables[k % d]);
+        }
+        let k = k - 2 * d;
+        let n_starts = self.groups * (self.carry + 1);
+        if k < n_starts {
+            return (0, &starts[k]);
+        }
+        let k = k - n_starts;
+        let i = 1 + k / (2 * self.carry);
+        (i, &points.shifts.links[i][k % (2 * self.carry)])
+    }
+}
+
+/// A column at the end of the row rounds: its 64 bit-slices at `χ_F`, and the values they give, laid out by
+/// [`RowPoints::all_shifts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnEnd {
+    pub slices: Vec<F128>,
+    pub values: Vec<F128>,
+}
+
+/// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`, for each column's words under its `eq`, in one dispatch.
+pub fn bit_slices_eq(columns: &[(&[u64], &[F128])]) -> Vec<Vec<F128>> {
+    const BLOCK: usize = TASK_PAIRS * 16;
+    let mut first = Vec::with_capacity(columns.len() + 1);
+    first.push(0);
+    for (words, eq) in columns {
+        first.push(first.last().unwrap() + words.len().min(eq.len()).div_ceil(BLOCK));
+    }
+    let slices = parallel::fold_reduce(
+        *first.last().unwrap(),
+        || vec![[F128::ZERO; 64]; columns.len()],
+        |acc, task| {
+            let c = first.partition_point(|&f| f <= task) - 1;
+            let (words, eq) = columns[c];
+            let start = (task - first[c]) * BLOCK;
+            let end = words.len().min(eq.len()).min(start + BLOCK);
+            let mut slices = [F128::ZERO; 64];
+            fold_sparse_bits(&eq[start..end], &words[start..end], &mut slices);
+            add_into(&mut acc[c], &slices);
+        },
+        |mut a, b| {
+            for (a, b) in a.iter_mut().zip(&b) {
+                add_into(a, b);
+            }
+            a
+        },
+    );
+    slices.into_iter().map(|s| s.to_vec()).collect()
+}
+
+/// A chunk table at a word's 64 bit-slices: the functional is linear in the bits.
+fn from_slices(chunks: &Chunks, slices: &[F128], i: usize, table: &[F128]) -> F128 {
+    let start = chunks.word_shift(i);
+    table.iter().zip(&slices[start..]).map(|(&e, &s)| e * s).sum()
+}
+
+impl ColumnEnd {
+    pub fn from_slices(chunks: &Chunks, points: &RowPoints, slices: Vec<F128>) -> Self {
+        let slots = points.all_shifts(chunks.d());
+        let starts: Vec<Vec<F128>> = (1..=points.shifts.max_shift)
+            .flat_map(|s| points.shifts.start[s].clone())
+            .collect();
+        let values = (0..slots.n_values())
+            .map(|k| {
+                let (i, table) = slots.table(k, points, &starts);
+                from_slices(chunks, &slices, i, table)
+            })
+            .collect();
+        Self { slices, values }
+    }
+}
+
+/// A table's values at the end of the row rounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableEnd {
+    pub omega: F128,
+    pub act: F128,
+    pub aux: Vec<F128>,
+    /// `Π (1 + χ_h)` over the row variables past the table's.
+    pub corner: F128,
+    pub columns: Vec<ColumnEnd>,
+    /// The base terms at `χ_F`, without the corner factor.
+    pub base: F128,
+}
+
+/// What the row side ends at.
+pub struct RowEnd {
+    /// `χ`, one coordinate per row round.
+    pub point: Vec<F128>,
+    /// `q*`, one coordinate per pointer-column round.
+    pub column_point: Vec<F128>,
+    pub tables: Vec<TableEnd>,
+    /// The claim the last round leaves.
+    pub claim: F128,
+}
+
+// ---- small polynomials in coefficient form -------------------------------------
+
+type Poly = [F128; MAX_COEFFS];
+
+/// A round's terms under one weight at a pair, unreduced.
+type Acc = [F128Unreduced; MAX_COEFFS];
+
+/// The most coefficients the base terms under `ω` have at a pair: a gate times a quadratic form.
+const BASE_COEFFS: usize = 4;
+
+/// A certificate's terms at a pair, unreduced: three coefficients.
+type CertAcc = [F128Unreduced; 3];
+
+/// Where a column's terms at a pair go: those under `ω` times `scale` to `omega`, those under `act` to `act`, and the
+/// certificate's, which are under `ω` too but unscaled, to `cert`.
+struct Sums<'s> {
+    omega: &'s mut Acc,
+    act: &'s mut Acc,
+    cert: &'s mut CertAcc,
+    scale: F128,
+}
+
+impl Sums<'_> {
+    fn reborrow(&mut self) -> Sums<'_> {
+        Sums {
+            omega: &mut *self.omega,
+            act: &mut *self.act,
+            cert: &mut *self.cert,
+            scale: self.scale,
+        }
+    }
+}
+
+/// `p ← p·(a + b·X)` for `p` of `len` coefficients; the new length.
+#[inline(always)]
+fn mul_linear(p: &mut Poly, len: usize, a: F128, b: F128) -> usize {
+    p[len] = p[len - 1] * b;
+    for j in (1..len).rev() {
+        p[j] = (p[j].mul_unreduced(a) ^ p[j - 1].mul_unreduced(b)).reduce();
+    }
+    p[0] *= a;
+    len + 1
+}
+
+/// `p ← p·f` for the linear `f` with `f(0) = pair.0`, `f(1) = pair.1`.
+#[inline(always)]
+fn mul_pair(p: &mut Poly, len: usize, pair: (F128, F128)) -> usize {
+    mul_linear(p, len, pair.0, pair.0 + pair.1)
+}
+
+/// `acc ← acc + p·f` for the linear `f` through `pair`; the length of the sum.
+#[inline(always)]
+fn add_mul_pair(acc: &mut Poly, acc_len: usize, p: &Poly, len: usize, pair: (F128, F128)) -> usize {
+    let (a, b) = (pair.0, pair.0 + pair.1);
+    acc[0] += p[0] * a;
+    for j in 1..len {
+        acc[j] += (p[j].mul_unreduced(a) ^ p[j - 1].mul_unreduced(b)).reduce();
+    }
+    acc[len] += p[len - 1] * b;
+    acc_len.max(len + 1)
+}
+
+/// The product of the linear functions through two pairs.
+#[inline(always)]
+fn pair_product(a: (F128, F128), b: (F128, F128)) -> [F128; 3] {
+    let (c0, c2) = (a.0 * b.0, (a.0 + a.1) * (b.0 + b.1));
+    [c0, a.1 * b.1 + c0 + c2, c2]
+}
+
+#[inline(always)]
+fn add_into(acc: &mut [F128], p: &[F128]) {
+    for (o, v) in acc.iter_mut().zip(p) {
+        *o += *v;
+    }
+}
+
+#[inline(always)]
+fn at(v: &[F128], i: usize) -> F128 {
+    v.get(i).copied().unwrap_or(F128::ZERO)
+}
+
+#[inline(always)]
+fn is_zero_pair(p: (F128, F128)) -> bool {
+    p.0.is_zero() && p.1.is_zero()
+}
+
+/// `c(X)·Φ_0(X) + Σ_g c_g(X)·Φ_g(X)` for one column at one pair, added to `acc`: the pointer under its coefficient
+/// and each shift group under its own, each coefficient linear and given by its coefficients. `pair(k)` is value slot `k` at the two rows; with `skip`, a chunk whose
+/// `same(i)` holds is a constant factor `first(i)`.
+///
+/// A group's chain starts at chunk 0 with one state per carry passed on. Once no carry is left, every group's value
+/// and the pointer's share the remaining factors `Π D_i`, which the skip then shortens. The pointer's term under the
+/// act weight has no shift groups: it is its coefficient times all the factors, one product after the chain.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn pointer_pair(
+    acc: &mut Acc,
+    slots: &Slots,
+    coef: &[F128],
+    groups: &[[F128; 2]],
+    act: Option<(&mut Acc, &[F128])>,
+    skip: bool,
+    (clean, digit): (&CleanEq, impl Fn(usize) -> Option<u8>),
+    same: impl Fn(usize) -> bool,
+    first: impl Fn(usize) -> F128,
+    pair: impl Fn(usize) -> (F128, F128),
+) {
+    let d = slots.d;
+    let mut p = [F128::ZERO; MAX_COEFFS];
+    // A zero coefficient (the cycle pointer's) starts the chain empty.
+    let mut len = if coef.iter().all(|c| c.is_zero()) {
+        0
+    } else {
+        coef.len()
+    };
+    p[..len].copy_from_slice(&coef[..len]);
+    // The factors `D_i` as `a + b·X`: the chain's chunks first (for the act term), then the remaining ones.
+    let mut factors = [(F128::ZERO, F128::ZERO); MAX_CHUNKS];
+    let mut start = 0;
+    let live = groups.iter().any(|g| g.iter().any(|c| !c.is_zero()));
+    if live {
+        let e = pair(slots.eq(0));
+        factors[0] = (e.0, e.0 + e.1);
+        if len > 0 {
+            len = mul_pair(&mut p, len, e);
+        }
+        // The carry states after chunk `start - 1`, carry `c` at `c - 1`, and whether any is nonzero.
+        let mut carries = [[F128::ZERO; MAX_COEFFS]; 4];
+        let mut carry_len = [0usize; 4];
+        for (g, gc) in groups.iter().enumerate() {
+            if gc.iter().all(|c| c.is_zero()) {
+                continue;
+            }
+            let mut gp = [F128::ZERO; MAX_COEFFS];
+            gp[..2].copy_from_slice(gc);
+            for c in 0..=slots.carry {
+                let e = pair(slots.start(g, c));
+                if is_zero_pair(e) {
+                    continue;
+                }
+                if c == 0 {
+                    len = add_mul_pair(&mut p, len, &gp, 2, e);
+                } else {
+                    carry_len[c - 1] = add_mul_pair(&mut carries[c - 1], carry_len[c - 1], &gp, 2, e);
+                }
+            }
+        }
+        start = 1;
+        while start < d && carry_len.iter().any(|&l| l > 0) {
+            let i = start;
+            let e = pair(slots.eq(i));
+            factors[i] = (e.0, e.0 + e.1);
+            if len > 0 {
+                len = mul_pair(&mut p, len, e);
+            }
+            let mut out = [F128::ZERO; MAX_COEFFS];
+            let mut out_len = 0;
+            for c in 1..=slots.carry {
+                if carry_len[c - 1] == 0 {
+                    continue;
+                }
+                let (y, y_len) = (&carries[c - 1], carry_len[c - 1]);
+                let e0 = pair(slots.link(i, c, 0));
+                if !is_zero_pair(e0) {
+                    len = add_mul_pair(&mut p, len, y, y_len, e0);
+                }
+                let e1 = pair(slots.link(i, c, 1));
+                if !is_zero_pair(e1) {
+                    out_len = add_mul_pair(&mut out, out_len, y, y_len, e1);
+                }
+            }
+            carry_len = [0; 4];
+            carries[0] = out;
+            carry_len[0] = out_len;
+            start += 1;
+        }
+    }
+    let p_live = !p[..len].iter().all(|c| c.is_zero());
+    let act = act.filter(|(_, c)| !c.iter().all(|c| c.is_zero()));
+    if !p_live && act.is_none() {
+        return;
+    }
+    // The remaining factors: one lookup for the chunks constant at one-hot values, one product for the rest.
+    let mut codes = [0u32; CLEAN_BLOCKS];
+    let mut n = start;
+    for i in start..d {
+        if let Some(v) = digit(i) {
+            clean.add(&mut codes, i, v);
+        } else {
+            factors[n] = if skip && same(i) {
+                (first(i), F128::ZERO)
+            } else {
+                let (a, b) = pair(slots.eq(i));
+                (a, a + b)
+            };
+            n += 1;
+        }
+    }
+    let s = clean.at(&codes);
+    if p_live {
+        let t = product(&factors[start..n]);
+        add_tail(acc, &p[..len], s, &t[..n - start + 1]);
+    }
+    if let Some((act_acc, c)) = act {
+        let t = product(&factors[..n]);
+        add_scaled(act_acc, s, c, &t[..n + 1]);
+    }
+}
+
+/// `acc ← acc + s·p·t`.
+#[inline(always)]
+fn add_tail(acc: &mut Acc, p: &[F128], s: F128, t: &[F128]) {
+    for (i, &c) in p.iter().enumerate() {
+        let c = s * c;
+        for (o, &v) in acc[i..].iter_mut().zip(t) {
+            *o ^= c.mul_unreduced(v);
+        }
+    }
+}
+
+/// `acc ← acc + c·f` for `c` of one or two coefficients and the linear `f` through `pair`.
+#[inline(always)]
+fn add_times_pair(acc: &mut Acc, c: &[F128], pair: (F128, F128)) {
+    let (a, b) = (pair.0, pair.0 + pair.1);
+    acc[0] ^= c[0].mul_unreduced(a);
+    acc[1] ^= c[0].mul_unreduced(b);
+    if c.len() == 2 && !c[1].is_zero() {
+        acc[1] ^= c[1].mul_unreduced(a);
+        acc[2] ^= c[1].mul_unreduced(b);
+    }
+}
+
+/// [`pointer_pair`] when at most one chunk differs across the pair's words: the pointer and every shifted chain are
+/// then linear in `X`, through their values `phi` and `shifted(g)` at the two rows.
+#[inline(always)]
+fn linear_pointer(
+    acc: &mut Acc,
+    coef: &[F128],
+    groups: &[[F128; 2]],
+    act: Option<(&mut Acc, &[F128])>,
+    phi: (F128, F128),
+    shifted: impl Fn(usize) -> (F128, F128),
+) {
+    add_times_pair(acc, coef, phi);
+    for (g, gc) in groups.iter().enumerate() {
+        if !(gc[0].is_zero() && gc[1].is_zero()) {
+            add_times_pair(acc, gc, shifted(g));
+        }
+    }
+    if let Some((act_acc, c)) = act {
+        add_times_pair(act_acc, c, phi);
+    }
+}
+
+/// `at` of each word of a group by its index, folded by the bound challenges `r`, the first for adjacent words.
+#[inline(always)]
+fn fold_words(index: &[u32], r: &[F128], at: impl Fn(usize) -> F128) -> F128 {
+    let mut values = [F128::ZERO; MAX_GROUP];
+    for (v, &x) in values.iter_mut().zip(index) {
+        *v = at(x as usize);
+    }
+    let mut len = index.len();
+    for &x in r {
+        len /= 2;
+        for t in 0..len {
+            let (a, b) = (values[2 * t], values[2 * t + 1]);
+            values[t] = if a == b { a } else { a + x * (a + b) };
+        }
+    }
+    values[0]
+}
+
+/// `Σ_i ε_i·(D_i(r_i)·D_i(1 + r_i) + π_i)(X)` for one column at one pair, added to `acc`, from the bar slots, which
+/// hold `ε_i·D_i(1 + r_i)` (see [`Column::bars`]), and `ε_i·π_i` in `cert_mirrors`. With `skip`, a chunk that is one
+/// one-hot value at both rows (`clean`) adds zero, one one-hot at both rows (`one_hot`) adds `b·b̄·(X + X²)`, and one
+/// whose values agree (`same`) a constant.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn cert_pair(
+    acc: &mut CertAcc,
+    slots: &Slots,
+    cert: &[F128],
+    cert_mirrors: &[F128],
+    skip: bool,
+    clean: impl Fn(usize) -> bool,
+    one_hot: impl Fn(usize) -> bool,
+    same: impl Fn(usize) -> bool,
+    pair: impl Fn(usize) -> (F128, F128),
+) {
+    let mut m = [F128Unreduced::ZERO; 3];
+    let mut constant = F128::ZERO;
+    for i in 0..slots.d {
+        if (skip && clean(i)) || cert[i].is_zero() {
+            continue;
+        }
+        let (x, y) = (pair(slots.eq(i)), pair(slots.bar(i)));
+        if skip && one_hot(i) {
+            let t = (x.0 + x.1).mul_unreduced(y.0 + y.1);
+            m[1] ^= t;
+            m[2] ^= t;
+        } else if skip && same(i) {
+            m[0] ^= x.0.mul_unreduced(y.0);
+            constant += cert_mirrors[i];
+        } else {
+            add_pair_product(&mut m, x, y);
+            constant += cert_mirrors[i];
+        }
+    }
+    add_cert(acc, m, constant);
+}
+
+/// `acc ← acc + m + constant`, `m` of three coefficients.
+#[inline(always)]
+fn add_cert(acc: &mut CertAcc, m: [F128Unreduced; 3], constant: F128) {
+    acc[0] ^= m[0] ^ F128Unreduced::from(constant);
+    acc[1] ^= m[1];
+    acc[2] ^= m[2];
+}
+
+/// How a chunk stands at a pair of rows, for [`plain_terms`].
+#[derive(Clone, Copy)]
+enum ChunkPair {
+    /// One one-hot value at both rows.
+    Constant(u8),
+    /// One-hot values `a` at the first row and `b ≠ a` at the second.
+    OneHot(u8, u8),
+    /// `D_i` and the scaled `D̄_i` at the two rows.
+    Values((F128, F128), (F128, F128)),
+}
+
+/// The product of two linear factors `a + b·X`, by Karatsuba.
+#[inline(always)]
+fn quad(f: (F128, F128), g: (F128, F128)) -> [F128; 3] {
+    let c0 = f.0.mul_unreduced(g.0);
+    let c2 = f.1.mul_unreduced(g.1);
+    let m = (f.0 + f.1).mul_unreduced(g.0 + g.1);
+    [c0.reduce(), (m ^ c0 ^ c2).reduce(), c2.reduce()]
+}
+
+/// `out ← p·q` for `p` of `P` and `q` of `Q` coefficients.
+#[inline(always)]
+fn conv<const P: usize, const Q: usize>(p: &[F128], q: &[F128], out: &mut [F128]) {
+    let mut u = [F128Unreduced::ZERO; MAX_CHUNKS + 1];
+    for i in 0..P {
+        for j in 0..Q {
+            u[i + j] ^= p[i].mul_unreduced(q[j]);
+        }
+    }
+    for (o, v) in out[..P + Q - 1].iter_mut().zip(u) {
+        *o = v.reduce();
+    }
+}
+
+/// The product of three linear factors.
+#[inline(always)]
+fn cubic(f: &[(F128, F128)]) -> [F128; 4] {
+    let mut out = [F128::ZERO; 4];
+    conv::<3, 2>(&quad(f[0], f[1]), &[f[2].0, f[2].1], &mut out);
+    out
+}
+
+/// The product of the linear factors `a + b·X` in `f`, as a balanced tree; its length is `f.len() + 1`.
+#[inline(always)]
+fn product(f: &[(F128, F128)]) -> [F128; MAX_CHUNKS + 1] {
+    let mut out = [F128::ZERO; MAX_CHUNKS + 1];
+    match f.len() {
+        0 => out[0] = F128::ONE,
+        1 => (out[0], out[1]) = f[0],
+        2 => out[..3].copy_from_slice(&quad(f[0], f[1])),
+        3 => out[..4].copy_from_slice(&cubic(f)),
+        4 => conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut out),
+        5 => conv::<3, 4>(&quad(f[0], f[1]), &cubic(&f[2..]), &mut out),
+        6 => conv::<4, 4>(&cubic(f), &cubic(&f[3..]), &mut out),
+        7 => {
+            let mut four = [F128::ZERO; 5];
+            conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut four);
+            conv::<5, 4>(&four, &cubic(&f[4..]), &mut out)
+        }
+        _ => {
+            let mut four = [[F128::ZERO; 5]; 2];
+            for (o, f) in four.iter_mut().zip(f.chunks(4)) {
+                conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), o);
+            }
+            conv::<5, 5>(&four[0], &four[1], &mut out)
+        }
+    }
+    out
+}
+
+/// `acc ← acc + s·c·p` for `c` of one or two coefficients.
+#[inline(always)]
+fn add_scaled(acc: &mut Acc, s: F128, c: &[F128], p: &[F128]) {
+    let t0 = s * c[0];
+    for (o, &v) in acc.iter_mut().zip(p) {
+        *o ^= t0.mul_unreduced(v);
+    }
+    if c.len() == 2 && !c[1].is_zero() {
+        let t1 = s * c[1];
+        for (o, &v) in acc[1..].iter_mut().zip(p) {
+            *o ^= t1.mul_unreduced(v);
+        }
+    }
+}
+
+/// [`Column::add_terms`] for a column without shift groups, from how each of its chunks stands at the pair:
+/// `c(X)·Φ_0(X)` under each weight and the certificate under `ω`. The chunks that stand constant at one-hot values
+/// give one lookup in [`CleanEq`], the rest one product of linear factors, which both weights share.
+#[inline(always)]
+fn plain_terms(
+    column: &Column,
+    aux: &[(F128, F128)],
+    points: &RowPoints,
+    widths: &[usize],
+    sums: Sums<'_>,
+    chunk: impl Fn(usize) -> ChunkPair,
+) {
+    let mut codes = [0u32; CLEAN_BLOCKS];
+    let mut factors = [(F128::ZERO, F128::ZERO); MAX_CHUNKS];
+    let mut n = 0;
+    let mut m = [F128Unreduced::ZERO; 3];
+    let mut constant = F128::ZERO;
+    for (i, &eps) in column.cert.iter().enumerate() {
+        match chunk(i) {
+            ChunkPair::Constant(v) => points.clean.add(&mut codes, i, v),
+            ChunkPair::OneHot(a, b) => {
+                let t = &points.eq.tables[i];
+                let (x0, x1) = (t[usize::from(a)], t[usize::from(b)]);
+                factors[n] = (x0, x0 + x1);
+                n += 1;
+                if !eps.is_zero() {
+                    let c = eps.mul_unreduced(points.cert_pairs[i][(usize::from(a) << widths[i]) + usize::from(b)]);
+                    m[1] ^= c;
+                    m[2] ^= c;
+                }
+            }
+            ChunkPair::Values(x, y) => {
+                factors[n] = (x.0, x.0 + x.1);
+                n += 1;
+                if !eps.is_zero() {
+                    add_pair_product(&mut m, x, y);
+                    constant += column.cert_mirrors[i];
+                }
+            }
+        }
+    }
+    add_cert(sums.cert, m, constant);
+    let (coef, len) = coef_linear(column.omega, aux);
+    let live = !(coef[0].is_zero() && coef[1].is_zero());
+    if !live && column.act.is_zero() {
+        return;
+    }
+    let s = points.clean.at(&codes);
+    let p = product(&factors[..n]);
+    let p = &p[..n + 1];
+    if live {
+        add_scaled(sums.omega, s * sums.scale, &coef[..len], p);
+    }
+    if !column.act.is_zero() {
+        let (c, len) = coef_linear(column.act, aux);
+        add_scaled(sums.act, s, &c[..len], p);
+    }
+}
+
+/// `m ← m + x(X)·y(X)` for the linear `x`, `y` through their pairs, by Karatsuba.
+#[inline(always)]
+fn add_pair_product(m: &mut [F128Unreduced; 3], x: (F128, F128), y: (F128, F128)) {
+    let c0 = x.0.mul_unreduced(y.0);
+    let c2 = (x.0 + x.1).mul_unreduced(y.0 + y.1);
+    m[0] ^= c0;
+    m[1] ^= x.1.mul_unreduced(y.1) ^ c0 ^ c2;
+    m[2] ^= c2;
+}
+
+/// `ω(X)·m(X)` added to `acc`, `m` of three coefficients.
+#[inline(always)]
+fn add_weighted(acc: &mut Poly, omega: (F128, F128), m: [F128; 3]) {
+    let (w0, w1) = (omega.0, omega.0 + omega.1);
+    acc[0] += w0 * m[0];
+    acc[1] += w0 * m[1] + w1 * m[0];
+    acc[2] += w0 * m[2] + w1 * m[1];
+    acc[3] += w1 * m[2];
+}
+
+/// A coefficient at a pair of rows, `constant + aux(X)`, by its coefficients in `X`: one when it is constant.
+#[inline(always)]
+fn coef_linear(c: Coef, aux: &[(F128, F128)]) -> ([F128; 2], usize) {
+    match c.aux {
+        None => ([c.constant, F128::ZERO], 1),
+        Some((a, s)) => {
+            let (a0, a1) = aux[a];
+            let lo = c.constant + s * a0;
+            ([lo, s * (a0 + a1)], 2)
+        }
+    }
+}
+
+/// The summand at one bound point from a column's values laid out by `slots`: `c·Φ_0 + Σ_g c_g·Φ_g +
+/// Σ_i e_i·(D_i(r_i)·D_i(1 + r_i) + π_i)`.
+pub fn summand(slots: &Slots, mirrors: &[F128], coef: F128, groups: &[F128], values: &[F128], certs: &[F128]) -> F128 {
+    let d = slots.d;
+    let pointer: F128 = (0..d).map(|i| values[slots.eq(i)]).product();
+    let shifted: F128 = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_zero())
+        .map(|(g, &c)| {
+            let start: Vec<F128> = (0..=slots.carry).map(|k| values[slots.start(g, k)]).collect();
+            c * chain(
+                &start,
+                d,
+                |i| values[slots.eq(i)],
+                |i, k, out| values[slots.link(i, k, out)],
+            )
+        })
+        .sum();
+    let cert: F128 = (0..d)
+        .map(|i| certs[i] * (values[slots.eq(i)] * values[slots.bar(i)] + mirrors[i]))
+        .sum();
+    coef * pointer + shifted + cert
+}
+
+// ---- per-table state ----------------------------------------------------------------
+
+/// Where a column's slots sit in a stored row: chunk by chunk, so that a row whose chunks from some `p` on all hold
+/// one-hot values stores only the slots of chunks `0..p` and reads the rest from the tables at its digits.
+struct Layout {
+    /// The tag bytes of the chunks.
+    chunk_bytes: u64,
+    /// Per slot, its chunk.
+    chunk: Vec<u8>,
+    /// Per slot, its place in a stored row.
+    place: Vec<u16>,
+    /// Per place in a stored row, its slot.
+    order: Vec<u16>,
+    /// At `p`, how many values a row stores when it stores chunks `0..p`.
+    stored: [usize; MAX_CHUNKS + 1],
+}
+
+impl Layout {
+    fn new(slots: &Slots) -> Self {
+        let n = slots.n_values();
+        let d = slots.d;
+        let chunk: Vec<u8> = (0..n).map(|k| slots.chunk(k) as u8).collect();
+        let mut order: Vec<u16> = (0..n as u16).collect();
+        order.sort_by_key(|&k| chunk[usize::from(k)]);
+        let mut place = vec![0u16; n];
+        for (j, &k) in order.iter().enumerate() {
+            place[usize::from(k)] = j as u16;
+        }
+        let mut stored = [0; MAX_CHUNKS + 1];
+        for p in 0..=d {
+            stored[p] = chunk.iter().filter(|&&c| usize::from(c) < p).count();
+        }
+        for o in &mut stored[d + 1..] {
+            *o = n;
+        }
+        Self {
+            chunk_bytes: u64::MAX >> (8 * (MAX_CHUNKS - d)),
+            chunk,
+            place,
+            order,
+            stored,
+        }
+    }
+
+    /// How many values a row with tags `t` stores: the slots of every chunk up to its last [`MIXED`] one.
+    #[inline(always)]
+    fn stored_len(&self, t: u64) -> usize {
+        const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        let x = !t;
+        // The high bit of each chunk's byte of `t` that is MIXED.
+        let mixed = !(((x & LOW) + LOW) | x) & !LOW & self.chunk_bytes;
+        self.stored[(64 - mixed.leading_zeros() as usize) / 8]
+    }
+
+    /// A row's value at `slot`: stored, or the slot's table at the chunk's one-hot digit.
+    #[inline(always)]
+    fn read(&self, row: RowView, tables: &[(usize, &[F128])], slot: usize) -> F128 {
+        debug_assert!(slot < self.place.len() && tables.len() == self.place.len());
+        // SAFETY: `slot` is one of the layout's slots, as `tables` has one entry per slot; a stored place is below
+        // the row's length; an unstored chunk's tag is its one-hot digit, below its table's length.
+        unsafe {
+            let j = usize::from(*self.place.get_unchecked(slot));
+            if j < row.values.len() {
+                *row.values.get_unchecked(j)
+            } else {
+                let c = usize::from(*self.chunk.get_unchecked(slot));
+                let table = tables.get_unchecked(slot).1;
+                let v = usize::from((row.tags >> (8 * c)) as u8);
+                debug_assert!(v < table.len());
+                *table.get_unchecked(v)
+            }
+        }
+    }
+}
+
+/// A row of a column's folded values: what it stores, laid out by its [`Layout`], and its tags.
+#[derive(Clone, Copy)]
+struct RowView<'b> {
+    values: &'b [F128],
+    tags: u64,
+}
+
+/// A column's folded values: each explicit row stores its first [`Layout::stored_len`] values, one row after another,
+/// and the tail row past them stores every slot.
+struct Sparse {
+    data: Vec<F128>,
+    /// Where each explicit row starts in `data`, and the end.
+    offsets: Vec<u32>,
+    tail: Vec<F128>,
+}
+
+impl Sparse {
+    #[inline(always)]
+    fn row(&self, k: usize) -> &[F128] {
+        match (self.offsets.get(k), self.offsets.get(k + 1)) {
+            (Some(&a), Some(&b)) => &self.data[a as usize..b as usize],
+            _ => &self.tail,
+        }
+    }
+}
+
+/// Every column's `len` new rows as [`Sparse`] values and tags: `tag(c, k)` is row `k`'s tags in column `c`, and
+/// `fill(c, rows, tags, values)` writes the stored values of column `c`'s `rows`, with tags `tags`, one row after
+/// another. Two dispatches cover every column.
+fn fill_sparse(
+    layouts: &[&Layout],
+    len: usize,
+    tag: impl Fn(usize, usize) -> u64 + Sync,
+    fill: impl Fn(usize, std::ops::Range<usize>, &[u64], &mut [F128]) + Sync,
+) -> Vec<(Sparse, Vec<u64>)> {
+    let per_column = len.div_ceil(TASK_PAIRS);
+    let tasks = layouts.len() * per_column;
+    let rows = |task: usize| {
+        let start = task % per_column * TASK_PAIRS;
+        start..len.min(start + TASK_PAIRS)
+    };
+    // SAFETY: the first dispatch writes every tag and offset past the first, the second every stored value.
+    let mut tags: Vec<Vec<u64>> = layouts.iter().map(|_| unsafe { primitives::uninit_vec(len) }).collect();
+    let mut offsets: Vec<Vec<u32>> = layouts
+        .iter()
+        .map(|_| unsafe { primitives::uninit_vec(len + 1) })
+        .collect();
+    let mut sizes = vec![0usize; tasks];
+    {
+        let tag_ptrs: Vec<_> = tags.iter_mut().map(|t| parallel::SendPtr(t.as_mut_ptr())).collect();
+        let offset_ptrs: Vec<_> = offsets.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
+        let size_ptr = [parallel::SendPtr(sizes.as_mut_ptr())];
+        parallel::for_each(tasks, |task| {
+            let (c, rows) = (task / per_column, rows(task));
+            let (t, o) = (tag_ptrs[c].0, offset_ptrs[c].0);
+            let mut size = 0usize;
+            for k in rows {
+                let v = tag(c, k);
+                size += layouts[c].stored_len(v);
+                // SAFETY: row `k` is this task's, inside column `c`'s `len` rows; its offset is relative to the
+                // task's first row until the second dispatch adds the task's start.
+                unsafe {
+                    *t.add(k) = v;
+                    *o.add(k + 1) = size as u32;
+                }
+            }
+            // SAFETY: each task writes its own size.
+            unsafe { *size_ptr[0].0.add(task) = size };
+        });
+    }
+    // Each task's first value in its column, and each column's length.
+    let mut starts = vec![0usize; tasks];
+    let mut totals = vec![0usize; layouts.len()];
+    for c in 0..layouts.len() {
+        let mut at = 0;
+        for task in c * per_column..(c + 1) * per_column {
+            starts[task] = at;
+            at += sizes[task];
+        }
+        assert!(at < u32::MAX as usize, "a column's stored values fit their offsets");
+        totals[c] = at;
+        offsets[c][0] = 0;
+    }
+    // SAFETY: the second dispatch writes every stored value.
+    let mut data: Vec<Vec<F128>> = totals.iter().map(|&n| unsafe { primitives::uninit_vec(n) }).collect();
+    {
+        let data_ptrs: Vec<_> = data.iter_mut().map(|v| parallel::SendPtr(v.as_mut_ptr())).collect();
+        let offset_ptrs: Vec<_> = offsets.iter_mut().map(|o| parallel::SendPtr(o.as_mut_ptr())).collect();
+        let tags = &tags;
+        parallel::for_each(tasks, |task| {
+            let (c, rows) = (task / per_column, rows(task));
+            let start = starts[task];
+            // SAFETY: this task's rows and their values are its own, inside column `c`'s.
+            unsafe {
+                let o = offset_ptrs[c].0;
+                for k in rows.clone() {
+                    *o.add(k + 1) += start as u32;
+                }
+                let values = std::slice::from_raw_parts_mut(data_ptrs[c].0.add(start), sizes[task]);
+                fill(c, rows.clone(), &tags[c][rows], values);
+            }
+        });
+    }
+    (data.into_iter().zip(offsets).zip(tags).zip(layouts))
+        .map(|(((data, offsets), tags), layout)| {
+            let tail = vec![F128::ZERO; layout.order.len()];
+            (Sparse { data, offsets, tail }, tags)
+        })
+        .collect()
+}
+
+/// Values in rows of `stride`, explicit on a prefix and one tail row after it.
+struct Strided {
+    data: Vec<F128>,
+    tail: Vec<F128>,
+    stride: usize,
+}
+
+impl Strided {
+    #[inline(always)]
+    fn row(&self, k: usize) -> &[F128] {
+        let s = self.stride;
+        self.data.get(k * s..(k + 1) * s).unwrap_or(&self.tail)
+    }
+
+    /// Bind the lowest variable at `x`: `len` explicit rows after.
+    fn fold(&self, len: usize, x: F128) -> Vec<F128> {
+        let s = self.stride;
+        if s == 0 {
+            return Vec::new();
+        }
+        // SAFETY: every row writes each of its `s` values.
+        unsafe {
+            primitives::filled_vec(len * s, |out| {
+                parallel::chunks_mut(out, s * TASK_PAIRS, |task, chunk| {
+                    for (j, row) in chunk.chunks_mut(s).enumerate() {
+                        let k = task * TASK_PAIRS + j;
+                        let (lo, hi) = (self.row(2 * k), self.row(2 * k + 1));
+                        for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
+                            *o = if a == b { a } else { a + x * (a + b) };
+                        }
+                    }
+                });
+            })
+        }
+    }
+}
+
+/// Per chunk, its bits when every word of `group` holds the same ones.
+#[inline(always)]
+fn uniform_chunks(chunks: &Chunks, group: &[u64]) -> [Option<u64>; MAX_CHUNKS] {
+    let mut out = [None; MAX_CHUNKS];
+    for (i, o) in out.iter_mut().enumerate().take(chunks.d()) {
+        let b = chunks.bits(group[0], i);
+        if group[1..].iter().all(|&u| chunks.bits(u, i) == b) {
+            *o = Some(b);
+        }
+    }
+    out
+}
+
+/// Chunk `i`'s `table` at a folded row: its values on the words of `group` folded by the bound challenges `r`, the
+/// first for adjacent words. One lookup when the chunk is `uniform` across the group, and no product for a pair of
+/// equal values.
+#[inline(always)]
+fn group_value(chunks: &Chunks, table: &[F128], i: usize, group: &[u64], uniform: Option<u64>, r: &[F128]) -> F128 {
+    if uniform.is_some() {
+        return eval_chunk(chunks, table, group[0], i);
+    }
+    let mut values = [F128::ZERO; MAX_GROUP];
+    let mut len = group.len() / 2;
+    for (v, pair) in values[..len].iter_mut().zip(group.chunks_exact(2)) {
+        let a = eval_chunk(chunks, table, pair[0], i);
+        *v = if chunks.bits(pair[0], i) == chunks.bits(pair[1], i) {
+            a
+        } else {
+            a + r[0] * (a + eval_chunk(chunks, table, pair[1], i))
+        };
+    }
+    for &x in &r[1..] {
+        len /= 2;
+        for t in 0..len {
+            let (a, b) = (values[2 * t], values[2 * t + 1]);
+            values[t] = if a == b { a } else { a + x * (a + b) };
+        }
+    }
+    values[0]
+}
+
+/// The weights the bound challenges `r` fold a group of words by, the first for adjacent words: word `t`'s is
+/// `Π_j r_j` over the bits `j` set in `t` times `Π_j (1 + r_j)` over the others.
+fn fold_weights(r: &[F128]) -> Vec<F128> {
+    let mut weights = vec![F128::ONE];
+    for &x in r {
+        let low: Vec<F128> = weights.iter().map(|&w| w * (F128::ONE + x)).collect();
+        weights = low.into_iter().chain(weights.iter().map(|&w| w * x)).collect();
+    }
+    weights
+}
+
+/// Each slot's table times each word's fold weight in turn, `weights.len()` copies of the table.
+fn weighted_tables(tables: &[(usize, &[F128])], weights: &[F128]) -> Vec<Vec<F128>> {
+    tables
+        .iter()
+        .map(|&(_, table)| {
+            weights
+                .iter()
+                .flat_map(|&w| table.iter().map(move |&v| w * v))
+                .collect()
+        })
+        .collect()
+}
+
+/// [`group_value`] as a sum of lookups: each word's value read from `weighted`, the table times that word's fold
+/// weight from [`weighted_tables`], so a group costs no product.
+#[inline(always)]
+fn weighted_value(
+    chunks: &Chunks,
+    table: &[F128],
+    weighted: &[F128],
+    i: usize,
+    group: &[u64],
+    uniform: Option<u64>,
+) -> F128 {
+    if uniform.is_some() {
+        return eval_chunk(chunks, table, group[0], i);
+    }
+    let len = table.len();
+    group
+        .iter()
+        .zip(weighted.chunks_exact(len))
+        .fold(F128::ZERO, |sum, (&u, w)| sum + eval_chunk(chunks, w, u, i))
+}
+
+/// Row `k`'s tags, chunk `i` in byte `i`.
+#[inline(always)]
+fn row_tags(tags: &[u64], k: usize) -> u64 {
+    tags.get(k).copied().unwrap_or(ALL_MIXED)
+}
+
+/// The tags of a folded pair: each chunk's tag where the two rows agree, [`MIXED`] where they differ.
+#[inline(always)]
+fn fold_tags(a: u64, b: u64) -> u64 {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let x = a ^ b;
+    let differs = (((x & LOW) + LOW) | x) & !LOW;
+    a | ((differs >> 7) * 0xff)
+}
+
+/// A pointer column: its words, and after round 1 per row its chunk functionals laid out by `slots`, and per chunk a
+/// tag, the one-hot value the whole folded group holds or [`MIXED`], packed one byte a chunk.
+struct Column<'a> {
+    words: &'a [u64],
+    slots: Slots,
+    /// Chunk 0's table per group and carry passed on, in slot order.
+    starts: Vec<Vec<F128>>,
+    /// Per group, its low tables in [`SplitEq`].
+    split_starts: Vec<Vec<Vec<F128>>>,
+    /// Each word's index, or [`NO_INDEX`], while the rounds read words.
+    index: Vec<u32>,
+    /// Where its slots sit in a stored row.
+    layout: Layout,
+    values: Option<Sparse>,
+    tags: Vec<u64>,
+    omega: Coef,
+    act: Coef,
+    shifts: Vec<ShiftGroup>,
+    cert: Vec<F128>,
+    /// Per chunk, `D_i` at `1 + r` times the chunk's certificate weight `ε_i` (one when `ε_i` is zero), so a pair's
+    /// certificate term is one product of its two slots; [`State::end`] divides the weight back out.
+    bars: Vec<Vec<F128>>,
+    /// `ε_i·π_i` per chunk.
+    cert_mirrors: Vec<F128>,
+    q: usize,
+}
+
+/// A chunk's certificate weight as [`Column::bars`] scales its table by.
+fn bar_scale(eps: F128) -> F128 {
+    if eps.is_zero() { F128::ONE } else { eps }
+}
+
+impl<'a> Column<'a> {
+    fn new(column: RowColumn<'a>, chunks: &Chunks, points: &RowPoints) -> Self {
+        let slots = Slots::new(chunks.d(), column.shifts.len(), points.shifts.carry);
+        let starts = column
+            .shifts
+            .iter()
+            .flat_map(|g| {
+                assert!(
+                    g.weights
+                        .iter()
+                        .all(|&(s, _)| (1..=points.shifts.max_shift).contains(&s))
+                );
+                points.shifts.combined_start(&g.weights)
+            })
+            .collect();
+        let split_starts = column
+            .shifts
+            .iter()
+            .map(|g| points.split.shifted_tables(&g.weights))
+            .collect();
+        let words = column.words;
+        assert_eq!(column.index.len(), words.len(), "an index per word");
+        Self {
+            words,
+            slots,
+            starts,
+            split_starts,
+            index: column.index,
+            layout: Layout::new(&slots),
+            values: None,
+            tags: Vec::new(),
+            omega: column.omega,
+            act: column.act,
+            shifts: column.shifts,
+            bars: (points.bar.tables.iter().zip(&column.cert))
+                .map(|(t, &e)| t.iter().map(|&v| bar_scale(e) * v).collect())
+                .collect(),
+            cert_mirrors: column.cert.iter().zip(&points.mirrors).map(|(&e, &m)| e * m).collect(),
+            cert: column.cert,
+            q: column.q,
+        }
+    }
+
+    /// Every slot's table and chunk, in slot order.
+    fn tables<'b>(&'b self, points: &'b RowPoints) -> Vec<(usize, &'b [F128])> {
+        let d = self.slots.d;
+        (0..self.slots.n_values())
+            .map(|k| match k.checked_sub(d) {
+                Some(i) if i < d => (i, self.bars[i].as_slice()),
+                _ => self.slots.table(k, points, &self.starts),
+            })
+            .collect()
+    }
+
+    /// Row `k`'s tags after the word rounds, its group of `n` words `k·n..(k + 1)·n`: per chunk its digit where the
+    /// whole group holds one one-hot value there, [`MIXED`] elsewhere.
+    #[inline(always)]
+    fn materialize_tag(&self, n: usize, k: usize, chunks: &Chunks) -> u64 {
+        let mut t = ALL_MIXED;
+        match self.group_sigmas(n, k) {
+            Some((sigmas, diff)) => {
+                for i in 0..chunks.d() {
+                    if chunks.digit(diff, i) == 0 {
+                        t ^= u64::from(MIXED ^ chunks.digit(sigmas[0] as usize, i) as u8) << (8 * i);
+                    }
+                }
+            }
+            None => {
+                let group = self.group_words(n, k);
+                let uniform = uniform_chunks(chunks, &group[..n]);
+                for (i, u) in uniform.iter().enumerate().take(chunks.d()) {
+                    if let Some(b) = u.filter(|b| b.is_power_of_two()) {
+                        t ^= u64::from(MIXED ^ b.trailing_zeros() as u8) << (8 * i);
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// Row `k`'s group of `n` indices and the bits where they differ, when every word of the group is one-hot.
+    #[inline(always)]
+    fn group_sigmas(&self, n: usize, k: usize) -> Option<([u32; 2 * MAX_GROUP], usize)> {
+        let mut sigmas = [0u32; 2 * MAX_GROUP];
+        for (o, s) in sigmas[..n].iter_mut().enumerate() {
+            *s = self.index.get(k * n + o).copied().unwrap_or(NO_INDEX);
+        }
+        if sigmas[..n].contains(&NO_INDEX) {
+            return None;
+        }
+        let diff = sigmas[..n].iter().fold(0, |d, &s| d | (s ^ sigmas[0])) as usize;
+        Some((sigmas, diff))
+    }
+
+    /// Row `k`'s group of `n` words.
+    #[inline(always)]
+    fn group_words(&self, n: usize, k: usize) -> [u64; 2 * MAX_GROUP] {
+        let mut group = [0u64; 2 * MAX_GROUP];
+        for (o, u) in group[..n].iter_mut().enumerate() {
+            *u = self.words.get(k * n + o).copied().unwrap_or(0);
+        }
+        group
+    }
+
+    /// The stored values of rows `rows` after the word rounds, one row after another, each its group of `n` words
+    /// folded by the bound challenges, with `tables` from [`Self::tables`] and `weighted` from [`weighted_tables`].
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_rows(
+        &self,
+        tables: &[(usize, &[F128])],
+        weighted: &[Vec<F128>],
+        n: usize,
+        rows: std::ops::Range<usize>,
+        tags: &[u64],
+        mut values: &mut [F128],
+        chunks: &Chunks,
+    ) {
+        let layout = &self.layout;
+        for (&t, k) in tags.iter().zip(rows) {
+            let len = layout.stored_len(t);
+            let (row, rest) = values.split_at_mut(len);
+            values = rest;
+            let order = &layout.order[..len];
+            // Every word one-hot: a chunk is uniform where its digit agrees across the group's indices.
+            if let Some((sigmas, diff)) = self.group_sigmas(n, k) {
+                let sigmas = &sigmas[..n];
+                let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
+                for (o, &slot) in row.iter_mut().zip(order) {
+                    let (i, table) = tables[usize::from(slot)];
+                    *o = if chunks.digit(diff, i) == 0 {
+                        table[digit(sigmas[0], i)]
+                    } else {
+                        let (len, weighted) = (table.len(), &weighted[usize::from(slot)]);
+                        (sigmas.iter().enumerate())
+                            .fold(F128::ZERO, |sum, (t, &s)| sum + weighted[t * len + digit(s, i)])
+                    };
+                }
+                continue;
+            }
+            let group = self.group_words(n, k);
+            let group = &group[..n];
+            let uniform = uniform_chunks(chunks, group);
+            for (o, &slot) in row.iter_mut().zip(order) {
+                let (i, table) = tables[usize::from(slot)];
+                *o = weighted_value(chunks, table, &weighted[usize::from(slot)], i, group, uniform[i]);
+            }
+        }
+    }
+
+    /// The stored values of rows `rows`, with tags `tags`, one row after another, with the lowest variable bound at
+    /// `x`, and `tables` from [`Self::tables`] for the chunks a row reads from its digits.
+    fn fold_rows(
+        &self,
+        tables: &[(usize, &[F128])],
+        rows: std::ops::Range<usize>,
+        tags: &[u64],
+        mut values: &mut [F128],
+        x: F128,
+    ) {
+        let layout = &self.layout;
+        for (&t, k) in tags.iter().zip(rows) {
+            let len = layout.stored_len(t);
+            let (row, rest) = values.split_at_mut(len);
+            values = rest;
+            let (lo, hi) = (self.view(2 * k), self.view(2 * k + 1));
+            let (lo_len, hi_len) = (lo.values.len(), hi.values.len());
+            for (j, o) in row.iter_mut().enumerate() {
+                let a = if j < lo_len {
+                    lo.values[j]
+                } else {
+                    layout.read(lo, tables, usize::from(layout.order[j]))
+                };
+                let b = if j < hi_len {
+                    hi.values[j]
+                } else {
+                    layout.read(hi, tables, usize::from(layout.order[j]))
+                };
+                *o = if a == b { a } else { a + x * (a + b) };
+            }
+        }
+    }
+
+    /// Row `k` of the folded values: what it stores and its tags.
+    #[inline(always)]
+    fn view(&self, k: usize) -> RowView<'_> {
+        let values = self.values.as_ref().expect("the values are written out");
+        RowView {
+            values: values.row(k),
+            tags: row_tags(&self.tags, k),
+        }
+    }
+
+    /// Row `k`'s value at every slot, in slot order.
+    fn dense_row(&self, k: usize, points: &RowPoints) -> Vec<F128> {
+        let tables = self.tables(points);
+        let row = self.view(k);
+        (0..self.slots.n_values())
+            .map(|slot| self.layout.read(row, &tables, slot))
+            .collect()
+    }
+
+    fn set_values(&mut self, values: Sparse, tags: Vec<u64>) {
+        self.values = Some(values);
+        self.tags = tags;
+    }
+
+    /// Add the column's terms at a pair to `sums`, each without its weight: the pointer's under `ω`, its
+    /// coefficients times `sums.scale`, to `omega`, and under `act` to `act`. `pointer(acc, coef, groups)` adds a
+    /// pointer term, `cert(acc)` the certificate's, unscaled.
+    #[inline(always)]
+    fn add_terms(
+        &self,
+        aux: &[(F128, F128)],
+        sums: Sums<'_>,
+        pointer: impl FnOnce(&mut Acc, &[F128], &[[F128; 2]], Option<(&mut Acc, &[F128])>),
+        cert: impl FnOnce(&mut CertAcc),
+    ) {
+        let scale = sums.scale;
+        let scaled = |c: Coef| {
+            let (mut v, len) = coef_linear(c, aux);
+            for x in &mut v[..len] {
+                *x *= scale;
+            }
+            (v, len)
+        };
+        let mut groups = [[F128::ZERO; 2]; 4];
+        for (o, g) in groups.iter_mut().zip(&self.shifts) {
+            *o = scaled(g.coef).0;
+        }
+        let (coef, len) = if self.omega.is_zero() {
+            ([F128::ZERO; 2], 1)
+        } else {
+            scaled(self.omega)
+        };
+        let (act_coef, act_len) = coef_linear(self.act, aux);
+        let act = (!self.act.is_zero()).then_some((sums.act, &act_coef[..act_len]));
+        pointer(sums.omega, &coef[..len], &groups[..self.shifts.len()], act);
+        cert(sums.cert);
+    }
+
+    /// The coefficient of `Φ_0`, of each shift `s` (at `s - 1`), and the certificate weights at a table's end, times
+    /// its corner factor.
+    fn end_coefs(&self, end: &TableEnd, max_shift: usize) -> (F128, Vec<F128>, Vec<F128>) {
+        let weight = |c: Coef| c.constant + c.aux.map_or(F128::ZERO, |(a, s)| s * end.aux[a]);
+        let coef = end.corner * (end.omega * weight(self.omega) + end.act * weight(self.act));
+        let mut shifts = vec![F128::ZERO; max_shift];
+        for g in &self.shifts {
+            let c = end.corner * end.omega * weight(g.coef);
+            for &(s, mu) in &g.weights {
+                shifts[s - 1] += c * mu;
+            }
+        }
+        let certs = self.cert.iter().map(|&e| end.corner * end.omega * e).collect();
+        (coef, shifts, certs)
+    }
+}
+
+struct State<'a> {
+    log_rows: usize,
+    /// Support of `ω` and `act`.
+    support: usize,
+    /// Explicit rows.
+    explicit: usize,
+    omega: Vec<F128>,
+    act: Vec<F128>,
+    /// `ω`'s point, when it is `θ·eq(τ, ·)` on the executed rows.
+    tau: Option<Vec<F128>>,
+    /// Rows whose whole group of rows is executed: there `act` is one and `ω` is `eq`'s.
+    full: usize,
+    aux: Strided,
+    columns: Vec<Column<'a>>,
+    /// The table's row variables.
+    m: usize,
+    /// The row challenges bound while the pointer columns are still words.
+    bound: Vec<F128>,
+    /// The table's value once its rows are bound, and the corner factor since.
+    done: Option<(F128, F128)>,
+    base: Option<Base<'a>>,
+    /// [`RowTable::base_first`], until the first round.
+    base_first: Option<[F128; 5]>,
+    /// Whether a column has a term under `act_F`.
+    any_act: bool,
+}
+
+impl<'a> State<'a> {
+    fn new(table: RowTable<'a>, chunks: &Chunks, points: &RowPoints) -> Self {
+        assert!(table.rows <= table.explicit && table.explicit <= 1 << table.log_rows);
+        assert_eq!(table.omega.len(), table.rows);
+        assert!(
+            table.columns.iter().all(|c| c.shifts.len() <= 4),
+            "at most four shift groups a column"
+        );
+        let stride = table.aux.len();
+        // SAFETY: every row writes each of its `stride` values.
+        let data = unsafe {
+            primitives::filled_vec(table.explicit * stride, |data| {
+                if stride > 0 {
+                    parallel::chunks_mut(data, stride * TASK_PAIRS * 16, |task, chunk| {
+                        for (j, row) in chunk.chunks_mut(stride).enumerate() {
+                            let u = task * TASK_PAIRS * 16 + j;
+                            for (o, a) in row.iter_mut().zip(&table.aux) {
+                                *o = a[u];
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        let aux = Strided {
+            data,
+            tail: table.aux_tail,
+            stride: table.aux.len(),
+        };
+        let mut state = Self {
+            log_rows: table.log_rows,
+            m: table.log_rows,
+            support: table.rows,
+            explicit: table.explicit,
+            omega: table.omega,
+            act: vec![F128::ONE; table.rows],
+            tau: table.tau,
+            full: table.rows,
+            aux,
+            columns: table
+                .columns
+                .into_iter()
+                .map(|c| Column::new(c, chunks, points))
+                .collect(),
+            bound: Vec::new(),
+            done: None,
+            base: table.base,
+            base_first: table.base_first.filter(|_| table.log_rows > 0),
+            any_act: false,
+        };
+        state.any_act = state.columns.iter().any(|c| !c.act.is_zero());
+        if state.log_rows == 0 {
+            // One row: its values are the table's end from the start.
+            state.materialize(1, chunks, points);
+            if let Some(base) = &mut state.base {
+                base.fold(1, F128::ZERO);
+            }
+            state.finish(points);
+        }
+        state
+    }
+
+    /// Write out every column's values and tags at `len` folded rows, from its words and the bound challenges.
+    fn materialize(&mut self, len: usize, chunks: &Chunks, points: &RowPoints) {
+        let tables: Vec<_> = self.columns.iter().map(|c| c.tables(points)).collect();
+        let weights = fold_weights(&self.bound);
+        let weighted: Vec<_> = tables.iter().map(|t| weighted_tables(t, &weights)).collect();
+        let (columns, n) = (&self.columns, weights.len());
+        let layouts: Vec<&Layout> = columns.iter().map(|c| &c.layout).collect();
+        let out = fill_sparse(
+            &layouts,
+            len,
+            |c, k| columns[c].materialize_tag(n, k, chunks),
+            |c, rows, tags, values| {
+                columns[c].materialize_rows(&tables[c], &weighted[c], n, rows, tags, values, chunks);
+            },
+        );
+        drop(tables);
+        for (column, (values, tags)) in self.columns.iter_mut().zip(out) {
+            column.set_values(values, tags);
+            column.index = Vec::new();
+        }
+    }
+
+    /// Rows bound: the table's value at its end.
+    fn finish(&mut self, points: &RowPoints) {
+        let end = self.end(F128::ONE, points);
+        let weight = |c: Coef| c.constant + c.aux.map_or(F128::ZERO, |(a, s)| s * end.aux[a]);
+        let value: F128 = self
+            .columns
+            .iter()
+            .zip(&end.columns)
+            .map(|(column, values)| {
+                let coef = end.omega * weight(column.omega) + end.act * weight(column.act);
+                let groups: Vec<F128> = column.shifts.iter().map(|g| end.omega * weight(g.coef)).collect();
+                let certs: Vec<F128> = column.cert.iter().map(|&e| end.omega * e).collect();
+                summand(&column.slots, &points.mirrors, coef, &groups, &values.values, &certs)
+            })
+            .sum();
+        self.done = Some((value + end.base, F128::ONE));
+    }
+
+    #[inline(always)]
+    fn aux_pair(&self, k: usize) -> [(F128, F128); 4] {
+        let mut out = [(F128::ZERO, F128::ZERO); 4];
+        let (lo, hi) = (self.aux.row(2 * k), self.aux.row(2 * k + 1));
+        for (o, (&a, &b)) in out.iter_mut().zip(lo.iter().zip(hi)) {
+            *o = (a, b);
+        }
+        out
+    }
+
+    /// What every task of this round's sum shares: the columns' tables and the pairs each task takes.
+    fn round_setup<'b>(&'b self, points: &'b RowPoints) -> RoundSetup<'b> {
+        let pairs = if self.base.as_ref().is_some_and(Base::on_padding) {
+            self.explicit.div_ceil(2)
+        } else {
+            self.support.div_ceil(2)
+        };
+        let tables: Vec<Vec<(usize, &[F128])>> = self.columns.iter().map(|c| c.tables(points)).collect();
+        // While the columns are words, each slot's table times each word's fold weight.
+        let weights = fold_weights(&self.bound);
+        let weighted = (self.columns.iter().zip(&tables))
+            .map(|(c, t)| {
+                if c.values.is_none() && weights.len() > 1 {
+                    weighted_tables(t, &weights)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        // A small round still spreads over the workers.
+        let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
+        RoundSetup {
+            pairs,
+            per_task,
+            tables,
+            weighted,
+        }
+    }
+
+    /// One task's share of the round polynomial over this table's pairs, added to `acc`.
+    fn round_task(
+        &self,
+        setup: &RoundSetup,
+        task: usize,
+        chunks: &Chunks,
+        points: &RowPoints,
+        skip: bool,
+        acc: &mut Poly,
+    ) {
+        let RoundSetup {
+            pairs,
+            per_task,
+            ref tables,
+            ref weighted,
+        } = *setup;
+        // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
+        // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
+        // `eq(τ_h, X)` multiplies their sum once per task. The columns' terms take that scale through their
+        // coefficients, so only the base and certificate terms, a few coefficients, are scaled per pair.
+        let (whole, tau) = match &self.tau {
+            Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
+            None => (0, F128::ZERO),
+        };
+        let len = (chunks.d() + 2).max(4);
+        let mut factored = [F128Unreduced::ZERO; MAX_COEFFS];
+        let mut under_one = [F128Unreduced::ZERO; MAX_COEFFS];
+        let range = task * per_task..pairs.min((task + 1) * per_task);
+        for k in range.clone() {
+            let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
+            // The base terms under `ω`, reduced: at most `BASE_COEFFS` coefficients.
+            let mut under_omega = [F128::ZERO; MAX_COEFFS];
+            if let Some(base) = &self.base {
+                let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
+                if with_omega || base.on_padding() {
+                    base.pair(k, with_omega, &mut under_omega, acc);
+                }
+            }
+            if is_zero_pair(omega) && 2 * k >= self.act.len() {
+                continue;
+            }
+            let act = (at(&self.act, 2 * k), at(&self.act, 2 * k + 1));
+            let aux = self.aux_pair(k);
+            let mut cert = [F128Unreduced::ZERO; 3];
+            let add_columns = |sums: &mut Sums| {
+                for ((column, tables), weighted) in self.columns.iter().zip(tables).zip(weighted) {
+                    let words = (tables.as_slice(), weighted.as_slice());
+                    let sums = sums.reborrow();
+                    match &column.values {
+                        None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
+                        Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, skip, sums),
+                    }
+                }
+            };
+            if k < whole {
+                // The columns scale their terms under `ω` by `ω_0 + ω_1` and add them to `factored` and those under
+                // `act` to `under_one`; the base and certificate terms take the scale here.
+                let scale = omega.0 + omega.1;
+                add_columns(&mut Sums {
+                    omega: &mut factored,
+                    act: &mut under_one,
+                    cert: &mut cert,
+                    scale,
+                });
+                for (o, c) in under_omega.iter_mut().zip(&cert) {
+                    *o += c.reduce();
+                }
+                debug_assert!(under_omega[BASE_COEFFS..].iter().all(|c| c.is_zero()));
+                for (f, &v) in factored.iter_mut().zip(&under_omega[..BASE_COEFFS]) {
+                    *f ^= scale.mul_unreduced(v);
+                }
+            } else {
+                let (mut cols_omega, mut cols_act) =
+                    ([F128Unreduced::ZERO; MAX_COEFFS], [F128Unreduced::ZERO; MAX_COEFFS]);
+                add_columns(&mut Sums {
+                    omega: &mut cols_omega,
+                    act: &mut cols_act,
+                    cert: &mut cert,
+                    scale: F128::ONE,
+                });
+                for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
+                    *o += c.reduce();
+                }
+                for (o, c) in under_omega.iter_mut().zip(&cert) {
+                    *o += c.reduce();
+                }
+                add_mul_pair(acc, 0, &under_omega, len, omega);
+                if self.any_act {
+                    let under_act = cols_act.map(F128Unreduced::reduce);
+                    add_mul_pair(acc, 0, &under_act, len, act);
+                }
+            }
+        }
+        if range.start < whole {
+            let factored = factored.map(F128Unreduced::reduce);
+            add_mul_pair(acc, 0, &factored, len, (F128::ONE + tau, tau));
+            add_into(acc, &under_one.map(F128Unreduced::reduce)[..len]);
+        }
+    }
+
+    /// The first rounds: the pair `(2k, 2k + 1)` straight from the words, each folded row its group of words folded
+    /// by the bound challenges `r`.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_words(
+        column: &Column,
+        (tables, weighted): WordTables<'_, '_>,
+        r: &[F128],
+        k: usize,
+        aux: &[(F128, F128)],
+        chunks: &Chunks,
+        points: &RowPoints,
+        skip: bool,
+        mut sums: Sums<'_>,
+    ) {
+        let n = 1 << r.len();
+        if skip {
+            let sums = sums.reborrow();
+            let done = match n {
+                1 => Self::try_indices::<1>(column, (tables, weighted), r, k, aux, chunks, points, sums),
+                2 => Self::try_indices::<2>(column, (tables, weighted), r, k, aux, chunks, points, sums),
+                _ => false,
+            };
+            if done {
+                return;
+            }
+        }
+        let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
+        let (mut lo, mut hi) = ([0u64; MAX_GROUP], [0u64; MAX_GROUP]);
+        for t in 0..n {
+            lo[t] = word(2 * k * n + t);
+            hi[t] = word((2 * k + 1) * n + t);
+        }
+        let (lo, hi) = (&lo[..n], &hi[..n]);
+        let (lo_bits, hi_bits) = (uniform_chunks(chunks, lo), uniform_chunks(chunks, hi));
+        let same = |i: usize| lo_bits[i].is_some() && lo_bits[i] == hi_bits[i];
+        let one_hot =
+            |i: usize| lo_bits[i].is_some_and(u64::is_power_of_two) && hi_bits[i].is_some_and(u64::is_power_of_two);
+        let pair = |slot: usize| {
+            let (i, table) = tables[slot];
+            (
+                group_value(chunks, table, i, lo, lo_bits[i], r),
+                group_value(chunks, table, i, hi, hi_bits[i], r),
+            )
+        };
+        let slots = &column.slots;
+        column.add_terms(
+            aux,
+            sums,
+            |acc, coef, groups, act| {
+                pointer_pair(
+                    acc,
+                    slots,
+                    coef,
+                    groups,
+                    act,
+                    skip,
+                    (&points.clean, |i| {
+                        let b = lo_bits[i].filter(|b| skip && same(i) && b.is_power_of_two());
+                        b.map(|b| b.trailing_zeros() as u8)
+                    }),
+                    same,
+                    |i| points.eq.eval(chunks, lo[0], i),
+                    pair,
+                )
+            },
+            |acc| {
+                cert_pair(
+                    acc,
+                    slots,
+                    &column.cert,
+                    &column.cert_mirrors,
+                    skip,
+                    |i| same(i) && lo_bits[i].is_some_and(u64::is_power_of_two),
+                    one_hot,
+                    same,
+                    pair,
+                )
+            },
+        );
+    }
+
+    /// [`Self::pair_indices`] on the pair `k` of groups of `N` words when every word's chunks are one-hot; whether it
+    /// was.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn try_indices<const N: usize>(
+        column: &Column,
+        tables: WordTables<'_, '_>,
+        r: &[F128],
+        k: usize,
+        aux: &[(F128, F128)],
+        chunks: &Chunks,
+        points: &RowPoints,
+        sums: Sums<'_>,
+    ) -> bool {
+        let index = |u: usize| column.index.get(u).copied().unwrap_or(NO_INDEX);
+        let sigmas: [[u32; N]; 2] = [0, 1].map(|side| std::array::from_fn(|t| index((2 * k + side) * N + t)));
+        if sigmas.iter().any(|s| s.contains(&NO_INDEX)) {
+            return false;
+        }
+        Self::pair_indices::<N>(column, tables, r, sigmas, aux, chunks, points, sums);
+        true
+    }
+
+    /// [`Self::pair_words`] when every word's chunks are one-hot, from the words' indices, `sigmas[0]` for the
+    /// first row's group and `sigmas[1]` for the second's: a chunk
+    /// whose digit agrees across them is constant and its certificate term zero, and a pointer with at most one
+    /// varying chunk is linear in `X`.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_indices<const N: usize>(
+        column: &Column,
+        (tables, weighted): WordTables<'_, '_>,
+        r: &[F128],
+        sigmas: [[u32; N]; 2],
+        aux: &[(F128, F128)],
+        chunks: &Chunks,
+        points: &RowPoints,
+        sums: Sums<'_>,
+    ) {
+        let (lo, hi) = (&sigmas[0], &sigmas[1]);
+        let (mut lo_diff, mut hi_diff) = (0, 0);
+        for (&a, &b) in lo.iter().zip(hi) {
+            lo_diff |= a ^ lo[0];
+            hi_diff |= b ^ hi[0];
+        }
+        let diff = lo_diff | hi_diff | (lo[0] ^ hi[0]);
+        let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
+        let varying = chunks.varying(diff);
+        // Slot `slot`'s value at a folded row of `side`: one lookup when its chunk's digit agrees across the side,
+        // else each word's lookup in the weighted tables.
+        let value = |slot: usize, side: &[u32], side_diff: u32| {
+            let (i, table) = tables[slot];
+            if digit(side_diff, i) == 0 {
+                return table[digit(side[0], i)];
+            }
+            let len = table.len();
+            (side.iter().enumerate()).fold(F128::ZERO, |sum, (t, &sigma)| {
+                sum + weighted[slot][t * len + digit(sigma, i)]
+            })
+        };
+        let pair = |slot: usize| (value(slot, lo, lo_diff), value(slot, hi, hi_diff));
+        let slots = &column.slots;
+        if column.shifts.is_empty() && (N > 1 || varying.count_ones() > 1) {
+            let chunk = |i: usize| {
+                let v = |sigma: u32| digit(sigma, i) as u8;
+                if varying >> i & 1 == 0 {
+                    ChunkPair::Constant(v(lo[0]))
+                } else if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
+                    ChunkPair::OneHot(v(lo[0]), v(hi[0]))
+                } else {
+                    ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i)))
+                }
+            };
+            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
+        }
+        column.add_terms(
+            aux,
+            sums,
+            |acc, coef, groups, act| {
+                if varying.count_ones() <= 1 {
+                    let at = |sigma| points.split.at(sigma);
+                    linear_pointer(
+                        acc,
+                        coef,
+                        groups,
+                        act,
+                        (fold_words(lo, r, at), fold_words(hi, r, at)),
+                        |g| {
+                            let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
+                            (fold_words(lo, r, at), fold_words(hi, r, at))
+                        },
+                    )
+                } else {
+                    pointer_pair(
+                        acc,
+                        slots,
+                        coef,
+                        groups,
+                        act,
+                        true,
+                        (&points.clean, |i| {
+                            (varying >> i & 1 == 0).then(|| digit(lo[0], i) as u8)
+                        }),
+                        |_| false,
+                        |_| F128::ZERO,
+                        pair,
+                    )
+                }
+            },
+            |acc| {
+                let mut m = [F128Unreduced::ZERO; 3];
+                let mut constant = F128::ZERO;
+                let mut rest = varying;
+                while rest != 0 {
+                    let i = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let eps = column.cert[i];
+                    if eps.is_zero() {
+                        continue;
+                    }
+                    if digit(lo_diff, i) == 0 && digit(hi_diff, i) == 0 {
+                        let t = eps.mul_unreduced(
+                            points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)],
+                        );
+                        m[1] ^= t;
+                        m[2] ^= t;
+                    } else {
+                        add_pair_product(&mut m, pair(slots.eq(i)), pair(slots.bar(i)));
+                        constant += column.cert_mirrors[i];
+                    }
+                }
+                add_cert(acc, m, constant);
+            },
+        );
+    }
+
+    /// Later rounds: the pair `(2k, 2k + 1)` of the folded columns.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn pair_folded(
+        column: &Column,
+        tables: &[(usize, &[F128])],
+        k: usize,
+        aux: &[(F128, F128)],
+        points: &RowPoints,
+        chunks: &Chunks,
+        skip: bool,
+        sums: Sums<'_>,
+    ) {
+        let slots = &column.slots;
+        let (lo_row, hi_row) = (column.view(2 * k), column.view(2 * k + 1));
+        let read = |row: RowView, slot: usize| column.layout.read(row, tables, slot);
+        let pair = |slot: usize| (read(lo_row, slot), read(hi_row, slot));
+        let (lo_tags, hi_tags) = (lo_row.tags, hi_row.tags);
+        if skip && column.shifts.is_empty() {
+            let chunk = |i: usize| {
+                let (a, b) = ((lo_tags >> (8 * i)) as u8, (hi_tags >> (8 * i)) as u8);
+                match (a, b) {
+                    (MIXED, _) | (_, MIXED) => ChunkPair::Values(pair(slots.eq(i)), pair(slots.bar(i))),
+                    _ if a == b => ChunkPair::Constant(a),
+                    _ => ChunkPair::OneHot(a, b),
+                }
+            };
+            return plain_terms(column, aux, points, &chunks.widths, sums, chunk);
+        }
+        let clean = |i: usize| {
+            let t = (lo_tags >> (8 * i)) as u8;
+            t != MIXED && t == (hi_tags >> (8 * i)) as u8
+        };
+        let same = |i: usize| {
+            let (e, b) = (pair(slots.eq(i)), pair(slots.bar(i)));
+            e.0 == e.1 && b.0 == b.1
+        };
+        column.add_terms(
+            aux,
+            sums,
+            |acc, coef, groups, act| {
+                let digit = |i: usize| {
+                    let t = (lo_tags >> (8 * i)) as u8;
+                    (skip && t != MIXED && t == (hi_tags >> (8 * i)) as u8).then_some(t)
+                };
+                let same = |i: usize| {
+                    let e = pair(i);
+                    e.0 == e.1
+                };
+                let first = |i: usize| read(lo_row, i);
+                pointer_pair(
+                    acc,
+                    slots,
+                    coef,
+                    groups,
+                    act,
+                    skip,
+                    (&points.clean, digit),
+                    same,
+                    first,
+                    pair,
+                )
+            },
+            |acc| {
+                cert_pair(
+                    acc,
+                    slots,
+                    &column.cert,
+                    &column.cert_mirrors,
+                    skip,
+                    clean,
+                    |_| false,
+                    same,
+                    pair,
+                )
+            },
+        );
+    }
+
+    /// Bind the lowest row variable at `x`.
+    fn fold(&mut self, x: F128, chunks: &Chunks, points: &RowPoints) {
+        let support = self.support.div_ceil(2);
+        let explicit = self.explicit.div_ceil(2);
+        let fold_vec = |v: &[F128], len: usize| -> Vec<F128> {
+            // SAFETY: every entry is written.
+            unsafe {
+                primitives::filled_vec(len, |out| {
+                    parallel::chunks_mut(out, TASK_PAIRS * 16, |task, chunk| {
+                        for (j, o) in chunk.iter_mut().enumerate() {
+                            let k = task * TASK_PAIRS * 16 + j;
+                            let (a, b) = (at(v, 2 * k), at(v, 2 * k + 1));
+                            *o = a + x * (a + b);
+                        }
+                    });
+                })
+            }
+        };
+        self.omega = fold_vec(&self.omega, support);
+        self.act = fold_vec(&self.act, support);
+        self.aux.data = self.aux.fold(explicit, x);
+        if let Some(base) = &mut self.base {
+            base.fold(explicit, x);
+        }
+        self.base_first = None;
+        let words = self.columns.first().is_some_and(|c| c.values.is_none());
+        if words {
+            self.bound.push(x);
+        }
+        if !words {
+            let columns = &self.columns;
+            let tables: Vec<_> = columns.iter().map(|c| c.tables(points)).collect();
+            let layouts: Vec<&Layout> = columns.iter().map(|c| &c.layout).collect();
+            let out = fill_sparse(
+                &layouts,
+                explicit,
+                |c, k| fold_tags(row_tags(&columns[c].tags, 2 * k), row_tags(&columns[c].tags, 2 * k + 1)),
+                |c, rows, tags, values| columns[c].fold_rows(&tables[c], rows, tags, values, x),
+            );
+            drop(tables);
+            for (column, (values, tags)) in self.columns.iter_mut().zip(out) {
+                column.set_values(values, tags);
+            }
+        } else if self.bound.len() == WORD_ROUNDS || self.log_rows == 1 {
+            self.materialize(explicit, chunks, points);
+        }
+        self.support = support;
+        self.explicit = explicit;
+        self.full /= 2;
+        self.log_rows -= 1;
+        if self.log_rows == 0 {
+            self.finish(points);
+        }
+    }
+
+    fn end(&self, corner: F128, points: &RowPoints) -> TableEnd {
+        TableEnd {
+            omega: at(&self.omega, 0),
+            act: at(&self.act, 0),
+            aux: self.aux.row(0).to_vec(),
+            corner,
+            columns: self
+                .columns
+                .iter()
+                .map(|c| {
+                    let mut values = if c.values.is_some() {
+                        c.dense_row(0, points)
+                    } else {
+                        Vec::new()
+                    };
+                    let d = c.slots.d;
+                    for (v, &e) in values.iter_mut().skip(d).take(d).zip(&c.cert) {
+                        *v *= bar_scale(e).inv();
+                    }
+                    ColumnEnd {
+                        slices: Vec::new(),
+                        values,
+                    }
+                })
+                .collect(),
+            base: self.base.as_ref().map_or(F128::ZERO, |b| b.end(at(&self.omega, 0))),
+        }
+    }
+}
+
+/// One column in the pointer-column rounds: its coefficient, its coefficient per shift, its values laid out by
+/// [`RowPoints::all_shifts`] and its certificate weights.
+type ColumnAt = (F128, Vec<F128>, Vec<F128>, Vec<F128>);
+
+/// The row side over `tables`. `round` takes each round polynomial's coefficients and returns the challenge;
+/// `claim` is what the rows sum to, checked in debug builds. `skip` turns equal-value skipping on, which every
+/// proof does; off, it is only there to measure. The pointer-column rounds run over `q_vars` variables, each column
+/// at its own `q`.
+pub fn prove(
+    chunks: &Chunks,
+    points: &RowPoints,
+    tables: Vec<RowTable>,
+    q_vars: usize,
+    skip: bool,
+    round: &mut dyn FnMut(&[F128]) -> F128,
+) -> RowEnd {
+    let d = chunks.d();
+    let n_coeffs = row_coeffs(d);
+    let n_rounds = tables.iter().map(|t| t.log_rows).max().unwrap_or(0);
+    let mut states: Vec<State> =
+        tracing::info_span!("Setup").in_scope(|| tables.into_iter().map(|t| State::new(t, chunks, points)).collect());
+    let mut point = Vec::with_capacity(n_rounds);
+    let mut claim = None;
+    let rounds = tracing::info_span!("Row rounds").entered();
+    for h in 0..n_rounds {
+        let _round = tracing::info_span!("Row round", round = h).entered();
+        let mut poly = [F128::ZERO; MAX_COEFFS];
+        tracing::info_span!("Sum").in_scope(|| {
+            // Every live table's tasks in one dispatch.
+            let setups: Vec<Option<RoundSetup>> = states
+                .iter()
+                .map(|s| s.done.is_none().then(|| s.round_setup(points)))
+                .collect();
+            let mut first = vec![0];
+            for setup in &setups {
+                let tasks = setup.as_ref().map_or(0, |r| r.pairs.div_ceil(r.per_task));
+                first.push(first.last().unwrap() + tasks);
+            }
+            poly = parallel::fold_reduce(
+                *first.last().unwrap(),
+                || [F128::ZERO; MAX_COEFFS],
+                |acc, task| {
+                    let t = first.partition_point(|&f| f <= task) - 1;
+                    let setup = setups[t].as_ref().unwrap();
+                    states[t].round_task(setup, task - first[t], chunks, points, skip, acc);
+                },
+                |mut a, b| {
+                    add_into(&mut a, &b);
+                    a
+                },
+            );
+            for state in &states {
+                match state.done {
+                    None => {
+                        if let Some(first) = &state.base_first {
+                            add_into(&mut poly, first);
+                        }
+                    }
+                    Some((value, corner)) => {
+                        poly[0] += value * corner;
+                        poly[1] += value * corner;
+                    }
+                }
+            }
+        });
+        debug_assert!(claim.is_none_or(|c: F128| c == poly[1..].iter().copied().sum::<F128>()));
+        let x = round(&poly[..n_coeffs]);
+        claim = Some(primitives::multilinear::poly_eval(&poly[..n_coeffs], x));
+        tracing::info_span!("Fold").in_scope(|| {
+            for state in &mut states {
+                match &mut state.done {
+                    None => state.fold(x, chunks, points),
+                    Some((_, corner)) => *corner *= F128::ONE + x,
+                }
+            }
+        });
+        point.push(x);
+    }
+
+    drop(rounds);
+
+    // Each column's values at its table's end come from its bit-slices there, as the verifier's do, so the
+    // column rounds see every shift's tables of every column.
+    let _ends = tracing::info_span!("Ends").entered();
+    // One eq table per table size, and every column's bit-slices in one dispatch.
+    let mut eqs: Vec<(usize, Vec<F128>)> = Vec::new();
+    for s in &states {
+        if !eqs.iter().any(|(m, _)| *m == s.m) {
+            eqs.push((s.m, primitives::multilinear::eq_table(&point[..s.m])));
+        }
+    }
+    let eq = |m: usize| eqs.iter().find(|(e, _)| *e == m).map(|(_, t)| t.as_slice()).unwrap();
+    let words: Vec<(&[u64], &[F128])> = states
+        .iter()
+        .flat_map(|s| s.columns.iter().map(|c| (c.words, eq(s.m))))
+        .collect();
+    let mut slices = bit_slices_eq(&words).into_iter();
+    let ends: Vec<TableEnd> = states
+        .iter()
+        .map(|s| {
+            let mut end = s.end(s.done.map_or(F128::ONE, |(_, corner)| corner), points);
+            for column_end in &mut end.columns {
+                let full = ColumnEnd::from_slices(chunks, points, slices.next().unwrap());
+                debug_assert_eq!(column_end.values[..2 * d], full.values[..2 * d]);
+                *column_end = full;
+            }
+            end
+        })
+        .collect();
+    let mut columns: Vec<Option<ColumnAt>> = Vec::new();
+    columns.resize_with(1 << q_vars, || None);
+    for (state, end) in states.iter().zip(&ends) {
+        for (column, values) in state.columns.iter().zip(&end.columns) {
+            let (coef, shifts, certs) = column.end_coefs(end, points.shifts.max_shift);
+            assert!(columns[column.q].is_none(), "two columns at q = {}", column.q);
+            columns[column.q] = Some((coef, shifts, values.values.clone(), certs));
+        }
+    }
+    let base = ends.iter().map(|e| e.corner * e.base).sum();
+    drop(_ends);
+    tracing::info_span!("Free").in_scope(|| drop(states));
+    let (column_point, claim) = tracing::info_span!("Pointer-column rounds")
+        .in_scope(|| prove_columns(chunks, points, columns, base, claim, round));
+    RowEnd {
+        point,
+        column_point,
+        tables: ends,
+        claim,
+    }
+}
+
+/// Coefficients of a row round: degree `d + 2` from a gated coefficient times a pointer, 4 from the base terms.
+pub fn row_coeffs(d: usize) -> usize {
+    (d + 2).max(4) + 1
+}
+
+/// Coefficients of a column round: degree `d + 1` from a pointer, 3 from a certificate.
+pub fn column_coeffs(d: usize) -> usize {
+    (d + 1).max(3) + 1
+}
+
+/// The rounds over the pointer-column index `q`, lowest bit first, an empty `q` a zero column; `base` is the tables'
+/// base terms, at `q = 0`.
+fn prove_columns(
+    chunks: &Chunks,
+    points: &RowPoints,
+    columns: Vec<Option<ColumnAt>>,
+    mut base: F128,
+    mut claim: Option<F128>,
+    round: &mut dyn FnMut(&[F128]) -> F128,
+) -> (Vec<F128>, F128) {
+    let d = chunks.d();
+    let slots = points.all_shifts(d);
+    let n_shifts = points.shifts.max_shift;
+    let n_coeffs = column_coeffs(d);
+    let n_vars = columns.len().trailing_zeros() as usize;
+    let zero = || {
+        (
+            F128::ZERO,
+            vec![F128::ZERO; n_shifts],
+            vec![F128::ZERO; slots.n_values()],
+            vec![F128::ZERO; d],
+        )
+    };
+    let mut columns: Vec<ColumnAt> = columns.into_iter().map(|c| c.unwrap_or_else(zero)).collect();
+    let mut point = Vec::with_capacity(n_vars);
+    for _ in 0..n_vars {
+        let mut poly = [F128::ZERO; MAX_COEFFS];
+        poly[0] += base;
+        poly[1] += base;
+        for k in 0..columns.len() / 2 {
+            let (lo, hi) = (&columns[2 * k], &columns[2 * k + 1]);
+            let pair = |slot: usize| (lo.2[slot], hi.2[slot]);
+            let groups: Vec<[F128; 2]> = (0..n_shifts).map(|s| [lo.1[s], lo.1[s] + hi.1[s]]).collect();
+            let mut terms = [F128Unreduced::ZERO; MAX_COEFFS];
+            pointer_pair(
+                &mut terms,
+                &slots,
+                &[lo.0, lo.0 + hi.0],
+                &groups,
+                None,
+                false,
+                (&points.clean, |_| None),
+                |_| false,
+                |_| F128::ZERO,
+                pair,
+            );
+            add_into(&mut poly, &terms.map(F128Unreduced::reduce));
+            for i in 0..d {
+                let m = pair_product(pair(slots.eq(i)), pair(slots.bar(i)));
+                add_weighted(&mut poly, (lo.3[i], hi.3[i]), [m[0] + points.mirrors[i], m[1], m[2]]);
+            }
+        }
+        debug_assert!(claim.is_none_or(|c: F128| c == poly[1..].iter().copied().sum::<F128>()));
+        let x = round(&poly[..n_coeffs]);
+        claim = Some(primitives::multilinear::poly_eval(&poly[..n_coeffs], x));
+        base *= F128::ONE + x;
+        let fold = |a: F128, b: F128| a + x * (a + b);
+        let fold_vec = |a: &[F128], b: &[F128]| a.iter().zip(b).map(|(&a, &b)| fold(a, b)).collect::<Vec<_>>();
+        columns = (0..columns.len() / 2)
+            .map(|k| {
+                let (lo, hi) = (&columns[2 * k], &columns[2 * k + 1]);
+                (
+                    fold(lo.0, hi.0),
+                    fold_vec(&lo.1, &hi.1),
+                    fold_vec(&lo.2, &hi.2),
+                    fold_vec(&lo.3, &hi.3),
+                )
+            })
+            .collect();
+        point.push(x);
+    }
+    let (coef, shifts, values, certs) = &columns[0];
+    let last = summand(&slots, &points.mirrors, *coef, shifts, values, certs) + base;
+    debug_assert!(claim.is_none_or(|c| c == last));
+    (point, last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::base::{Block, Weight};
+    use super::super::pointer::eval_chunk;
+    use super::*;
+    use crate::leaf::BusForm;
+    use primitives::field::F64;
+    use primitives::multilinear::{eq_eval, eq_table, poly_eval};
+    use primitives::test_rng::Rng;
+
+    struct Raw {
+        log_rows: usize,
+        rows: usize,
+        explicit: usize,
+        omega: Vec<F128>,
+        aux: Vec<Vec<F128>>,
+        aux_tail: Vec<F128>,
+        words: Vec<Vec<u64>>,
+        coefs: Vec<(Coef, Coef, Vec<ShiftGroup>, Vec<F128>)>,
+        /// Committed columns for the base terms, the padrow past `explicit`.
+        k_columns: Vec<Vec<F64>>,
+        padrow: Vec<F64>,
+        blocks: Vec<Block>,
+        tau: Vec<F128>,
+    }
+
+    /// Base blocks over three committed columns: one `ω` block, one gated by column 2, one on every row that
+    /// vanishes where column 0 does (on the padrow).
+    fn random_blocks(rng: &mut Rng) -> Vec<Block> {
+        let form = |rng: &mut Rng, constant: bool| {
+            let mut f = BusForm::new(3);
+            f.constant = if constant { rng.ext() } else { F128::ZERO };
+            f.coeffs[0] = rng.ext();
+            if constant {
+                f.coeffs[1] = rng.ext();
+            }
+            f.prods.push((0, 1, rng.ext()));
+            f
+        };
+        vec![
+            Block {
+                weight: Weight::Omega,
+                gate: None,
+                form: form(rng, true),
+            },
+            Block {
+                weight: Weight::Omega,
+                gate: Some(2),
+                form: form(rng, true),
+            },
+            Block {
+                weight: Weight::Eq,
+                gate: None,
+                form: form(rng, false),
+            },
+        ]
+    }
+
+    /// A random table: three columns whose neighbouring rows share most chunks, some words not one-hot, padding rows
+    /// zero past `explicit`. The first column is read shifted by one, the second by several shifts in two groups.
+    fn random_table(
+        rng: &mut Rng,
+        chunks: &Chunks,
+        max_shift: usize,
+        (log_rows, rows, explicit): (usize, usize, usize),
+    ) -> Raw {
+        let mask = (1usize << chunks.width) - 1;
+        let mut words = Vec::new();
+        let mut coefs = Vec::new();
+        for c in 0..3 {
+            let mut sigma = rng.next_u64() as usize & mask;
+            let column = (0..1 << log_rows)
+                .map(|u| {
+                    if u >= explicit {
+                        return 0;
+                    }
+                    if rng.next_u32().is_multiple_of(3) {
+                        sigma = (sigma + rng.next_u32() as usize % 5) & mask;
+                    }
+                    if rng.next_u32().is_multiple_of(7) {
+                        // All ones in the low chunks, so the shift carries.
+                        sigma |= (1 << (chunks.widths[0] + chunks.widths.get(1).copied().unwrap_or(0))) - 1;
+                        sigma &= mask;
+                    }
+                    let word = chunks.encode(sigma);
+                    if rng.next_u32().is_multiple_of(11) {
+                        word ^ 1 << (rng.next_u32() % 64)
+                    } else {
+                        word
+                    }
+                })
+                .collect();
+            words.push(column);
+            let coef = |rng: &mut Rng, a: usize| Coef {
+                constant: rng.ext(),
+                aux: if a < 2 { Some((a, rng.ext())) } else { None },
+            };
+            let shifts = match c {
+                0 => vec![ShiftGroup {
+                    coef: coef(rng, 2),
+                    weights: vec![(1, rng.ext())],
+                }],
+                1 => (0..2)
+                    .map(|g| ShiftGroup {
+                        coef: coef(rng, 2 * g),
+                        weights: (0..3)
+                            .map(|_| (1 + rng.next_u32() as usize % max_shift, rng.ext()))
+                            .collect(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            coefs.push((coef(rng, c), coef(rng, c + 1), shifts, rng.ext_vec(chunks.d())));
+        }
+        let padrow = vec![F64::ZERO, F64(rng.next_u64()), F64(rng.next_u64())];
+        let k_columns = (0..3)
+            .map(|c| {
+                (0..1 << log_rows)
+                    .map(|u| if u < explicit { F64(rng.next_u64()) } else { padrow[c] })
+                    .collect()
+            })
+            .collect();
+        let tau = rng.ext_vec(log_rows);
+        let theta = rng.ext();
+        let mut omega = eq_table(&tau);
+        omega.truncate(rows);
+        omega.iter_mut().for_each(|x| *x *= theta);
+        Raw {
+            log_rows,
+            rows,
+            explicit,
+            omega,
+            aux: (0..2).map(|_| rng.ext_vec(explicit)).collect(),
+            aux_tail: rng.ext_vec(2),
+            words,
+            coefs,
+            k_columns,
+            padrow,
+            blocks: random_blocks(rng),
+            tau,
+        }
+    }
+
+    /// The base terms of a table at one row, from its columns' values there.
+    fn base_at(t: &Raw, omega: F128, eq: F128, col: &dyn Fn(usize) -> F128) -> F128 {
+        t.blocks
+            .iter()
+            .map(|b| {
+                let w = if b.weight == Weight::Omega { omega } else { eq };
+                let mut f = b.form.constant;
+                for (i, &c) in b.form.coeffs.iter().enumerate() {
+                    f += c * col(i);
+                }
+                for &(x, y, c) in &b.form.prods {
+                    f += c * col(x) * col(y);
+                }
+                w * b.gate.map_or(F128::ONE, col) * f
+            })
+            .sum()
+    }
+
+    /// A folded pair keeps each chunk's tag where the rows agree and is [`MIXED`] where they differ, byte by byte.
+    #[test]
+    fn folded_tags_agree_with_the_bytewise_rule() {
+        let mut rng = Rng::new(0x7a6);
+        for _ in 0..10_000 {
+            let pick = |rng: &mut Rng| -> u64 {
+                (0..8).fold(0, |t, i| {
+                    t | u64::from([0u8, 1, 3, 15, MIXED][rng.next_u64() as usize % 5]) << (8 * i)
+                })
+            };
+            let (a, b) = (pick(&mut rng), pick(&mut rng));
+            let want = (0..8).fold(0, |t, i| {
+                let (x, y) = ((a >> (8 * i)) as u8, (b >> (8 * i)) as u8);
+                t | u64::from(if x == y { x } else { MIXED }) << (8 * i)
+            });
+            assert_eq!(fold_tags(a, b), want);
+        }
+    }
+
+    #[test]
+    fn row_side_matches_the_naive_sum_and_end() {
+        let mut rng = Rng::new(0x407);
+        for (width, max_shift, shapes, skip) in [
+            (7usize, 12usize, vec![(3usize, 5usize, 6usize), (2, 4, 4)], true),
+            (13, 12, vec![(5, 19, 25), (6, 64, 64), (2, 1, 3), (0, 1, 1)], true),
+            (13, 3, vec![(5, 19, 25), (6, 64, 64), (2, 1, 3), (0, 0, 0)], false),
+            (22, 12, vec![(4, 16, 16), (7, 100, 100), (3, 7, 8)], true),
+            (23, 12, vec![(4, 16, 16), (3, 7, 8)], true),
+            (1, 1, vec![(3, 6, 6), (1, 2, 2)], true),
+        ] {
+            let chunks = Chunks::new(width);
+            let d = chunks.d();
+            let points = RowPoints::new(&chunks, &rng.ext_vec(width), max_shift);
+            let raw: Vec<Raw> = shapes
+                .iter()
+                .map(|&s| random_table(&mut rng, &chunks, max_shift, s))
+                .collect();
+            let n_columns = 3 * raw.len();
+            let q_vars = n_columns.next_power_of_two().trailing_zeros() as usize;
+            let mut q = 0;
+            let tables: Vec<RowTable> = raw
+                .iter()
+                .map(|t| RowTable {
+                    log_rows: t.log_rows,
+                    rows: t.rows,
+                    explicit: t.explicit,
+                    omega: t.omega.clone(),
+                    tau: skip.then(|| t.tau.clone()),
+                    aux: t.aux.clone(),
+                    aux_tail: t.aux_tail.clone(),
+                    columns: t
+                        .words
+                        .iter()
+                        .zip(&t.coefs)
+                        .map(|(w, (o, a, g, e))| {
+                            q += 1;
+                            RowColumn {
+                                words: w,
+                                index: chunks.decode_all(w),
+                                omega: *o,
+                                act: *a,
+                                shifts: g.clone(),
+                                cert: e.clone(),
+                                q: q - 1,
+                            }
+                        })
+                        .collect(),
+                    base: Some(Base::new(
+                        t.blocks.clone(),
+                        t.k_columns.iter().map(|c| &c[..]).collect(),
+                        &t.padrow,
+                        Some(eq_table(&t.tau)),
+                    )),
+                    base_first: Some(
+                        Base::new(
+                            t.blocks.clone(),
+                            t.k_columns.iter().map(|c| &c[..]).collect(),
+                            &t.padrow,
+                            Some(eq_table(&t.tau)),
+                        )
+                        .omega_round(&t.omega, t.tau.first().copied().filter(|_| skip)),
+                    ),
+                })
+                .collect();
+
+            // Per row of a column: its coefficient, its coefficient per shift, `ω`, and the chunk functionals.
+            let slots = points.all_shifts(d);
+            let starts: Vec<Vec<F128>> = (1..=max_shift).flat_map(|s| points.shifts.start[s].clone()).collect();
+            let chunks_ref = &chunks;
+            let shift_coefs = |groups: &[ShiftGroup], weight: &dyn Fn(&Coef) -> F128| {
+                let mut out = vec![F128::ZERO; max_shift];
+                for g in groups {
+                    for &(s, mu) in &g.weights {
+                        out[s - 1] += weight(&g.coef) * mu;
+                    }
+                }
+                out
+            };
+            let row_value = |t: &Raw, u: usize, column: usize| -> (F128, Vec<F128>, F128, Vec<F128>) {
+                let (om, act) = if u < t.rows {
+                    (t.omega[u], F128::ONE)
+                } else {
+                    (F128::ZERO, F128::ZERO)
+                };
+                let aux = |a: usize| if u < t.explicit { t.aux[a][u] } else { t.aux_tail[a] };
+                let w = t.words[column][u];
+                let (co, ca, groups, _) = &t.coefs[column];
+                let weight = |c: &Coef| c.constant + c.aux.map_or(F128::ZERO, |(a, s)| s * aux(a));
+                let vals = (0..slots.n_values())
+                    .map(|k| {
+                        let (i, table) = slots.table(k, &points, &starts);
+                        eval_chunk(chunks_ref, table, w, i)
+                    })
+                    .collect();
+                let shifts = shift_coefs(groups, &|c| om * weight(c));
+                (om * weight(co) + act * weight(ca), shifts, om, vals)
+            };
+            let row_summand = |t: &Raw, column: usize, coef: F128, shifts: &[F128], om: F128, vals: &[F128]| {
+                let certs: Vec<F128> = t.coefs[column].3.iter().map(|&e| om * e).collect();
+                summand(&slots, &points.mirrors, coef, shifts, vals, &certs)
+            };
+            let mut total = F128::ZERO;
+            for t in &raw {
+                let eq = eq_table(&t.tau);
+                for u in 0..1 << t.log_rows {
+                    for column in 0..3 {
+                        let (coef, shifts, om, vals) = row_value(t, u, column);
+                        total += row_summand(t, column, coef, &shifts, om, &vals);
+                    }
+                    let om = if u < t.rows { t.omega[u] } else { F128::ZERO };
+                    total += base_at(t, om, eq[u], &|c| F128::from(t.k_columns[c][u]));
+                }
+            }
+
+            let mut claim = total;
+            let mut n_coeffs = Vec::new();
+            let mut claims = Vec::new();
+            let end = prove(&chunks, &points, tables, q_vars, skip, &mut |poly| {
+                assert_eq!(claim, poly[1..].iter().copied().sum::<F128>(), "a round's sum");
+                claims.push(claim);
+                n_coeffs.push(poly.len());
+                let x = rng.ext();
+                claim = poly_eval(poly, x);
+                x
+            });
+            claims.push(claim);
+            assert_eq!(claim, end.claim);
+            let max_log = shapes.iter().map(|s| s.0).max().unwrap();
+            assert!(n_coeffs[..max_log].iter().all(|&n| n == row_coeffs(d)));
+            assert!(n_coeffs[max_log..].iter().all(|&n| n == column_coeffs(d)));
+
+            // The end, from the rows' multilinear extensions at χ and then the columns' at q*.
+            let chi = &end.point;
+            let mut columns = Vec::new();
+            let mut base = F128::ZERO;
+            for (t, table_end) in raw.iter().zip(&end.tables) {
+                let eqs = eq_table(&chi[..t.log_rows]);
+                let corner: F128 = chi[t.log_rows..].iter().map(|&x| F128::ONE + x).product();
+                assert_eq!(table_end.corner, corner);
+                // `ω`, `act` and each aux column are separate factors of the summand, so each is its own extension.
+                let mle = |f: &dyn Fn(usize) -> F128| eqs.iter().enumerate().map(|(u, &e)| e * f(u)).sum::<F128>();
+                let om = mle(&|u| if u < t.rows { t.omega[u] } else { F128::ZERO });
+                let act = mle(&|u| if u < t.rows { F128::ONE } else { F128::ZERO });
+                let aux: Vec<F128> = (0..2)
+                    .map(|a| mle(&|u| if u < t.explicit { t.aux[a][u] } else { t.aux_tail[a] }))
+                    .collect();
+                assert_eq!(table_end.omega, om);
+                let k_values: Vec<F128> = (0..3).map(|c| mle(&|u| F128::from(t.k_columns[c][u]))).collect();
+                let table_base = base_at(t, om, eq_eval(&t.tau, &chi[..t.log_rows]), &|c| k_values[c]);
+                assert_eq!(table_end.base, table_base);
+                base += corner * table_base;
+                for column in 0..3 {
+                    let mut vals = vec![F128::ZERO; slots.n_values()];
+                    for (u, &e) in eqs.iter().enumerate() {
+                        let (_, _, _, g) = row_value(t, u, column);
+                        for (v, g) in vals.iter_mut().zip(g) {
+                            *v += e * g;
+                        }
+                    }
+                    let (co, ca, groups, cert) = &t.coefs[column];
+                    let weight = |c: &Coef| c.constant + c.aux.map_or(F128::ZERO, |(a, s)| s * aux[a]);
+                    let coef = om * weight(co) + act * weight(ca);
+                    assert_eq!(table_end.columns[column].values, vals);
+                    let shifts = shift_coefs(groups, &|c| corner * om * weight(c));
+                    let certs: Vec<F128> = cert.iter().map(|&e| corner * om * e).collect();
+                    columns.push((corner * coef, shifts, vals, certs));
+                }
+            }
+            let at_chi: F128 = columns
+                .iter()
+                .map(|(c, s, v, e)| summand(&slots, &points.mirrors, *c, s, v, e))
+                .sum();
+            assert_eq!(claims[max_log], at_chi + base, "the row rounds end on the columns' sum");
+            let eqq = eq_table(&end.column_point);
+            let mle = |f: &dyn Fn(usize) -> F128| (0..columns.len()).map(|q| eqq[q] * f(q)).sum::<F128>();
+            let coef = mle(&|q| columns[q].0);
+            let shifts: Vec<F128> = (0..max_shift).map(|s| mle(&|q| columns[q].1[s])).collect();
+            let vals: Vec<F128> = (0..slots.n_values()).map(|j| mle(&|q| columns[q].2[j])).collect();
+            let certs: Vec<F128> = (0..d).map(|i| mle(&|q| columns[q].3[i])).collect();
+            let base_q: F128 = end.column_point.iter().map(|&x| F128::ONE + x).product();
+            let last = summand(&slots, &points.mirrors, coef, &shifts, &vals, &certs);
+            assert_eq!(end.claim, last + base_q * base);
+        }
+    }
+}

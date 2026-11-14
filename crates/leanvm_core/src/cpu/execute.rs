@@ -53,21 +53,18 @@ enum State {
     Written,
 }
 
-/// One cell: its word, its access count as an exponent (the column holds `g^count`),
-/// and its write state, side by side so one access touches one line. All zero is an
-/// unwritten cell holding ZERO, never accessed.
+/// One cell: its word and its write state, side by side so one access touches one line. All zero is an
+/// unwritten cell holding ZERO.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct Cell {
     pub(crate) word: F128,
-    pub(crate) count: u32,
     state: State,
 }
 
 impl Cell {
     pub(crate) const UNWRITTEN: Self = Self {
         word: F128::ZERO,
-        count: 0,
         state: State::Unwritten,
     };
 }
@@ -151,8 +148,6 @@ pub enum Fault {
 /// The longest run the interpreter executes, the longest a stack can commit: every step is a row
 /// of at least `MIN_COMMITTED_COLUMNS` committed columns.
 const MAX_STEPS: usize = (1 << verifier::MAX_STACKED_LOG) / crate::tables::MIN_COMMITTED_COLUMNS;
-// A row touches at most a `KECCAK` row's cells, so every access count fits the `u32` exponent.
-const _: () = assert!(crate::keccak::ROW_CELLS * MAX_STEPS < u32::MAX as usize);
 
 impl ExecError {
     #[cold]
@@ -280,12 +275,11 @@ impl Program {
         // reservation and each lookup past it, and its reverse index g^j ↦ j.
         let mut g = GPow::new((self.prog.len() + 2).max(self.main_frame as usize));
 
-        // The write-once data memory, each cell's access count and write state with its word.
+        // The write-once data memory, each cell's write state with its word.
         let n0 = self.main_frame.max(2) as usize;
         let mut m = Mem {
             pages: Vec::new(),
             used: 0,
-            counts: 0,
             links: HashMap::new(),
             unwritten_reads: Vec::new(),
             program: self,
@@ -296,9 +290,6 @@ impl Program {
         // Seed the public input into m[0], m[1] (addresses g^0, g^1, §sec:e2e-pi).
         m.put(0, public_input[0])?;
         m.put(1, public_input[1])?;
-
-        // Per-pc bytecode execution count, as an exponent of `g`.
-        let mut bytecode_count: Vec<u32> = vec![0; self.prog.len()];
 
         let mut next_free = self.main_frame;
         let (mut pc, mut fp) = (0u32, 0u32);
@@ -353,8 +344,6 @@ impl Program {
             /// One past the highest cell accessed or reserved: every cell below it is
             /// in a page.
             used: usize,
-            /// The highest access count any cell reached.
-            counts: u32,
             /// The cells a `DEREF` linked each cell to.
             links: HashMap<u32, Vec<u32>>,
             /// Cells an instruction read before anything wrote them.
@@ -474,17 +463,6 @@ impl Program {
                     hint: self.dbg_hint,
                 };
                 ExecError::new(self.program, self.dbg_pc, fault)
-            }
-            // Read the running access count and advance it: the column's `×g`, on the
-            // exponent. A run makes fewer than `2^32` accesses in all, so it cannot wrap.
-            #[inline(always)]
-            fn bump_access_count(&mut self, cell: u32) -> u32 {
-                self.ensure(cell as usize);
-                let c = self.at(cell);
-                let count = c.count;
-                c.count = count + 1;
-                self.counts = self.counts.max(count + 1);
-                count
             }
         }
         // The cell a heap run starts at: read the pointer back out of memory and
@@ -767,12 +745,6 @@ impl Program {
             // Cover the g-powers this step may index (g²·pc return target, g^fp).
             g.grow_to((pc as usize + 2).max(fp as usize));
 
-            let bytecode_read = {
-                let v = bytecode_count[pc as usize];
-                bytecode_count[pc as usize] = v + 1;
-                v
-            };
-
             // Loaded once: the shared Xor/Mul arm needs the discriminant again,
             // and `Op` is wide enough that re-reading it costs a second load.
             let op = self.prog[pc as usize];
@@ -807,16 +779,10 @@ impl Program {
                     let vb = m.read(ab);
                     let vc = if is_xor { va + vb } else { va * vb };
                     m.put(ac, vc)?;
-                    let ra = m.bump_access_count(aa);
-                    let rb = m.bump_access_count(ab);
-                    let rc = m.bump_access_count(ac);
                     let row = Xrow {
                         pc,
                         fp,
-                        ra,
-                        rb,
-                        rc,
-                        bytecode_read,
+                        step: steps as u32,
                     };
                     if is_xor {
                         xor.push(row);
@@ -828,12 +794,10 @@ impl Program {
                 Op::Set { o, k } => {
                     let a = at(fp, o)?;
                     m.put(a, k)?;
-                    let r = m.bump_access_count(a);
                     set.push(Srow {
                         pc,
                         fp,
-                        r,
-                        bytecode_read,
+                        step: steps as u32,
                     });
                     pc += 1;
                 }
@@ -871,16 +835,11 @@ impl Program {
                             m.put(a2, v)?;
                         }
                     }
-                    let r1 = m.bump_access_count(a1);
-                    let r2 = m.bump_access_count(a2);
-                    let r3 = m.bump_access_count(a3);
                     deref.push(Drow {
                         pc,
                         fp,
-                        r1,
-                        r2,
-                        r3,
-                        bytecode_read,
+                        step: steps as u32,
+                        store: a2,
                     });
                     pc += 1;
                 }
@@ -899,17 +858,11 @@ impl Program {
                     // flow, only recorded as a witness column, so it is not
                     // computed here at all: `JumpTable::fill` batch-inverts every
                     // row's condition at once (§the trace rows in `cpu::trace`).
-                    let rc = m.bump_access_count(ac);
-                    let rd = m.bump_access_count(ad);
-                    let rf = m.bump_access_count(af);
                     let taken = !c.is_zero();
                     jump.push(Jrow {
                         pc,
                         fp,
-                        rc,
-                        rd,
-                        rf,
-                        bytecode_read,
+                        step: steps as u32,
                     });
                     if taken {
                         pc = g.log_below(d, self.prog.len()).ok_or_else(|| {
@@ -948,17 +901,10 @@ impl Program {
                     for (&cell, &v) in cells[STATE_CELLS..written].iter().zip(&output) {
                         m.put(cell, v)?;
                     }
-                    // In flush order, so a cell two operands alias still pairs each
-                    // read with its own count. A cell not written keeps count 0.
-                    let mut r = [0; ROW_CELLS];
-                    for (count, &cell) in r.iter_mut().zip(&cells[..written]) {
-                        *count = m.bump_access_count(cell);
-                    }
                     keccak.push(Krow {
                         pc,
                         fp,
-                        r,
-                        bytecode_read,
+                        step: steps as u32,
                     });
                     pc += 1;
                 }
@@ -1008,7 +954,6 @@ impl Program {
             }
         }
 
-        let counts = bytecode_count.iter().copied().max().unwrap_or(0).max(m.counts) as usize + 1;
         let trace = Trace {
             xor,
             mul,
@@ -1016,8 +961,6 @@ impl Program {
             deref,
             jump,
             keccak,
-            bytecode_count,
-            counts,
         };
         // The memory announced: the least power of two covering every cell the run touched
         // (the boundary tables read a dense image).

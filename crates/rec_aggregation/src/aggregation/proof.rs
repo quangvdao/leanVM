@@ -104,6 +104,11 @@ impl EthereumProof {
         &self.claims
     }
 
+    /// The VM proof's scalar stream length, and its encoding's length in bytes.
+    pub fn vm_proof_shape(&self) -> (usize, usize) {
+        (self.proof.stream.len(), self.proof.to_bytes().len())
+    }
+
     /// What goes on the wire: the deferred point and the VM proof. Neither the claims nor the
     /// deferred claim's value is transmitted: the receiver supplies the claims to
     /// [`Self::from_proof_bytes`], which recomputes the value, so there is nothing to lie about.

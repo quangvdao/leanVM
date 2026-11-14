@@ -13,32 +13,47 @@ pub fn warm_up() {
     scalar_bytecode();
 }
 
-/// The aggregation bytecode, compiled to a fixed point on its own size.
+/// The aggregation bytecode.
 ///
-/// The recursion placeholders are a function of the inner bytecode's log size,
-/// and here the inner bytecode is this one, so the size has to agree with
-/// itself. Its *digest* needs no such loop: it rides the statement rather than
-/// the code. The guess converges in one or two rounds because the map's only
-/// size-dependent part is a handful of unrolled sumcheck rounds.
+/// Its recursion verifier still checks the bus proof: Hotwire has not been ported to the guest. So the guest is
+/// compiled from the constants the bus layout gave it ([`frozen_placeholder_map`]), and stays the same program,
+/// with the same digest, as before Hotwire. A leaf aggregate proves this program with the Hotwire prover; a node
+/// aggregate, whose guest would verify Hotwire child proofs, does not work until the guest is ported.
 pub fn unified_guest() -> &'static Program {
     static GUEST: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
     GUEST.get_or_init(|| {
-        // A guess at the guest's own size: right, it compiles once; wrong, one more round.
-        let mut guess = 19;
-        for _ in 0..8 {
-            let guest = compile_guest(guess);
-            let actual = guest.prog().len().trailing_zeros() as usize;
-            if actual == guess {
-                return guest;
-            }
-            guess = actual;
-        }
-        panic!("the aggregation bytecode's self-referential compile did not converge");
+        let guest = compile_with(&frozen_placeholder_map());
+        assert_eq!(
+            guest.prog().len().trailing_zeros() as usize,
+            FROZEN_KBC,
+            "the frozen guest constants are for a 2^{FROZEN_KBC} program"
+        );
+        guest
     })
 }
 
+/// The log size of the program the frozen constants were computed for: the bus-era guest's fixed point.
+const FROZEN_KBC: usize = 19;
+
+/// The guest constants `placeholder_map(19)` gave on the bus layout (main at f5f3672f2), one `KEY = value` per line.
+pub(super) fn frozen_placeholder_map() -> std::collections::BTreeMap<String, String> {
+    include_str!("bus_guest_constants.txt")
+        .lines()
+        .map(|line| {
+            let (key, value) = line.split_once(" = ").expect("a `KEY = value` line");
+            (key.to_string(), value.to_string())
+        })
+        .collect()
+}
+
+/// The guest compiled from the current layout's constants: the self-referential compile the port to Hotwire will
+/// restore in [`unified_guest`].
+#[allow(dead_code, reason = "unused until the guest verifies Hotwire proofs")]
 pub(super) fn compile_guest(kbc: usize) -> Program {
-    let replacements = placeholder_map(kbc);
+    compile_with(&placeholder_map(kbc))
+}
+
+fn compile_with(replacements: &std::collections::BTreeMap<String, String>) -> Program {
     // `DBG_PLACEHOLDERS=path`: dump the baked guest constants, to read alongside
     // a `DBG_PROF_DUMP` profile (the guest's shape is entirely in these).
     if let Ok(path) = std::env::var("DBG_PLACEHOLDERS") {
@@ -46,7 +61,7 @@ pub(super) fn compile_guest(kbc: usize) -> Program {
         std::fs::write(&path, dump).expect("write DBG_PLACEHOLDERS");
     }
     let guest = compile(
-        &parse_with_replacements(include_str!("../../guests/lean_ethereum.py"), &replacements)
+        &parse_with_replacements(include_str!("../../guests/lean_ethereum.py"), replacements)
             .expect("the repository aggregation guest must parse"),
     );
     // `DBG_DISASM=path`: dump the guest's disassembly, to read alongside a

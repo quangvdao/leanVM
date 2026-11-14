@@ -88,18 +88,11 @@ fn tampers_fail_their_check() {
     let final_coefficients = (1 << mu) + k;
     let final_level = 5 * k + final_coefficients + 1 + tail;
     // After the announced sizes (the memory, six tables and the rate), the root and the OOD sample's nonce: its value,
-    // which the transcript binds, so the first grind after it, the bus's, already fails.
+    // which the transcript binds, so every link challenge after it moves and the link's terminal check fails.
     let ood_value = 1 + 6 + 1 + 2 + 1;
-    // The bytecode sumcheck ends on the stacked bytecode at the summary's point, the scalar the stream holds; its
-    // degree-two rounds over the four slot bits follow the share.
-    let bytecode_value = fixture.bytecode.evaluate(&fixture.summary.bytecode_point).unwrap();
-    let bytecode_value = stream.iter().position(|&s| s == bytecode_value).unwrap();
-    let bytecode_share = bytecode_value - 4 * round - 1;
     let cases = [
         (0, VerifierError::AnnouncedHighLimb),
-        (ood_value, VerifierError::GrindingNonce),
-        (bytecode_share, VerifierError::BytecodeShare),
-        (bytecode_value, VerifierError::BytecodeShare),
+        (ood_value, VerifierError::LinkTerminal),
         (end - tail - final_coefficients - 3, VerifierError::GrindingNonce),
         (end - final_level - 4, VerifierError::GrindingNonce),
         (end - tail - 1, VerifierError::GrindingNonce),
@@ -121,5 +114,24 @@ fn tampers_fail_their_check() {
             verify_execution(&fixture.bytecode, &fixture.public_input_bytes, &proof) == Err(error)
         });
         assert!(found, "no tamper of scalar {position} fails with {error}");
+    }
+}
+
+/// Each of the index side's values at `r` (`w⁺`, the spine and the memory term) and each of the pointer columns'
+/// bit-slices, tampered, fails the link's terminal check.
+#[test]
+fn tampered_link_values_fail_the_link() {
+    let fixture = fixture();
+    let summary = &fixture.summary;
+    assert_eq!(summary.values_at_r.len(), 3);
+    assert_eq!(summary.bit_slices.len(), 64);
+    for position in summary.values_at_r.clone().chain(summary.bit_slices.clone()) {
+        let mut proof = scalar_proof(&fixture.proof);
+        proof.stream[position] += E::new(0, 1);
+        assert_eq!(
+            verify_execution(&fixture.bytecode, &fixture.public_input_bytes, &proof).map(|_| ()),
+            Err(VerifierError::LinkTerminal),
+            "scalar {position}"
+        );
     }
 }

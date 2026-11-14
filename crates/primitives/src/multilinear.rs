@@ -180,6 +180,35 @@ pub fn mle_eval_par(table: &[F64], point: &[F128]) -> F128 {
     parallel::map_reduce(table.len() >> low_vars, || F128::ZERO, eval, |a, b| a + b)
 }
 
+/// [`mle_eval_par`] of several tables at one point, in one dispatch that builds the `eq` tables once: each task
+/// takes one row of every table.
+pub fn mle_eval_many_par(tables: &[&[F64]], point: &[F128]) -> Vec<F128> {
+    for table in tables {
+        assert_eq!(table.len(), 1 << point.len());
+    }
+    if 1usize << point.len() < PAR_THRESHOLD {
+        return tables.iter().map(|t| mle_eval(t, point)).collect();
+    }
+    let low_vars = point.len().min(MLE_LOW_VARS);
+    let low = packed_eq(&point[..low_vars]);
+    let high = eq_table(&point[low_vars..]);
+    parallel::fold_reduce(
+        high.len(),
+        || vec![F128::ZERO; tables.len()],
+        |acc, row| {
+            for (a, table) in acc.iter_mut().zip(tables) {
+                *a += high[row] * dot_base(&low, &table[row << low_vars..(row + 1) << low_vars]).reduce();
+            }
+        },
+        |mut a, b| {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+            a
+        },
+    )
+}
+
 /// The variables of the L1-resident low `eq` table of an MLE evaluation.
 const MLE_LOW_VARS: usize = 10;
 
@@ -218,6 +247,12 @@ mod tests {
             let point: Vec<_> = (0..n).map(|i| F128::new(17 + i, 231 + 3 * i)).collect();
             assert_eq!(mle_eval(&table, &point), fold(&point));
             assert_eq!(mle_eval_par(&table, &point), fold(&point));
+            let shifted: Vec<_> = table.iter().map(|&v| v + F64(3)).collect();
+            let shifted_fold = mle_eval(&shifted, &point);
+            assert_eq!(
+                mle_eval_many_par(&[&table, &shifted], &point),
+                [fold(&point), shifted_fold]
+            );
             let point: Vec<_> = (0..n).map(|i| F128::from(F64(i % 2))).collect();
             assert_eq!(mle_eval(&table, &point), fold(&point));
             assert_eq!(mle_eval_par(&table, &point), fold(&point));

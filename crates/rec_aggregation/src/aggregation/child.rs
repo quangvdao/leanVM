@@ -160,7 +160,10 @@ pub(super) fn gen_verify(
     }
     let mut col_order = committed_globals;
     col_order.sort_by_key(|&global| layout.placements[global].offset);
-    // The order by column group (`col_groups`): its columns are consecutive in it.
+    // The order by column group (`col_groups`), one entry per run of a group's columns. The guest models the bus-era
+    // layout, in which each group's columns are consecutive. Hotwire places the pointer columns apart from the rest of
+    // their group, so the list runs longer than the guest expects. The guest still verifies bus proofs and rejects
+    // the child either way until it is ported.
     let groups = col_groups(&col_sources.iter().flatten().copied().collect::<Vec<_>>());
     let group_of = |compact: usize| groups.partition_point(|&start| start <= compact) - 1;
     let mut col_group_order: Vec<F128> = Vec::new();
@@ -172,11 +175,6 @@ pub(super) fn gen_verify(
             last_group = group;
         }
     }
-    assert_eq!(
-        col_group_order.len(),
-        groups.len(),
-        "a column group's columns are consecutive"
-    );
 
     // ---- Hints for the stacked WHIR opening ----
     // Share the upper Merkle tree across a level's queries, one cap entry a level. Unknown,

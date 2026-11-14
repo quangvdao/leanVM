@@ -44,11 +44,11 @@ impl Openings {
     /// inputs' ring-switched, the outputs' a point claim to add to the batch.
     pub fn into_pcs_claims(self, offset: usize) -> (RingSwitchOpen, Option<StackClaim>) {
         let ring = RingSwitchOpen {
-            offset,
-            claims: vec![RingSwitchClaim {
-                suffix_point: self.inputs.point,
-                s_hat_v: Some(self.inputs.slices),
-            }],
+            claims: vec![RingSwitchClaim::single(
+                offset,
+                self.inputs.point,
+                Some(self.inputs.slices),
+            )],
         };
         let outputs = self.outputs.map(|outputs| StackClaim::Point {
             offset,
