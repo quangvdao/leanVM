@@ -13,7 +13,7 @@ use crate::field::{E, ONE, ZERO};
 use crate::layout::{Access, BUS_BITS, GLOBAL_COLUMN_BASES, K_BITS, Layout, N_TABLES, gpow};
 use crate::multilinear::{eq_eval, eq_kernel, index_mle, log2_ceil, padding_weight};
 use crate::ring_switch::{RingClaim, RingPiece};
-use crate::transcript::{Transcript, sumcheck};
+use crate::transcript::{Transcript, grinding_bits, sumcheck};
 use crate::{VerifierError, require};
 
 /// The widest pointer one word holds.
@@ -260,8 +260,10 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let n_pointers: usize = pointers.iter().map(Vec::len).sum();
     let max_shift = tables.iter().map(|t| t.links.max_shift()).max().unwrap_or(0).max(1);
 
-    // The challenges.
+    // The challenges, after the grind their error asks for: a degree-`m + 3 + BUS_BITS` polynomial in them on the
+    // row side (`m` the tallest table's row variables), and the `width + 1` of the index side.
     let n_rows = heights.iter().copied().max().unwrap_or(0);
+    transcript.grind_check(grinding_bits((n_rows + 3 + BUS_BITS).max(width + 1) as u128))?;
     let theta = transcript.samples(N_TABLES);
     let tau = transcript.samples(n_rows);
     let gamma_state = transcript.samples(2);

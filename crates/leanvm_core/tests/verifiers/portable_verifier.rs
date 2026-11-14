@@ -88,11 +88,11 @@ fn tampers_fail_their_check() {
     let final_coefficients = (1 << mu) + k;
     let final_level = 5 * k + final_coefficients + 1 + tail;
     // After the announced sizes (the memory, six tables and the rate), the root and the OOD sample's nonce: its value,
-    // which the transcript binds, so every link challenge after it moves and the link's terminal check fails.
+    // which the transcript binds, so the first grind after it, the link's, already fails.
     let ood_value = 1 + 6 + 1 + 2 + 1;
     let cases = [
         (0, VerifierError::AnnouncedHighLimb),
-        (ood_value, VerifierError::LinkTerminal),
+        (ood_value, VerifierError::GrindingNonce),
         (end - tail - final_coefficients - 3, VerifierError::GrindingNonce),
         (end - final_level - 4, VerifierError::GrindingNonce),
         (end - tail - 1, VerifierError::GrindingNonce),

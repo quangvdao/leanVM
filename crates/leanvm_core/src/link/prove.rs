@@ -157,8 +157,12 @@ pub(crate) struct Challenges {
 }
 
 impl Challenges {
+    /// After the grind their error asks for: a degree-`m + 3 + N_BYTECODE_SELECTORS` polynomial in them on the row
+    /// side (`m` the tallest table's row variables), and the `width + 1` of the index side.
     fn sample(ps: &mut ProverState, plans: &[Plan], taus: &[usize], chunks: &Chunks) -> Self {
         let m = taus.iter().copied().max().unwrap_or(0);
+        let degree = (m + 3 + crate::leaf::N_BYTECODE_SELECTORS).max(chunks.width + 1);
+        ps.grind(fiat_shamir::grinding_bits(degree as u128));
         let theta = ps.sample_vec(tables::N_TABLES);
         let tau = ps.sample_vec(m);
         let gamma_state = [ps.sample(), ps.sample()];
