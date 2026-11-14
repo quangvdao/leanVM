@@ -109,6 +109,9 @@ pub struct RowColumn<'a> {
     pub cert: Vec<F128>,
     /// The column's index in the pointer-column rounds.
     pub q: usize,
+    /// Log rows of each piece the stack holds the column in: the bit-slices are taken per piece too, at the low end
+    /// of the row point, as the opening's projections of the column's lanes.
+    pub piece_log: usize,
 }
 
 /// One table, as the row side reads it.
@@ -361,6 +364,9 @@ impl Slots {
 pub struct ColumnEnd {
     pub slices: Vec<F128>,
     pub values: Vec<F128>,
+    /// Each piece's 64 bit-slices at the row point's low `piece_log` coordinates ([`RowColumn::piece_log`]); `slices`
+    /// is their sum under `eq` of the rest of the point.
+    pub pieces: Vec<Vec<F128>>,
 }
 
 /// `Σ_u eq[u]·bit_b(word_u)` for each bit `b`, for each column's words under its `eq`, in one dispatch.
@@ -411,7 +417,11 @@ impl ColumnEnd {
                 from_slices(chunks, &slices, i, table)
             })
             .collect();
-        Self { slices, values }
+        Self {
+            slices,
+            values,
+            pieces: Vec::new(),
+        }
     }
 }
 
@@ -1314,6 +1324,7 @@ struct Column<'a> {
     /// `ε_i·π_i` per chunk.
     cert_mirrors: Vec<F128>,
     q: usize,
+    piece_log: usize,
 }
 
 /// A chunk's certificate weight as [`Column::bars`] scales its table by.
@@ -1361,6 +1372,7 @@ impl<'a> Column<'a> {
             cert_mirrors: column.cert.iter().zip(&points.mirrors).map(|(&e, &m)| e * m).collect(),
             cert: column.cert,
             q: column.q,
+            piece_log: column.piece_log,
         }
     }
 
@@ -2226,6 +2238,7 @@ impl<'a> State<'a> {
                     ColumnEnd {
                         slices: Vec::new(),
                         values,
+                        pieces: Vec::new(),
                     }
                 })
                 .collect(),
@@ -2318,27 +2331,42 @@ pub fn prove(
     // Each column's values at its table's end come from its bit-slices there, as the verifier's do, so the
     // column rounds see every shift's tables of every column.
     let _ends = tracing::info_span!("Ends").entered();
-    // One eq table per table size, and every column's bit-slices in one dispatch.
+    // One eq table per piece size, and every piece's bit-slices in one dispatch. A column's are its pieces' under
+    // `eq` of the rest of its table's point.
     let mut eqs: Vec<(usize, Vec<F128>)> = Vec::new();
-    for s in &states {
-        if !eqs.iter().any(|(m, _)| *m == s.m) {
-            eqs.push((s.m, primitives::multilinear::eq_table(&point[..s.m])));
+    for c in states.iter().flat_map(|s| &s.columns) {
+        if !eqs.iter().any(|(m, _)| *m == c.piece_log) {
+            eqs.push((c.piece_log, primitives::multilinear::eq_table(&point[..c.piece_log])));
         }
     }
     let eq = |m: usize| eqs.iter().find(|(e, _)| *e == m).map(|(_, t)| t.as_slice()).unwrap();
     let words: Vec<(&[u64], &[F128])> = states
         .iter()
-        .flat_map(|s| s.columns.iter().map(|c| (c.words, eq(s.m))))
+        .flat_map(|s| &s.columns)
+        .flat_map(|c| c.words.chunks(1 << c.piece_log).map(|piece| (piece, eq(c.piece_log))))
         .collect();
-    let mut slices = bit_slices_eq(&words).into_iter();
+    let mut piece_slices = bit_slices_eq(&words).into_iter();
+    let mut slices = states.iter().flat_map(|s| s.columns.iter().map(move |c| (s.m, c))).map(|(m, c)| {
+        assert!(c.piece_log <= m && c.words.len() == 1 << m, "a column is whole pieces of its table");
+        let pieces: Vec<Vec<F128>> = piece_slices.by_ref().take(1 << (m - c.piece_log)).collect();
+        let weights = primitives::multilinear::eq_table_serial(&point[c.piece_log..m]);
+        let mut slices = vec![F128::ZERO; 64];
+        for (piece, &w) in pieces.iter().zip(&weights) {
+            for (s, &v) in slices.iter_mut().zip(piece) {
+                *s += w * v;
+            }
+        }
+        (slices, pieces)
+    });
     let ends: Vec<TableEnd> = states
         .iter()
         .map(|s| {
             let mut end = s.end(s.done.map_or(F128::ONE, |(_, corner)| corner), points);
             for column_end in &mut end.columns {
-                let full = ColumnEnd::from_slices(chunks, points, slices.next().unwrap());
+                let (column, pieces) = slices.next().unwrap();
+                let full = ColumnEnd::from_slices(chunks, points, column);
                 debug_assert_eq!(column_end.values[..2 * d], full.values[..2 * d]);
-                *column_end = full;
+                *column_end = ColumnEnd { pieces, ..full };
             }
             end
         })
@@ -2677,6 +2705,7 @@ mod tests {
                                 shifts: g.clone(),
                                 cert: e.clone(),
                                 q: q - 1,
+                                piece_log: t.log_rows,
                             }
                         })
                         .collect(),

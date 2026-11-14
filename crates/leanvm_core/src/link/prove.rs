@@ -590,6 +590,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                     shifts,
                     cert: ch.eps[q].iter().map(|&e| fresh.cert * e).collect(),
                     q,
+                    piece_log: layout.placements[sch.base[t] + pointer].piece_vars,
                 });
                 q += 1;
             }
@@ -654,15 +655,17 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             for (s, &v) in slices.iter_mut().zip(&end.slices) {
                 *s += eq_q[q] * v;
             }
-            // A split column (the band layout) is its pieces, each at the low end of the row point.
+            // A split column (the band layout) is its pieces, each at the low end of the row point. The row side's
+            // per-piece bit-slices are the opening's first projection of the piece's lane onto them.
             let placement = &layout.placements[sch.base[t] + pointer];
             let lane = layout.shape.mu - crate::pcs::LOG_BATCH;
             let weights = primitives::multilinear::eq_table_serial(&point[placement.piece_vars..]);
-            for (offset, &weight) in placement.piece_offsets(lane).zip(&weights) {
+            for ((offset, &weight), slices) in placement.piece_offsets(lane).zip(&weights).zip(&end.pieces) {
                 pieces.push(RingPiece {
                     offset,
                     point: point[..placement.piece_vars].to_vec(),
                     scale: eq_q[q] * weight,
+                    slices: (placement.piece_vars <= lane).then(|| slices.clone()),
                 });
             }
             q += 1;

@@ -135,11 +135,17 @@ fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F12
 
 /// One piece of a ring-switched claim: the bit-slice MLEs of the aligned
 /// sub-block `stack[offset .. offset + 2^|point|]` at `point`, scaled by `scale`.
+///
+/// `slices`, when the caller has them, are those 64 bit-slices unscaled. They are the
+/// projection of the piece's lane onto its ring's terms in level 0's first round, which
+/// the prover then takes as given rather than folding the sub-block's bits again. Only a
+/// piece inside one lane block can carry them, and they never reach the transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RingPiece {
     pub offset: usize,
     pub point: Vec<F128>,
     pub scale: F128,
+    pub slices: Option<Vec<F128>>,
 }
 
 /// One ring-switched claim: the 64 values `s_hat_v[i] = sum_p scale_p *
@@ -164,6 +170,7 @@ impl RingSwitchClaim {
                 offset,
                 point,
                 scale: F128::ONE,
+                slices: None,
             }],
             s_hat_v,
         }
@@ -294,8 +301,8 @@ mod tests {
     /// The level-0 rounds on a projected basis must send the tables of the dense rounds on the transposed stack and
     /// dense weight, and leave the same lane and weight, across claims inside
     /// one lane and spanning lanes, strides above the lane bit, shared and distinct points, one over the whole stack
-    /// past its lanes, and a q_keccak ring both spanning lanes and selected by lane bits, over a stack with runs of
-    /// equal blocks.
+    /// past its lanes, a q_keccak ring both spanning lanes and selected by lane bits, and a ring piece whose bit-slices
+    /// are given, over a stack with runs of equal blocks.
     #[test]
     fn projected_lane_rounds_match_the_dense_rounds() {
         const LANE_ROUNDS: usize = 6;
@@ -338,15 +345,31 @@ mod tests {
                             offset,
                             point: rng.ext_vec(qkeccak_vars),
                             scale: rng.ext(),
+                            slices: None,
                         },
                         RingPiece {
                             offset: other - other % 64,
                             point: rng.ext_vec(6),
                             scale: rng.ext(),
+                            slices: None,
                         },
                     ],
                     s_hat_v: None,
                 });
+                // The small piece's bit-slices given, as the link gives a pointer piece's: the first round takes its
+                // lane's projection from them.
+                let small = &mut ring.claims[2].pieces[1];
+                let eq = primitives::multilinear::eq_table(&small.point);
+                let mut slices = vec![F128::ZERO; 64];
+                for (y, e) in eq.into_iter().enumerate() {
+                    let word = stack[small.offset + y].0;
+                    for (i, s) in slices.iter_mut().enumerate() {
+                        if word >> i & 1 == 1 {
+                            *s += e;
+                        }
+                    }
+                }
+                small.slices = Some(slices);
                 let coordinates = std::array::from_fn(|_| rng.ext());
                 let rs_outputs: Vec<_> = ring
                     .claims

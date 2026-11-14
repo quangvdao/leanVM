@@ -229,6 +229,9 @@ pub(crate) struct Terms {
     rings: Vec<Ring>,
     /// Tags the stack's blocks of `2^low_vars` words that equal their predecessor, or is empty.
     repeats: Vec<bool>,
+    /// Ring projections the caller already has, `(lane, ring's first term, bit-slices)`: a piece's bit-slices at its
+    /// point are its lane's projection onto its ring's terms, transposed.
+    given: Vec<(usize, usize, [F128; ROWS])>,
 }
 
 impl Terms {
@@ -328,6 +331,29 @@ impl Terms {
         self.repeats
             .get(l * n_blocks + blocks.start..l * n_blocks + blocks.end)
             .unwrap_or(&[])
+    }
+
+    /// Marks, per lane, the ring terms whose projection of the lane itself is given, so the first round need not
+    /// project it.
+    pub(crate) fn given_terms(&self, n_lanes: usize) -> Vec<bool> {
+        let n_terms = self.n_terms();
+        let mut out = vec![false; n_lanes * n_terms];
+        for &(l, first, _) in &self.given {
+            out[l * n_terms + first..][..DEGREE_E].fill(true);
+        }
+        out
+    }
+
+    /// Adds the given projections to `rows`, lane `l`'s row from `row(l)`, where `wanted(l, first)` asks for them.
+    pub(crate) fn add_given(&self, rows: &mut [F128], row: impl Fn(usize) -> usize, wanted: impl Fn(usize, usize) -> bool) {
+        for (l, first, slices) in &self.given {
+            if !wanted(*l, *first) {
+                continue;
+            }
+            for (slot, k) in rows[row(*l) + first..].iter_mut().zip(transpose_s_hat(slices)) {
+                *slot += F128::from(k);
+            }
+        }
     }
 
     /// Bits of a block of the projection.
@@ -574,6 +600,7 @@ pub(super) fn initial_basis(
         } else {
             Vec::new()
         },
+        given: Vec::new(),
     };
     // The claims' lane weights, then the rings', each `1 << lane_bits` long.
     let mut lanes: Vec<F128> = Vec::new();
@@ -627,6 +654,7 @@ pub(super) fn initial_basis(
             let shared = terms.rings[first_ring..]
                 .iter()
                 .position(|r| r.x_offset == x_offset && r.point == piece.point);
+            let ring_at = first_ring + shared.unwrap_or(terms.rings.len() - first_ring);
             let at = match shared {
                 Some(k) => (claims.len() + first_ring + k) << lane_bits,
                 None => {
@@ -652,6 +680,14 @@ pub(super) fn initial_basis(
             };
             for (l, w) in lanes[at..at + (1 << lane_bits)].iter_mut().zip(&lane_weights) {
                 *l += *w;
+            }
+            if let Some(slices) = &piece.slices {
+                assert!(piece.point.len() <= lane_vars, "given slices are a piece inside one lane block");
+                let (lane, first) = (piece.offset >> lane_vars, terms.rings[ring_at].first);
+                if !terms.given.iter().any(|g| (g.0, g.1) == (lane, first)) {
+                    let slices: [F128; ROWS] = slices.as_slice().try_into().expect("64 bit-slices");
+                    terms.given.push((lane, first, slices));
+                }
             }
         }
     }
