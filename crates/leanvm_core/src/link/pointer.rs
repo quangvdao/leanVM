@@ -32,6 +32,11 @@ pub struct Chunks {
     /// Per chunk, its digit's shift and mask in an index; zero past the last chunk.
     digit_shifts: [u32; 8],
     digit_masks: [u32; 8],
+    /// The words of an index's low `split` bits and of its high bits, which cover whole chunks each: a word is one of
+    /// each, ORed.
+    split: usize,
+    low_words: Vec<u64>,
+    high_words: Vec<u64>,
 }
 
 impl Chunks {
@@ -90,7 +95,12 @@ impl Chunks {
             digit_shifts[i] = index_shifts[i] as u32;
             digit_masks[i] = (1 << widths[i]) - 1;
         }
-        Self {
+        // The chunk boundary nearest the middle of the index.
+        let split = *index_shifts
+            .iter()
+            .min_by_key(|&&at| at.abs_diff(width / 2))
+            .expect("a pointer has a chunk");
+        let mut chunks = Self {
             digit_shifts,
             digit_masks,
             width,
@@ -100,7 +110,23 @@ impl Chunks {
             bytes,
             count_shift,
             one_each,
-        }
+            split,
+            low_words: Vec::new(),
+            high_words: Vec::new(),
+        };
+        let low_chunks = chunks.index_shifts.iter().filter(|&&at| at < split).count();
+        let words = |chunks: &Self, range: std::ops::Range<usize>, sigma: usize| {
+            range.fold(0, |word, i| {
+                let v = (sigma >> chunks.index_shifts[i]) & ((1 << chunks.widths[i]) - 1);
+                word | 1 << (chunks.word_shifts[i] + v)
+            })
+        };
+        let d = chunks.d();
+        chunks.low_words = (0..1usize << split).map(|s| words(&chunks, 0..low_chunks, s)).collect();
+        chunks.high_words = (0..1usize << (width - split))
+            .map(|s| words(&chunks, low_chunks..d, s << split))
+            .collect();
+        chunks
     }
 
     pub fn d(&self) -> usize {
@@ -108,12 +134,10 @@ impl Chunks {
     }
 
     /// The word of index `sigma`.
+    #[inline]
     pub fn encode(&self, sigma: usize) -> u64 {
         debug_assert!(sigma >> self.width == 0, "index {sigma} past 2^{}", self.width);
-        (0..self.d()).fold(0, |word, i| {
-            let v = (sigma >> self.index_shifts[i]) & ((1 << self.widths[i]) - 1);
-            word | 1 << (self.word_shifts[i] + v)
-        })
+        self.low_words[sigma & ((1 << self.split) - 1)] | self.high_words[sigma >> self.split]
     }
 
     /// The indicator bits of chunk `i` of `word`, at bit 0.
