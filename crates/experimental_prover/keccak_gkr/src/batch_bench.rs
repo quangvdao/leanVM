@@ -201,7 +201,7 @@ pub(crate) fn open_commitment(
     openings: Openings,
     ood: StackClaim,
 ) {
-    let (ring, outputs) = openings.into_pcs_claims(0);
+    let (ring, outputs) = openings.into_pcs_claims(0, usize::MAX, 0);
     let points: Vec<_> = outputs.into_iter().chain([ood]).collect();
     pcs::stack_open::open_batch_mixed_whir_stacked(ps, shape.stack_log(), stack, prover_data, config, &points, &ring);
 }

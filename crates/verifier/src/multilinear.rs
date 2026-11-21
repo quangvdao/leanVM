@@ -113,9 +113,11 @@ pub fn poly_eval(coefficients: &[E], point: E) -> E {
 
 /// Where something sits in the stacked cube: a claim's point fills the low `variables` coordinates, the bits of `index` fixing the rest.
 ///
-/// A pointer column of the band layout ([`stack_offsets`]) can be split: then `piece_variables < variables`, and piece `j`
-/// (its rows `j·2^piece_variables..`) sits at `index + j·2^lane`, one lane down per piece. Only ring-switch claims read
-/// a split column, piece by piece ([`Placement::pieces`]).
+/// A column of the stripe or band layout ([`stack_offsets`]) can be split: then `piece_variables < variables`, and piece
+/// `j` (its rows `j·2^piece_variables..`) sits at `index + j·2^lane`, one lane down per piece. A ring-switch claim reads
+/// a split column piece by piece ([`Placement::pieces`]). A point claim still reads it at one stack point
+/// ([`Placement::stack_point`]): its pieces share an in-lane window and fill an aligned run of lanes, so the row
+/// coordinates above the pieces are lane coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
     pub variables: usize,
@@ -136,10 +138,45 @@ impl Placement {
         self.piece_variables < self.variables
     }
 
-    pub fn stack_point(&self, point: &[E], stack_log: usize) -> Vec<E> {
-        assert!(!self.is_split(), "a point claim reads a whole column");
-        let above = selector_point(self.index >> self.variables, stack_log - self.variables);
-        [point, &above].concat()
+    /// The stack point of a claim at row `point`, in a stack of `2^stack_log` words in `2^lane`-word lanes. For a split
+    /// column the low `piece_variables` coordinates are the in-lane ones, the in-lane offset's bits come next, then
+    /// the rest of the row point on the lowest lane coordinates and the first lane's bits above them.
+    pub fn stack_point(&self, point: &[E], stack_log: usize, lane: usize) -> Vec<E> {
+        assert_eq!(point.len(), self.variables, "a column's row point");
+        if !self.is_split() {
+            let above = selector_point(self.index >> self.variables, stack_log - self.variables);
+            return [point, &above].concat();
+        }
+        let (piece, spread) = (self.piece_variables, self.variables - self.piece_variables);
+        let (first_lane, in_lane) = (self.index >> lane, self.index & ((1 << lane) - 1));
+        assert!(
+            piece <= lane && in_lane % (1 << piece) == 0,
+            "a piece is aligned inside one lane"
+        );
+        assert!(
+            first_lane % (1 << spread) == 0,
+            "the pieces fill an aligned run of lanes"
+        );
+        [
+            &point[..piece],
+            &selector_point(in_lane >> piece, lane - piece),
+            &point[piece..],
+            &selector_point(first_lane >> spread, stack_log - lane - spread),
+        ]
+        .concat()
+    }
+
+    /// The `2^variables` rows from `start` (a multiple of `2^variables`) as a column of their own: whole when they
+    /// fit in one piece, else the run of pieces holding them.
+    pub fn rows(&self, start: u64, variables: usize, lane: usize) -> Placement {
+        assert!(start.is_multiple_of(1 << variables) && start + (1 << variables) <= 1 << self.variables);
+        let piece = self.piece_variables;
+        let index = self.index + ((start >> piece) << lane) + (start & ((1 << piece) - 1));
+        Placement {
+            variables,
+            index,
+            piece_variables: piece.min(variables),
+        }
     }
 
     /// eq weight of the coordinates above the window.
@@ -176,20 +213,25 @@ pub struct Spot {
 /// log size, `log2_ceil` of the total and at least `min_log`. Depends only on its arguments, so the verifier rebuilds
 /// the prover's layout.
 ///
-/// The `shared` blocks (the pointer columns, which the opening reads through ring weights at one point) go in a band:
+/// The `ring` blocks are the ones the opening reads through ring weights (the pointer columns and q_keccak). The
+/// opening's first fold rounds project every lane onto terms shared by the claims and rings that sit at one in-lane
+/// window, so the layout is the stripe one ([`striped`]) when it fits in the `⌈total / lane⌉` lanes the dense layout
+/// uses: every block it can, the ring ones first, cut into one piece per lane of the first `2^w` lanes, which puts
+/// each block's claims at one in-lane window for all those lanes. Failing that, the `ring` blocks go in a band:
 /// in-lane words `[0, 2^band)` of adjacent lanes, a block larger than `2^band` split into `2^band`-word pieces, one per
-/// lane. The opening projects every lane pair its ring weights touch, over the union of their in-lane windows, so a
-/// band that is narrow and contiguous keeps that union small in every fold round. The band is the narrowest one with
-/// which every block still fits in the `⌈total / lane⌉` lanes the dense layout uses ([`banded`]), and with no shared
-/// block, or none that fits, the layout is the dense one ([`dense`]).
-pub fn stack_offsets(sizes: &[usize], shared: &[bool], min_log: usize, lane_fold: usize) -> (Vec<Spot>, usize) {
+/// lane, the band the narrowest one with which every block still fits ([`banded`]). With no ring block, or none that
+/// fits, the layout is the dense one ([`dense`]).
+pub fn stack_offsets(sizes: &[usize], ring: &[bool], min_log: usize, lane_fold: usize) -> (Vec<Spot>, usize) {
     let total: u64 = sizes.iter().map(|&size| 1u64 << size).sum();
     let log = log2_ceil(total).max(min_log);
     let lane = log - lane_fold;
     let lanes = total.div_ceil(1 << lane);
+    if let Some(spots) = striped(sizes, ring, lane, log, lanes) {
+        return (spots, log);
+    }
     let pointer: u64 = sizes
         .iter()
-        .zip(shared)
+        .zip(ring)
         .filter(|(_, s)| **s)
         .map(|(&size, _)| 1u64 << size)
         .sum();
@@ -198,12 +240,71 @@ pub fn stack_offsets(sizes: &[usize], shared: &[bool], min_log: usize, lane_fold
             if pointer.div_ceil(1 << band) > lanes {
                 continue;
             }
-            if let Some(spots) = banded(sizes, shared, lane, log, band, lanes) {
+            if let Some(spots) = banded(sizes, ring, lane, log, band, lanes) {
                 return (spots, log);
             }
         }
     }
-    (dense(sizes, shared, lane), log)
+    (dense(sizes, ring, lane), log)
+}
+
+/// The stripe layout of [`stack_offsets`], if it fits in `lanes` lanes. The stripe is the first `2^w` lanes, the most
+/// a power of two that `lanes` holds. Every `ring` block goes in it, and then every other block, largest first, that
+/// still fits; a block of `2^s` words in it is `2^w` pieces of `2^(s - w)`, piece `j` in lane `j`, all at one in-lane
+/// offset. The blocks stack up from in-lane word 0, largest first, so each offset is aligned. The rest go largest
+/// first, ties by index, at the lowest free offset aligned to their size past the stripe, or above it in its lanes.
+fn striped(sizes: &[usize], ring: &[bool], lane: usize, log: usize, lanes: u64) -> Option<Vec<Spot>> {
+    let width = (lanes.max(1).ilog2() as usize).min(log - lane);
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&index| (std::cmp::Reverse(sizes[index]), index));
+    let rows = |index: usize| 1u64 << (sizes[index] - width);
+    let mut in_stripe = vec![false; sizes.len()];
+    let mut height = 0u64;
+    for &index in order.iter().filter(|&&i| ring[i]) {
+        if sizes[index] < width {
+            return None;
+        }
+        height += rows(index);
+        in_stripe[index] = true;
+    }
+    if height > 1 << lane {
+        return None;
+    }
+    for &index in order.iter().filter(|&&i| !ring[i] && sizes[i] >= width) {
+        if height + rows(index) <= 1 << lane {
+            height += rows(index);
+            in_stripe[index] = true;
+        }
+    }
+    let mut spots = vec![Spot { offset: 0, piece: 0 }; sizes.len()];
+    let mut at = 0u64;
+    for &index in order.iter().filter(|&&i| in_stripe[i]) {
+        spots[index] = Spot {
+            offset: at,
+            piece: sizes[index] - width,
+        };
+        at += rows(index);
+    }
+    // Free aligned blocks `(offset, log)`: the stack past the stripe, then the stripe's lanes above it.
+    let stripe_end = (1u64 << width) << lane;
+    let mut free = aligned_blocks(stripe_end, 1 << log);
+    for l in 0..1u64 << width {
+        free.extend(aligned_blocks((l << lane) + height, (l + 1) << lane));
+    }
+    let mut end = stripe_end;
+    for &index in order.iter().filter(|&&i| !in_stripe[i]) {
+        let size = sizes[index];
+        let (pick, _) = free
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.1 >= size)
+            .min_by_key(|(_, b)| (b.0 < stripe_end, b.0))?;
+        let (offset, log) = free.swap_remove(pick);
+        free.extend(aligned_blocks(offset + (1 << size), offset + (1 << log)));
+        spots[index] = Spot { offset, piece: size };
+        end = end.max(offset + (1 << size));
+    }
+    (end.div_ceil(1 << lane) <= lanes).then_some(spots)
 }
 
 /// The band layout of [`stack_offsets`] with band width `2^band`, if it fits in `lanes` lanes. The band starts at lane
@@ -347,12 +448,13 @@ mod tests {
         pieces
     }
 
-    /// The band layout must keep what the dense one guarantees (disjoint, aligned pieces in the fewest whole lanes)
-    /// and put every pointer piece at in-lane offsets below the band width, which is what it is for.
+    /// The layout must keep what the dense one guarantees (disjoint, aligned pieces in the fewest whole lanes). The
+    /// stripe layout must cut every ring block into one piece per stripe lane, all at one in-lane window, and the band
+    /// layout must put every ring piece at in-lane offsets below the band width, which is what each is for.
     #[test]
-    fn the_band_layout_is_disjoint_aligned_and_in_the_fewest_lanes() {
-        // The 16-blob and 500-SPHINCS aggregations' columns, `(log size, pointer?) × count`, a stack of only pointer
-        // columns, a pointer larger than a lane, and no pointer at all.
+    fn the_layout_is_disjoint_aligned_and_in_the_fewest_lanes() {
+        // The 16-blob and 500-SPHINCS aggregations' columns, `(log size, ring?) × count`, a stack of only ring
+        // columns, a ring block too large for the stripe, and no ring block at all.
         let expand = |counts: &[((usize, bool), usize)]| -> Vec<(usize, bool)> {
             counts
                 .iter()
@@ -382,21 +484,26 @@ mod tests {
             ((17, false), 10),
             ((17, true), 5),
         ]);
-        // Each case: its columns' sizes and whether each is shared, and the band it should place, if any.
-        type Case = (Vec<(usize, bool)>, Option<usize>);
-        let cases: [Case; 5] = [
-            (blob, Some(20)),
-            (sphincs, Some(20)),
-            (vec![(18, true); 64], None),
+        #[derive(Debug, PartialEq)]
+        enum Kind {
+            Stripe,
+            Band,
+            Dense,
+        }
+        let cases: [(Vec<(usize, bool)>, Kind); 6] = [
+            (blob, Kind::Stripe),
+            (sphincs, Kind::Stripe),
+            (vec![(18, true); 64], Kind::Stripe),
             (
                 vec![(23, true), (20, false), (19, true), (18, false), (18, false)],
-                None,
+                Kind::Band,
             ),
-            (vec![(20, false), (19, false), (18, false)], None),
+            (vec![(22, true), (21, true), (18, false), (18, false)], Kind::Band),
+            (vec![(20, false), (19, false), (18, false)], Kind::Stripe),
         ];
-        for (case, expected_band) in cases {
-            let (sizes, shared): (Vec<usize>, Vec<bool>) = case.iter().copied().unzip();
-            let (spots, log) = stack_offsets(&sizes, &shared, 18, 6);
+        for (case, kind) in cases {
+            let (sizes, ring): (Vec<usize>, Vec<bool>) = case.iter().copied().unzip();
+            let (spots, log) = stack_offsets(&sizes, &ring, 18, 6);
             let lane = log - 6;
             let total: u64 = sizes.iter().map(|&s| 1u64 << s).sum();
             let lanes = total.div_ceil(1 << lane);
@@ -409,19 +516,56 @@ mod tests {
                 assert!(offset + length <= lanes << lane, "a piece is in the fewest whole lanes");
                 assert!(length <= 1 << lane || offset % (1 << lane) == 0);
             }
-            let band = (0..sizes.len()).filter(|&i| shared[i]).map(|i| spots[i].piece).max();
-            if let Some(expected) = expected_band {
-                assert_eq!(band, Some(expected), "the narrowest band that fits");
-                let first = pieces.iter().find(|p| shared[p.2]).map(|p| p.0);
-                assert_eq!(first, Some(0), "the band starts at lane 0");
+            let width = lanes.ilog2() as usize;
+            let striped = (0..sizes.len()).all(|i| !ring[i] || sizes[i] - spots[i].piece == width);
+            let split = (0..sizes.len()).any(|i| spots[i].piece < sizes[i]);
+            let found = if striped && (width > 0) == split {
+                Kind::Stripe
+            } else if split {
+                Kind::Band
+            } else {
+                Kind::Dense
+            };
+            assert_eq!(found, kind, "{case:?}");
+            if kind == Kind::Stripe {
+                for i in (0..sizes.len()).filter(|&i| spots[i].piece < sizes[i]) {
+                    assert_eq!(spots[i].offset >> lane, 0, "a striped block starts in lane 0");
+                }
             }
-            if let Some(band) = band {
-                for &(offset, length, block) in pieces.iter().filter(|p| shared[p.2]) {
+            if kind == Kind::Band {
+                let band = (0..sizes.len())
+                    .filter(|&i| ring[i])
+                    .map(|i| spots[i].piece)
+                    .max()
+                    .unwrap();
+                for &(offset, length, block) in pieces.iter().filter(|p| ring[p.2]) {
                     let in_lane = offset % (1 << lane);
                     assert!(
                         in_lane + length <= 1 << band.max(sizes[block].min(lane)),
-                        "pointer {block} is in the band"
+                        "ring block {block} is in the band"
                     );
+                }
+            }
+            // A claim at a boolean row reads the word the row is at, through the stack point and through `rows`.
+            let bits = |value: u64, length: usize| -> Vec<E> { selector_point(value, length) };
+            for (i, (&size, spot)) in sizes.iter().zip(&spots).enumerate().filter(|(_, (s, _))| **s <= 20) {
+                let placement = Placement {
+                    variables: size,
+                    index: spot.offset,
+                    piece_variables: spot.piece,
+                };
+                let at = |row: u64| spot.offset + ((row >> spot.piece) << lane) + (row & ((1 << spot.piece) - 1));
+                for row in [0, 1, (1 << size) / 3, (1 << size) - 1] {
+                    let point = placement.stack_point(&bits(row, size), log, lane);
+                    assert_eq!(point, bits(at(row), log), "block {i} row {row}");
+                }
+                for variables in [0, size.min(3), size - 1] {
+                    let start = (((1u64 << size) / 3) >> variables) << variables;
+                    let sub = placement.rows(start, variables, lane);
+                    for row in [0, (1 << variables) - 1] {
+                        let point = sub.stack_point(&bits(row, variables), log, lane);
+                        assert_eq!(point, bits(at(start + row), log), "block {i} rows from {start}");
+                    }
                 }
             }
         }

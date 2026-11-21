@@ -15,7 +15,7 @@ use crate::leaf::{BusForm, ColumnClaim, Coord, accumulate_form};
 use crate::pcs::{RingSwitchClaim, StackClaim};
 use crate::tables::{self, Links, Table};
 use crate::transcript::ProverState;
-use ::pcs::stack_open::{RingPiece, SumPart};
+use ::pcs::stack_open::RingPiece;
 use primitives::field::{F64, F128};
 use primitives::multilinear::{eq_table, mle_eval_many_par};
 use std::borrow::Cow;
@@ -699,11 +699,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     ps.add_scalars(&slices);
     let memory = StackClaim::Sum {
         parts: (MEMORY_0..=MEMORY_1)
-            .map(|c| SumPart {
-                offset: layout.placements[c].whole(),
-                low_point: r_mem.to_vec(),
-                scale: ch.gamma_mem[1 + c - MEMORY_0] * below_mem,
-            })
+            .map(|c| layout.placements[c].sum_part(r_mem.to_vec(), ch.gamma_mem[1 + c - MEMORY_0] * below_mem))
             .collect(),
         value: m1,
     };

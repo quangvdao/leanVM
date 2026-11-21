@@ -8,7 +8,8 @@
 //! - **point claims** ([`StackClaim`]): plain multilinear evaluations of
 //!   aligned sub-slices of the stack (a claim's weight is `eq(low_point, .)`
 //!   supported on `[offset, offset + 2^|low_point|)`, which may reach past the
-//!   committed lanes, as the OOD sample's does),
+//!   committed lanes, as the OOD sample's does), or of a column striped across lanes
+//!   ([`StackClaim::Striped`]),
 //! - **ring-switched claims** ([`RingSwitchOpen`]): bit-MLE evaluation claims
 //!   on aligned packed sub-blocks (`q_keccak`, and the pointer columns), several
 //!   weighted sub-blocks to a claim, reduced per claim by [`super::ring_switch::prove_prepare`] and the
@@ -75,36 +76,77 @@ pub enum StackClaim {
         low_point: Vec<F128>,
         value: F128,
     },
+    /// A column cut into `2^|lane_point|` pieces of `2^|low_point|` words, piece `j` at
+    /// `offset + j·2^lane_vars` (the opening's lane blocks): `eq(low_point, .)` on the
+    /// in-lane slice at `offset`, times `eq(lane_point, .)` on the lowest lane coordinates.
+    /// `offset` must be a multiple of `2^|low_point|` inside one lane block, and its lane a
+    /// multiple of `2^|lane_point|`.
+    Striped {
+        offset: usize,
+        low_point: Vec<F128>,
+        lane_point: Vec<F128>,
+        value: F128,
+    },
     /// `sum_p scale_p * eq(low_point_p, .)` on each part's aligned slice, as
-    /// [`StackClaim::Point`] places them: one value for several weighted points.
+    /// [`StackClaim::Point`] places them (or [`StackClaim::Striped`], for a part with a
+    /// `lane_point`): one value for several weighted points.
     Sum { parts: Vec<SumPart>, value: F128 },
 }
 
-/// One part of a [`StackClaim::Sum`].
+/// One part of a [`StackClaim::Sum`]. An empty `lane_point` is a part on one slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SumPart {
     pub offset: usize,
     pub low_point: Vec<F128>,
+    pub lane_point: Vec<F128>,
     pub scale: F128,
 }
 
+impl SumPart {
+    fn claim(&self) -> StackClaim {
+        StackClaim::new(self.offset, self.low_point.clone(), self.lane_point.clone(), F128::ZERO)
+    }
+}
+
 impl StackClaim {
-    #[inline]
-    pub fn value(&self) -> F128 {
-        match self {
-            StackClaim::Point { value, .. } | StackClaim::Sum { value, .. } => *value,
+    /// A [`StackClaim::Point`], or a [`StackClaim::Striped`] when `lane_point` is not empty.
+    pub fn new(offset: usize, low_point: Vec<F128>, lane_point: Vec<F128>, value: F128) -> Self {
+        if lane_point.is_empty() {
+            StackClaim::Point {
+                offset,
+                low_point,
+                value,
+            }
+        } else {
+            StackClaim::Striped {
+                offset,
+                low_point,
+                lane_point,
+                value,
+            }
         }
     }
 
-    /// The end of the stack range its weight is supported on.
-    fn end(&self) -> usize {
+    #[inline]
+    pub fn value(&self) -> F128 {
+        match self {
+            StackClaim::Point { value, .. } | StackClaim::Striped { value, .. } | StackClaim::Sum { value, .. } => {
+                *value
+            }
+        }
+    }
+
+    /// The end of the stack range its weight is supported on, in a stack of `2^lane_vars`-word lane blocks.
+    fn end(&self, lane_vars: usize) -> usize {
         match self {
             StackClaim::Point { offset, low_point, .. } => *offset + (1usize << low_point.len()),
-            StackClaim::Sum { parts, .. } => parts
-                .iter()
-                .map(|part| part.offset + (1usize << part.low_point.len()))
-                .max()
-                .unwrap_or(0),
+            StackClaim::Striped {
+                offset,
+                low_point,
+                lane_point,
+                ..
+            } => *offset + (((1usize << lane_point.len()) - 1) << lane_vars) + (1usize << low_point.len()),
+            StackClaim::Sum { parts, .. } => parts.iter().map(|part| part.claim().end(lane_vars)).max().unwrap_or(0),
         }
     }
 }
@@ -115,17 +157,13 @@ fn flatten(claims: &[StackClaim], lambdas: &[F128]) -> (Vec<StackClaim>, Vec<F12
     let mut scales = Vec::with_capacity(claims.len());
     for (claim, &lambda) in claims.iter().zip(lambdas) {
         match claim {
-            StackClaim::Point { .. } => {
+            StackClaim::Point { .. } | StackClaim::Striped { .. } => {
                 points.push(claim.clone());
                 scales.push(lambda);
             }
             StackClaim::Sum { parts, .. } => {
                 for part in parts {
-                    points.push(StackClaim::Point {
-                        offset: part.offset,
-                        low_point: part.low_point.clone(),
-                        value: F128::ZERO,
-                    });
+                    points.push(part.claim());
                     scales.push(lambda * part.scale);
                 }
             }
@@ -220,8 +258,9 @@ pub fn open_batch_mixed_whir_stacked(
             "a ring piece must fit inside the stack"
         );
     }
+    let lane_vars = log_n - config.initial_k;
     assert!(
-        point_claims.iter().all(|c| c.end() <= 1 << log_n),
+        point_claims.iter().all(|c| c.end(lane_vars) <= 1 << log_n),
         "every claim must live inside the stack"
     );
     assert!(
@@ -276,7 +315,6 @@ pub fn open_batch_mixed_whir_stacked(
 
     // Level 0's fold rounds run on the weight's terms and projections of lanes onto them, so the
     // lifted weight over the stack is never built.
-    let lane_vars = log_n - config.initial_k;
     let rings: Vec<_> = rs_outputs.into_iter().map(|output| output.weight).collect();
     let (points, scales) = flatten(point_claims, lambdas_pd);
     let initial_basis = tracing::info_span!("Basis")
@@ -408,7 +446,7 @@ mod tests {
                 shapes.retain(|&(offset, vars, _)| offset + (1 << vars) <= stack.len());
                 // The whole stack, past the committed lanes.
                 shapes.push((0, lane_vars + LANE_ROUNDS, None));
-                let claims: Vec<_> = shapes
+                let mut claims: Vec<_> = shapes
                     .into_iter()
                     .map(|(offset, vars, point)| StackClaim::Point {
                         offset,
@@ -416,6 +454,23 @@ mod tests {
                         value: rng.ext(),
                     })
                     .collect();
+                // Columns striped across the first lanes, one at in-lane word 16 and one spanning its lanes.
+                for spread in 1..=2 {
+                    if lanes_count >= 1 << spread {
+                        claims.push(StackClaim::Striped {
+                            offset: 16,
+                            low_point: rng.ext_vec(3),
+                            lane_point: rng.ext_vec(spread),
+                            value: rng.ext(),
+                        });
+                        claims.push(StackClaim::Striped {
+                            offset: 0,
+                            low_point: rng.ext_vec(lane_vars),
+                            lane_point: rng.ext_vec(spread),
+                            value: rng.ext(),
+                        });
+                    }
+                }
                 let lambdas = rng.ext_vec(claims.len());
 
                 // Oracle: the dense weight written out naively, one eq entry at a time.
@@ -429,14 +484,23 @@ mod tests {
                     }
                 }
                 for (claim, &lambda) in claims.iter().zip(&lambdas) {
-                    let StackClaim::Point { offset, low_point, .. } = claim else {
-                        unreachable!("the test makes point claims")
+                    let (offset, low_point, lane_point) = match claim {
+                        StackClaim::Point { offset, low_point, .. } => (offset, low_point, &Vec::new()),
+                        StackClaim::Striped {
+                            offset,
+                            low_point,
+                            lane_point,
+                            ..
+                        } => (offset, low_point, lane_point),
+                        StackClaim::Sum { .. } => unreachable!("the test makes no sums"),
                     };
-                    for j in 0..1usize << low_point.len() {
-                        let w = low_point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
+                    let point = [low_point.as_slice(), lane_point].concat();
+                    for j in 0..1usize << point.len() {
+                        let w = point.iter().enumerate().fold(lambda, |w, (i, &p_i)| {
                             w * if (j >> i) & 1 == 1 { p_i } else { F128::ONE + p_i }
                         });
-                        dense[offset + j] += w;
+                        let (low, piece) = (j & ((1 << low_point.len()) - 1), j >> low_point.len());
+                        dense[offset + (piece << lane_vars) + low] += w;
                     }
                 }
 

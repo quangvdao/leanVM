@@ -159,7 +159,7 @@ impl Witness {
     /// stack for a committed column or a KECCAK input lane (its slot of `q_keccak`),
     /// the private buffer for an output lane.
     pub(crate) fn columns(&self) -> Vec<&[F64]> {
-        let q_keccak = self.layout.placements[QKECCAK].offset;
+        let q_keccak = self.column(QKECCAK);
         let steps = 1 << self.layout.taus[verifier::layout::OP_KECCAK];
         let mut cols: Vec<&[F64]> = self
             .layout
@@ -167,7 +167,7 @@ impl Witness {
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => &self.q[q_keccak + slot * steps..][..steps],
+                Some(KeccakLane::Slot(slot)) => &q_keccak[slot * steps..][..steps],
                 _ if p.is_virtual() => &[][..],
                 _ if p.is_split() => &[][..],
                 _ => &self.q[p.offset..][..1 << p.n_vars],
@@ -179,6 +179,38 @@ impl Witness {
         cols
     }
 
+    /// A committed column's words in row order: its window of the stack, or for a split
+    /// column the buffer it was filled in before its pieces were scattered.
+    pub(crate) fn column(&self, i: usize) -> &[F64] {
+        column(&self.q, &self.virt, &self.layout.placements, i)
+    }
+
+    /// [`Witness::column`], to change: a split column's change reaches the stack at
+    /// [`Witness::scatter_split`].
+    #[cfg(test)]
+    pub(crate) fn column_mut(&mut self, i: usize) -> &mut [F64] {
+        let p = self.layout.placements[i];
+        if p.is_split() {
+            let (_, buf) = self
+                .virt
+                .iter_mut()
+                .find(|(c, _)| *c == i)
+                .expect("a split column keeps its buffer");
+            buf
+        } else {
+            &mut self.q[p.whole()..][..1 << p.n_vars]
+        }
+    }
+
+    /// Write every split column's buffer into its pieces of the stack again.
+    #[cfg(test)]
+    pub(crate) fn scatter_split(&mut self) {
+        let lane = self.layout.shape.mu - crate::pcs::LOG_BATCH;
+        for (i, column) in self.virt.iter().filter(|(i, _)| self.layout.placements[*i].is_split()) {
+            witness::scatter(&mut self.q, &self.layout.placements[*i], lane, column);
+        }
+    }
+
     /// Committed data before the zero-pad to `2^m`: the real witness size.
     pub(crate) fn committed_size(&self) -> usize {
         self.layout
@@ -187,6 +219,25 @@ impl Witness {
             .filter(|p| !p.is_virtual())
             .map(|p| 1usize << p.n_vars)
             .sum()
+    }
+}
+
+/// [`Witness::column`] on the witness's parts, for a caller that has moved another part out.
+pub(crate) fn column<'a>(
+    q: &'a [F64],
+    virt: &'a [(usize, Vec<F64>)],
+    placements: &[witness::Placement],
+    i: usize,
+) -> &'a [F64] {
+    let p = placements[i];
+    if p.is_split() {
+        let (_, buf) = virt
+            .iter()
+            .find(|(c, _)| *c == i)
+            .expect("a split column keeps its buffer");
+        buf
+    } else {
+        &q[p.whole()..][..1 << p.n_vars]
     }
 }
 
@@ -333,7 +384,10 @@ pub(crate) fn layout_of(log_bytecode: usize, log_mem: usize, rows: [usize; table
             pointer[sch.base[t] + column] = true;
         }
     }
-    let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus), &pointer);
+    // The opening reads the pointer columns and q_keccak through ring weights.
+    let mut ring = pointer;
+    ring[QKECCAK] = true;
+    let (placements, shape) = witness::placements_of(&col_kappas(log_mem, log_bytecode, taus), &ring);
     Layout {
         push,
         pull,
@@ -406,8 +460,9 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
         // `fill_table` asserts each table wrote all of its windows.
         .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
         .collect();
-    // A split pointer column is filled contiguously, for the link to read, and then
-    // scattered into its pieces of the stack.
+    // A split column (a pointer, q_keccak, memory or any other column the stripe
+    // layout cuts across lanes) is filled contiguously, for the link and the Keccak
+    // reduction to read, and then scattered into its pieces of the stack.
     let lane = l.shape.mu - crate::pcs::LOG_BATCH;
     let split: Vec<usize> = (0..sch.n).filter(|&i| l.placements[i].is_split()).collect();
     // SAFETY: as for the output lanes.

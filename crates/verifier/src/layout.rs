@@ -564,7 +564,7 @@ fn stacked_blocks(columns: usize) -> Vec<usize> {
 }
 
 /// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
-/// The pointer columns are [`stack_offsets`]'s shared blocks, the opening reading them all at one point.
+/// The pointer columns and q_keccak are [`stack_offsets`]'s ring blocks, the opening reading them through ring weights.
 fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
     let blocks = stacked_blocks(kappas.len());
     let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
@@ -574,8 +574,9 @@ fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
             pointer[GLOBAL_COLUMN_BASES[table.opcode] + column] = true;
         }
     }
-    let shared: Vec<bool> = blocks.iter().map(|&column| pointer[column]).collect();
-    let (block_offsets, stack_log) = stack_offsets(&block_kappas, &shared, MIN_STACKED_LOG, INITIAL_FOLDING_FACTOR);
+    pointer[QKECCAK] = true;
+    let ring: Vec<bool> = blocks.iter().map(|&column| pointer[column]).collect();
+    let (block_offsets, stack_log) = stack_offsets(&block_kappas, &ring, MIN_STACKED_LOG, INITIAL_FOLDING_FACTOR);
     (blocks.into_iter().zip(block_offsets).collect(), stack_log)
 }
 
@@ -613,18 +614,18 @@ pub fn build_layout<'a>(
     let keccak = keccak_shape(&table_log_heights);
     let kappas = column_kappas(&tables, log_memory, &table_log_heights);
     let (offsets, stack_log) = stack(&tables, &kappas);
-    let placement = |(column, &kappa): (usize, &usize)| {
-        Some(match qkeccak_slot(column) {
-            Some(slot) => Placement::whole(kappa, offsets[&QKECCAK].offset + ((slot as u64) << kappa)),
-            None => {
-                let spot = offsets.get(&column)?;
-                Placement {
-                    variables: kappa,
-                    index: spot.offset,
-                    piece_variables: spot.piece,
-                }
-            }
+    let lane = stack_log - INITIAL_FOLDING_FACTOR;
+    let block = |column: usize| {
+        let spot = offsets.get(&column)?;
+        Some(Placement {
+            variables: kappas[column],
+            index: spot.offset,
+            piece_variables: spot.piece,
         })
+    };
+    let placement = |(column, &kappa): (usize, &usize)| match qkeccak_slot(column) {
+        Some(slot) => Some(block(QKECCAK)?.rows((slot as u64) << kappa, kappa, lane)),
+        None => block(column),
     };
     let placements = kappas.iter().enumerate().map(placement).collect();
     Ok(Layout {

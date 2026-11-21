@@ -7,7 +7,7 @@
 //! The first claim weighs the bits of a word as the word itself does, so its 64 evaluations
 //! are only ever needed as the one they add up to: the committed polynomial at that point.
 
-use pcs::stack_open::{RingSwitchClaim, RingSwitchOpen, StackClaim};
+use pcs::stack_open::{RingPiece, RingSwitchClaim, RingSwitchOpen, StackClaim};
 use primitives::bit_fold::{BLOCK as ROWS, BitFold};
 use primitives::field::{F64, F128, F128Unreduced};
 use primitives::hash::STATE_LANES;
@@ -43,19 +43,36 @@ pub struct Openings {
 
 impl Openings {
     /// The openings as claims on the committed states, placed at `offset` of the stack: the
-    /// inputs' ring-switched, the outputs' a point claim to add to the batch.
-    pub fn into_pcs_claims(self, offset: usize) -> (RingSwitchOpen, Option<StackClaim>) {
+    /// inputs' ring-switched, the outputs' a point claim to add to the batch. The states may be
+    /// striped: then their `2^piece_vars`-word pieces sit at `offset + j·2^lane_vars`, a lane
+    /// block down per piece, and each claim reads them at the low end of its point (the whole
+    /// states are one piece, `piece_vars` their log size).
+    pub fn into_pcs_claims(
+        self,
+        offset: usize,
+        piece_vars: usize,
+        lane_vars: usize,
+    ) -> (RingSwitchOpen, Option<StackClaim>) {
+        let (low, high) = self.inputs.point.split_at(piece_vars.min(self.inputs.point.len()));
+        let pieces = eq_table(high)
+            .into_iter()
+            .enumerate()
+            .map(|(j, scale)| RingPiece {
+                offset: offset + (j << lane_vars),
+                point: low.to_vec(),
+                scale,
+                slices: None,
+            })
+            .collect();
         let ring = RingSwitchOpen {
-            claims: vec![RingSwitchClaim::single(
-                offset,
-                self.inputs.point,
-                Some(self.inputs.slices),
-            )],
+            claims: vec![RingSwitchClaim {
+                pieces,
+                s_hat_v: Some(self.inputs.slices),
+            }],
         };
-        let outputs = self.outputs.map(|outputs| StackClaim::Point {
-            offset,
-            low_point: outputs.point,
-            value: outputs.value,
+        let outputs = self.outputs.map(|outputs| {
+            let (low, high) = outputs.point.split_at(piece_vars.min(outputs.point.len()));
+            StackClaim::new(offset, low.to_vec(), high.to_vec(), outputs.value)
         });
         (ring, outputs)
     }

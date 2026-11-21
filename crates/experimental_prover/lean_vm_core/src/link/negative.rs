@@ -127,9 +127,7 @@ const PI: [F128; 2] = [F128::new(7, 0), F128::new(11, 0)];
 
 /// A pointer column's words, or any column's values, in the witness.
 fn column(w: &mut Witness, t: usize, c: usize) -> &mut [F64] {
-    let p = w.layout.placements[schema().base[t] + c];
-    let offset = p.whole();
-    &mut w.q[offset..offset + (1 << p.n_vars)]
+    w.column_mut(schema().base[t] + c)
 }
 
 fn plan(t: usize) -> Plan {
@@ -143,6 +141,10 @@ fn chunks(w: &Witness) -> Chunks {
 /// Prove with `tamper` applied, and verify.
 fn outcome(tamper: impl FnOnce(&mut Witness)) -> Result<(), VerifierError> {
     let program = program();
+    let tamper = |w: &mut Witness| {
+        tamper(w);
+        w.scatter_split();
+    };
     let (proof, _) = prove_tampered(&program, &[], PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
     cheat::INDEX_WORD.set(None);
     cheat::MEMORY_TERM.set(F128::ZERO);
@@ -439,6 +441,10 @@ fn rows_of_two_tables_at_the_same_index_with_swapped_cycles_are_rejected() {
             column(w, XOR, cx)[0] = b;
             column(w, MUL, cm)[0] = a;
         }
+    };
+    let tamper = |w: &mut Witness| {
+        tamper(w);
+        w.scatter_split();
     };
     let (proof, _) = prove_tampered(&program, &[], PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
     assert_eq!(

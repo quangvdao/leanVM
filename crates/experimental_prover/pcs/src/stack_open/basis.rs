@@ -85,6 +85,35 @@ fn point_factors(point: &[F128], offset: usize, bits: usize) -> Vec<Factor> {
         .collect()
 }
 
+/// The factors on the `bits` bits of the stack index of a point claim, in a stack of `2^lane_vars`-word lane blocks.
+fn claim_factors(claim: &StackClaim, bits: usize, lane_vars: usize) -> Vec<Factor> {
+    match claim {
+        StackClaim::Point { offset, low_point, .. } => point_factors(low_point, *offset, bits),
+        StackClaim::Striped {
+            offset,
+            low_point,
+            lane_point,
+            ..
+        } => {
+            assert!(
+                low_point.len() <= lane_vars,
+                "a striped claim's pieces sit inside one lane block"
+            );
+            assert_eq!(
+                (offset >> lane_vars) & ((1 << lane_point.len()) - 1),
+                0,
+                "a striped claim's pieces fill an aligned run of lanes"
+            );
+            let mut factors = point_factors(low_point, *offset, bits);
+            for (b, &p) in lane_point.iter().enumerate() {
+                factors[lane_vars + b] = Factor::Eq(p);
+            }
+            factors
+        }
+        StackClaim::Sum { .. } => unreachable!("sums are flattened into points first"),
+    }
+}
+
 /// The claims that share one low factor list `pi`, and `pi`'s form.
 struct Pattern {
     factors: Vec<Factor>,
@@ -576,7 +605,7 @@ pub(super) fn initial_basis(
     assert_eq!(claims.len(), lambdas.len());
     assert_eq!(rings.len(), ring.claims.len());
     assert!(
-        claims.iter().all(|claim| matches!(claim, StackClaim::Point { .. })),
+        claims.iter().all(|claim| !matches!(claim, StackClaim::Sum { .. })),
         "sums are flattened into points first"
     );
     assert!(
@@ -608,10 +637,7 @@ pub(super) fn initial_basis(
     // The claims' lane weights, then the rings', each `1 << lane_bits` long.
     let mut lanes: Vec<F128> = Vec::new();
     for (c, claim) in claims.iter().enumerate() {
-        let StackClaim::Point { offset, low_point, .. } = claim else {
-            unreachable!("sums are flattened into points first")
-        };
-        let factors = point_factors(low_point, *offset, bits);
+        let factors = claim_factors(claim, bits, lane_vars);
         let (low, rest) = factors.split_at(low_vars);
         let (mid, lane) = rest.split_at(lane_vars - low_vars);
         extend_table(&mut terms.gamma, mid);

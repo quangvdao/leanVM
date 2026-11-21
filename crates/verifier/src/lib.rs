@@ -178,7 +178,8 @@ struct ColumnClaim {
 impl ColumnClaim {
     /// `None` for a column nothing commits, whose claim never reaches the stack.
     fn on_stack(&self, layout: &Layout) -> Option<StackClaim<'static>> {
-        let point = layout.placements[self.column]?.stack_point(&self.point, layout.stack_log);
+        let lane = layout.stack_log - INITIAL_FOLDING_FACTOR;
+        let point = layout.placements[self.column]?.stack_point(&self.point, layout.stack_log, lane);
         Some((Box::new(move |x| eq_eval(&point, x)), self.value))
     }
 }
@@ -355,14 +356,20 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
 
     // 6] Ring switching: the Keccak reduction's input slices on q_keccak, then the pointer columns' slices. Both lead
     // the batch, then the memory term and the point claims.
+    // A striped q_keccak is its pieces, each at the low end of the point, as a split pointer column is.
     let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
+    let lane = layout.stack_log - INITIAL_FOLDING_FACTOR;
     let (point, slices) = openings.inputs;
     let keccak_ring = RingClaim {
-        pieces: vec![RingPiece {
-            placement: Some(qkeccak),
-            point,
-            scale: ONE,
-        }],
+        pieces: qkeccak
+            .pieces(lane, &point)
+            .into_iter()
+            .map(|(piece, scale)| RingPiece {
+                placement: Some(piece),
+                point: point[..piece.variables].to_vec(),
+                scale,
+            })
+            .collect(),
         slices,
     };
     let mut stack_claims: Vec<StackClaim<'static>> = ring_switch(vec![keccak_ring, link.ring], &mut transcript)?;
@@ -372,7 +379,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         .zip(memory_scales)
         .map(|(column, scale)| {
             let placement = layout.placements[column].expect("memory is committed");
-            (placement.stack_point(&memory_point, layout.stack_log), scale)
+            (placement.stack_point(&memory_point, layout.stack_log, lane), scale)
         })
         .collect();
     stack_claims.push((

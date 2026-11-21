@@ -185,8 +185,9 @@ pub(crate) fn prove_tampered(
             crate::link::prove::prove(&mut ps, &w.layout, &cols, program.stacked_bytecode())
         })
     };
-    // The link was the output lanes' last reader.
-    drop(std::mem::take(&mut w.virt));
+    // The link was the last reader of the output lanes and of the split columns' buffers, but a split q_keccak's,
+    // which the Keccak reduction reads below.
+    w.virt.retain(|(i, _)| *i == QKECCAK);
     let l = &w.layout;
 
     // The PI binding (§sec:e2e-pi) transmits nothing: its claims are the public
@@ -203,12 +204,13 @@ pub(crate) fn prove_tampered(
     // PCS below in the SAME WHIR as every leanVM point claim: one ring-switched,
     // one appended to the point claims.
     let keccak_reduction = w.keccak_reduction;
-    let witness::Placement { offset, n_vars, .. } = w.layout.placements[QKECCAK];
-    let q_keccak = &w.q[offset..][..1 << n_vars];
+    let witness::Placement { offset, piece_vars, .. } = w.layout.placements[QKECCAK];
+    let lane = w.layout.shape.mu - crate::pcs::LOG_BATCH;
+    let q_keccak = layout::column(&w.q, &w.virt, &w.layout.placements, QKECCAK);
     let openings = crate::stage!("Keccak reduction", || {
         keccak_reduction.prove(&mut ps, q_keccak, &link.output)
     });
-    let (mut ring, outputs) = openings.into_pcs_claims(offset);
+    let (mut ring, outputs) = openings.into_pcs_claims(offset, piece_vars, lane);
     ring.claims.push(link.ring);
     slots.extend(outputs);
     crate::stage!("PCS open", || { pcs::open(&mut ps, committed, w.q, &slots, &ring) });
@@ -268,32 +270,28 @@ pub fn verify(
     verifier::verify_execution(program.bytecode(), &public_input_bytes(public_input), proof)
 }
 
-/// Lift `ColumnClaim`s to located PCS claims: a claim on column `c` lives in
-/// the slot at `placements[c].offset`, with the claim's point as the low point.
+/// Lift `ColumnClaim`s to located PCS claims: a claim on column `c` lives where
+/// `placements[c]` puts it, as a point claim or, on a split column, a striped one
+/// ([`witness::Placement::claim`]).
 ///
 /// The columns `q_keccak` carries are virtual: they have no committed placement. A claim
 /// `col(r) = v` on one (at the `n_log`-dim instance point `r`) is re-routed to the equal
 /// `q_keccak` slot evaluation: an ordinary claim on the committed `QKECCAK` column at the
-/// point whose low coords are `r` and whose next `SLOT_LOG` are the slot's bits. No
+/// point whose low coords are `r` and whose next `SLOT_LOG` are the slot's bits, the slot's
+/// rows of q_keccak placed as [`witness::Placement::rows`] finds them. No
 /// downstream special-casing: it folds into the one opening like every other point claim.
 fn slot_claims(l: &Layout, claims: Vec<ColumnClaim>) -> Vec<pcs::StackClaim> {
+    let lane = l.shape.mu - crate::pcs::LOG_BATCH;
     claims
         .into_iter()
         .map(|c| {
             // A KECCAK value column (always virtual): its bus claim at instance point
             // `c.point` is a claim on the slot's `2^n_log` words of QKECCAK.
-            if let Some(KeccakLane::Slot(slot)) = keccak_value(c.col) {
-                return pcs::StackClaim::Point {
-                    offset: l.placements[QKECCAK].offset + (slot << c.point.len()),
-                    low_point: c.point,
-                    value: c.value,
-                };
-            }
-            pcs::StackClaim::Point {
-                offset: l.placements[c.col].whole(),
-                low_point: c.point,
-                value: c.value,
-            }
+            let placement = match keccak_value(c.col) {
+                Some(KeccakLane::Slot(slot)) => l.placements[QKECCAK].rows(slot << c.point.len(), c.point.len(), lane),
+                _ => l.placements[c.col],
+            };
+            placement.claim(c.point, c.value)
         })
         .collect()
 }

@@ -4,16 +4,18 @@
 //! `q̂(ζ, sel_i) = c` on the stack, where `sel_i` is the high-bit selector of
 //! the column's offset.
 
-use primitives::field::F64;
+use ::pcs::stack_open::{StackClaim, SumPart};
+use primitives::field::{F64, F128};
 
 /// Where a column sits in the stacked witness. A [`Placement::VIRTUAL`] column has no
 /// placement of its own: either its words are committed inside another column, and its
 /// evaluation claims settle there (the KECCAK columns `q_keccak` carries), or they are not
 /// committed at all and something else proves them (the KECCAK output lanes).
 ///
-/// A pointer column of the band layout can be split ([`verifier::stack_offsets`]): its
-/// rows `j·2^piece_vars..` then sit at `offset + j·2^lane`, a lane down per piece, and
-/// only the ring switch reads it, piece by piece.
+/// A column of the stripe or band layout can be split ([`verifier::stack_offsets`]): its
+/// rows `j·2^piece_vars..` then sit at `offset + j·2^lane`, a lane down per piece. The ring
+/// switch reads it piece by piece, and a point claim at one striped stack point
+/// ([`Placement::claim`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
     pub n_vars: usize,
@@ -45,6 +47,46 @@ impl Placement {
     /// Each piece's offset, in row order, in a stack of `2^lane`-word lanes.
     pub(crate) fn piece_offsets(&self, lane: usize) -> impl Iterator<Item = usize> + '_ {
         (0..1usize << (self.n_vars - self.piece_vars)).map(move |j| self.offset + (j << lane))
+    }
+
+    /// The `2^n_vars` rows from `start` (a multiple of `2^n_vars`) as a column of their own:
+    /// whole when they fit in one piece, else the run of pieces holding them
+    /// (`verifier::multilinear::Placement::rows`).
+    pub(crate) fn rows(&self, start: usize, n_vars: usize, lane: usize) -> Placement {
+        assert!(start.is_multiple_of(1 << n_vars) && start + (1 << n_vars) <= 1 << self.n_vars);
+        let piece = self.piece_vars;
+        Placement {
+            n_vars,
+            offset: self.offset + ((start >> piece) << lane) + (start & ((1 << piece) - 1)),
+            piece_vars: piece.min(n_vars),
+        }
+    }
+
+    /// The claim that the column takes `value` at row `point`, on the stack: a point claim on
+    /// a whole column, a striped one on a split column, its pieces at the low end of the point.
+    pub(crate) fn claim(&self, point: Vec<F128>, value: F128) -> StackClaim {
+        let (low, lanes) = self.split_point(point);
+        StackClaim::new(self.offset, low, lanes, value)
+    }
+
+    /// One part of a [`StackClaim::Sum`] at row `point`, as [`Placement::claim`] places it.
+    pub(crate) fn sum_part(&self, point: Vec<F128>, scale: F128) -> SumPart {
+        let (low_point, lane_point) = self.split_point(point);
+        SumPart {
+            offset: self.offset,
+            low_point,
+            lane_point,
+            scale,
+        }
+    }
+
+    fn split_point(&self, mut point: Vec<F128>) -> (Vec<F128>, Vec<F128>) {
+        assert!(
+            !self.is_virtual() && point.len() == self.n_vars,
+            "a committed column's row point"
+        );
+        let lanes = point.split_off(self.piece_vars);
+        (point, lanes)
     }
 }
 
@@ -95,17 +137,18 @@ pub(crate) fn stack_offsets(kappas: &[Option<usize>]) -> (Vec<usize>, usize) {
 
 /// Per-column placements and the stack's [`StackShape`] from the columns' log-sizes
 /// alone, by [`verifier::stack_offsets`]. A `None` kappa marks a virtual (uncommitted)
-/// column. The `pointer` columns, which the opening reads at one point, go in a band at
-/// the start of the lanes, split where wider than it. Depends only on lengths and which
+/// column. The `ring` columns (the pointers and q_keccak), which the opening reads
+/// through ring weights, are cut across the first lanes with every other column that
+/// fits there, or else go in a band at the start of the lanes. Depends only on lengths and which
 /// columns are pointers, and the verifier runs the same function, so it reconstructs
 /// the same layout.
-pub fn placements_of(kappas: &[Option<usize>], pointer: &[bool]) -> (Vec<Placement>, StackShape) {
+pub fn placements_of(kappas: &[Option<usize>], ring: &[bool]) -> (Vec<Placement>, StackShape) {
     let committed: Vec<usize> = (0..kappas.len()).filter(|&i| kappas[i].is_some()).collect();
     let sizes: Vec<usize> = committed.iter().map(|&i| kappas[i].unwrap()).collect();
-    let shared: Vec<bool> = committed.iter().map(|&i| pointer[i]).collect();
+    let ring: Vec<bool> = committed.iter().map(|&i| ring[i]).collect();
     // Floor at the PCS minimum (WHIR's level ladder needs room); tiny
     // witnesses zero-pad up.
-    let (spots, mu) = verifier::stack_offsets(&sizes, &shared, crate::pcs::MIN_STACKED_LOG, crate::pcs::LOG_BATCH);
+    let (spots, mu) = verifier::stack_offsets(&sizes, &ring, crate::pcs::MIN_STACKED_LOG, crate::pcs::LOG_BATCH);
     let mut placements = vec![Placement::VIRTUAL; kappas.len()];
     for ((&i, spot), &n_vars) in committed.iter().zip(&spots).zip(&sizes) {
         placements[i] = Placement {
@@ -115,7 +158,7 @@ pub fn placements_of(kappas: &[Option<usize>], pointer: &[bool]) -> (Vec<Placeme
         };
     }
     let placed: usize = sizes.iter().map(|&k| 1usize << k).sum();
-    // The columns fit in the fewest whole lanes (the band layout keeps to them too), and
+    // The columns fit in the fewest whole lanes (the stripe and band layouts keep to them too), and
     // the lanes past those are never committed at all.
     let n_lanes = placed.div_ceil(1 << (mu - crate::pcs::LOG_BATCH)).max(1);
     (placements, StackShape { mu, n_lanes })
@@ -240,14 +283,12 @@ mod tests {
         }
     }
 
-    /// The opening reads every pointer column at one point, over the in-lane window its pieces cover, so the
-    /// pointers must sit in a narrow band at the start of their lanes, split when a column is wider than the band. The
-    /// windows of [`split_stack`] and the pieces of [`scatter`] must then still cover every committed word once, the
-    /// pieces holding the column's rows in order.
+    /// The opening reads every ring column (here the pointers) at one point, so the stripe layout must cut each into
+    /// one piece per lane of the first lanes, all at one in-lane offset. The windows of [`split_stack`] and the pieces
+    /// of [`scatter`] must then still cover every committed word once, the pieces holding the column's rows in order.
     #[test]
-    fn pointer_columns_sit_in_a_band_and_the_stack_holds_them() {
-        // Pointer columns wider than the band (split), at its width, and narrower, among other columns, a virtual
-        // one included.
+    fn ring_columns_are_striped_and_the_stack_holds_them() {
+        // Pointer columns of several sizes among other columns, a virtual one included.
         let mut columns = vec![(Some(15), true); 2];
         columns.extend([(Some(13), true); 2]);
         columns.extend([(Some(12), true); 8].iter().chain(&[(Some(12), false); 16]));
@@ -256,20 +297,14 @@ mod tests {
         let (kappas, pointer): (Vec<Option<usize>>, Vec<bool>) = columns.into_iter().unzip();
         let (placements, shape) = placements_of(&kappas, &pointer);
         let lane = shape.mu - crate::pcs::LOG_BATCH;
-        assert!(placements.iter().any(|p| p.is_split()), "the case splits a column");
-        let band = (0..kappas.len())
-            .filter(|&i| pointer[i] && kappas[i].is_some())
-            .map(|i| placements[i].piece_vars)
-            .max()
-            .unwrap();
-        assert!(band < lane, "the band ({band}) is narrower than a lane ({lane})");
+        let width = shape.n_lanes.ilog2() as usize;
         for i in (0..kappas.len()).filter(|&i| pointer[i] && kappas[i].is_some()) {
-            for offset in placements[i].piece_offsets(lane) {
-                assert!(
-                    offset % (1 << lane) + (1 << placements[i].piece_vars) <= 1 << band,
-                    "column {i} is in the band"
-                );
+            let p = placements[i];
+            assert_eq!(p.n_vars - p.piece_vars, width, "column {i} has a piece per stripe lane");
+            for (j, offset) in p.piece_offsets(lane).enumerate() {
+                assert_eq!(offset, (j << lane) + p.offset, "column {i}'s piece {j} is in lane {j}");
             }
+            assert!(p.offset < 1 << lane, "column {i} starts in lane 0");
         }
 
         // Write column i's row u as i·2^32 + u + 1 through the windows and the scatter, and read it back.
