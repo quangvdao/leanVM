@@ -38,12 +38,6 @@ impl Placement {
         !self.is_virtual() && self.piece_vars < self.n_vars
     }
 
-    /// The offset of a whole (unsplit) column.
-    pub(crate) fn whole(&self) -> usize {
-        assert!(!self.is_split(), "a split column has no single window");
-        self.offset
-    }
-
     /// Each piece's offset, in row order, in a stack of `2^lane`-word lanes.
     pub(crate) fn piece_offsets(&self, lane: usize) -> impl Iterator<Item = usize> + '_ {
         (0..1usize << (self.n_vars - self.piece_vars)).map(move |j| self.offset + (j << lane))
@@ -80,6 +74,32 @@ impl Placement {
         }
     }
 
+    /// The column's rows in `q`, the stack.
+    pub(crate) fn view<'a>(&self, q: &'a [F64], lane: usize) -> Col<'a> {
+        assert!(!self.is_virtual(), "a virtual column is not in the stack");
+        let len = 1 << self.n_vars;
+        if self.is_split() {
+            let end = self.offset + (((len >> self.piece_vars) - 1) << lane) + (1 << self.piece_vars);
+            Col::split(&q[self.offset..end], self.piece_vars, lane, len)
+        } else {
+            Col::whole(&q[self.offset..][..len])
+        }
+    }
+
+    /// [`Placement::view`], to write.
+    #[cfg(test)]
+    pub(crate) fn view_mut<'a>(&self, q: &'a mut [F64], lane: usize) -> ColMut<'a> {
+        let col = self.view(q, lane);
+        let (piece, lane, len) = (col.piece, col.lane, col.len);
+        ColMut {
+            words: parallel::SendPtr(q[self.offset..].as_mut_ptr()),
+            piece,
+            lane,
+            len,
+            _q: std::marker::PhantomData,
+        }
+    }
+
     fn split_point(&self, mut point: Vec<F128>) -> (Vec<F128>, Vec<F128>) {
         assert!(
             !self.is_virtual() && point.len() == self.n_vars,
@@ -87,6 +107,296 @@ impl Placement {
         );
         let lanes = point.split_off(self.piece_vars);
         (point, lanes)
+    }
+}
+
+/// A column's rows in order, wherever the stack holds them: one run of words for a whole column, or for a split one
+/// ([`Placement`]) `2^piece` rows per piece, piece `j` starting `j·2^lane` words after the first.
+#[derive(Debug)]
+pub struct Col<'a, T = F64> {
+    /// From the column's first word to the end of its last piece.
+    words: &'a [T],
+    piece: usize,
+    lane: usize,
+    len: usize,
+}
+
+// By hand: the derives would demand `T: Clone` and `T: Copy`.
+impl<T> Clone for Col<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Col<'_, T> {}
+
+impl<'a, T: Copy> Col<'a, T> {
+    /// A column held as one run of words.
+    pub const fn whole(words: &'a [T]) -> Self {
+        Self {
+            words,
+            piece: usize::BITS as usize - 1,
+            lane: 0,
+            len: words.len(),
+        }
+    }
+
+    /// `len` rows, `2^piece` per piece, piece `j` at `words[j·2^lane..]`.
+    pub fn split(words: &'a [T], piece: usize, lane: usize, len: usize) -> Self {
+        assert!(
+            piece <= lane && len.is_multiple_of(1 << piece),
+            "pieces of whole rows inside their lanes"
+        );
+        assert!(len == 0 || words.len() >= (((len >> piece) - 1) << lane) + (1 << piece));
+        Self {
+            words,
+            piece,
+            lane,
+            len,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Where row `u` is in `words`.
+    #[inline(always)]
+    fn at(&self, u: usize) -> usize {
+        ((u >> self.piece) << self.lane) + (u & ((1 << self.piece) - 1))
+    }
+
+    /// Row `u`, which the column has.
+    #[inline(always)]
+    fn read(&self, u: usize) -> &'a T {
+        // SAFETY: [`Col::split`] checks that `words` reaches the last row's word, and every row below `len` is at or
+        // before it; the callers check `u < len`.
+        unsafe { self.words.get_unchecked(self.at(u)) }
+    }
+
+    /// Row `u`, if the column has it.
+    #[inline(always)]
+    pub fn get(&self, u: usize) -> Option<T> {
+        (u < self.len).then(|| *self.read(u))
+    }
+
+    /// Rows in one piece: the whole column if it is one run.
+    pub fn piece_len(&self) -> usize {
+        self.len.min(1 << self.piece)
+    }
+
+    /// The pieces, in row order: one run of [`Self::piece_len`] rows each.
+    pub fn pieces(&self) -> impl ExactSizeIterator<Item = &'a [T]> + use<'a, T> {
+        let (words, piece, lane) = (self.words, self.piece_len(), self.lane);
+        (0..self.len.div_ceil(piece.max(1))).map(move |j| &words[j << lane..][..piece])
+    }
+
+    /// Rows `start..end` as runs of words, each with its first row.
+    pub fn runs(&self, start: usize, end: usize) -> impl Iterator<Item = (usize, &'a [T])> + use<'a, T> {
+        assert!(start <= end && end <= self.len);
+        let (col, piece) = (*self, self.piece_len().max(1));
+        let mut u = start;
+        std::iter::from_fn(move || {
+            (u < end).then(|| {
+                let len = (piece - u % piece).min(end - u);
+                let run = (u, &col.words[col.at(u)..][..len]);
+                u += len;
+                run
+            })
+        })
+    }
+
+    /// Rows `start..start + len`, which lie in one piece.
+    pub fn run(&self, start: usize, len: usize) -> &'a [T] {
+        assert!(
+            start + len <= self.len && (len == 0 || start / self.piece_len() == (start + len - 1) / self.piece_len())
+        );
+        &self.words[self.at(start)..][..len]
+    }
+
+    /// Rows `start..end` as one run of words: borrowed when they lie in one piece, copied otherwise.
+    pub fn window(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
+        assert!(start <= end && end <= self.len);
+        let piece = self.piece_len().max(1);
+        if start == end {
+            std::borrow::Cow::Borrowed(&[])
+        } else if start / piece == (end - 1) / piece {
+            std::borrow::Cow::Borrowed(&self.words[self.at(start)..][..end - start])
+        } else {
+            std::borrow::Cow::Owned(self.runs(start, end).flat_map(|(_, run)| run.iter().copied()).collect())
+        }
+    }
+
+    /// The first `len` rows.
+    pub fn prefix(&self, len: usize) -> Self {
+        assert!(len <= self.len);
+        Self { len, ..*self }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = T> + use<'a, T> {
+        self.pieces().flat_map(|piece| piece.iter().copied())
+    }
+
+    pub fn to_vec(&self) -> Vec<T> {
+        self.iter().collect()
+    }
+
+    /// The last row that satisfies `f`.
+    pub fn rposition(&self, f: impl Fn(T) -> bool) -> Option<usize> {
+        let piece = self.piece_len();
+        let pieces: Vec<&[T]> = self.pieces().collect();
+        pieces
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(j, p)| p.iter().rposition(|&v| f(v)).map(|r| j * piece + r))
+    }
+}
+
+impl<'a> Col<'a, F64> {
+    /// A pointer column's words.
+    pub fn words(self) -> Col<'a, u64> {
+        Col {
+            words: primitives::cast_slice(self.words),
+            piece: self.piece,
+            lane: self.lane,
+            len: self.len,
+        }
+    }
+}
+
+impl<'a, T: Copy> From<&'a [T]> for Col<'a, T> {
+    fn from(words: &'a [T]) -> Self {
+        Self::whole(words)
+    }
+}
+
+impl<'a, T: Copy> From<&'a Vec<T>> for Col<'a, T> {
+    fn from(words: &'a Vec<T>) -> Self {
+        Self::whole(words)
+    }
+}
+
+impl<T: Copy> std::ops::Index<usize> for Col<'_, T> {
+    type Output = T;
+
+    #[inline(always)]
+    fn index(&self, u: usize) -> &T {
+        assert!(u < self.len, "row {u} of a column of {}", self.len);
+        self.read(u)
+    }
+}
+
+/// Several columns' multilinear extensions at one `point`, in one dispatch: a split column is the `eq`-weighted sum of
+/// its pieces at the point's low end.
+pub fn mle_eval_cols(cols: &[Col], point: &[F128]) -> Vec<F128> {
+    let mut values = vec![F128::ZERO; cols.len()];
+    let mut logs: Vec<usize> = cols.iter().map(|c| c.piece_len().trailing_zeros() as usize).collect();
+    logs.sort_unstable();
+    logs.dedup();
+    for log in logs {
+        let of: Vec<usize> = (0..cols.len()).filter(|&c| cols[c].piece_len() == 1 << log).collect();
+        let pieces: Vec<&[F64]> = of.iter().flat_map(|&c| cols[c].pieces()).collect();
+        let at = primitives::multilinear::mle_eval_many_par(&pieces, &point[..log]);
+        let eq = primitives::multilinear::eq_table_serial(&point[log..]);
+        let mut at = at.into_iter();
+        for &c in &of {
+            values[c] = eq.iter().zip(at.by_ref()).map(|(&e, v)| e * v).sum();
+        }
+    }
+    values
+}
+
+/// A column to write, as [`Col`] reads it: the window a fill writes, in the stack or in a buffer of its own. Rows on
+/// different threads may be written at once, so each write is `unsafe`, and the caller keeps them disjoint.
+pub struct ColMut<'a> {
+    words: parallel::SendPtr<F64>,
+    piece: usize,
+    lane: usize,
+    len: usize,
+    _q: std::marker::PhantomData<&'a mut [F64]>,
+}
+
+// SAFETY: a `ColMut` writes only through `unsafe` calls whose callers keep the rows of concurrent writes disjoint.
+unsafe impl Sync for ColMut<'_> {}
+unsafe impl Send for ColMut<'_> {}
+
+impl<'a> ColMut<'a> {
+    /// No window: a column held elsewhere.
+    pub const EMPTY: Self = Self {
+        words: parallel::SendPtr(std::ptr::NonNull::dangling().as_ptr()),
+        piece: 0,
+        lane: 0,
+        len: 0,
+        _q: std::marker::PhantomData,
+    };
+
+    pub fn whole(words: &'a mut [F64]) -> Self {
+        Self {
+            words: parallel::SendPtr(words.as_mut_ptr()),
+            piece: usize::BITS as usize - 1,
+            lane: 0,
+            len: words.len(),
+            _q: std::marker::PhantomData,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn piece_len(&self) -> usize {
+        self.len.min(1 << self.piece)
+    }
+
+    /// Write `values` to rows `start..`, piece by piece.
+    ///
+    /// # Safety
+    /// The rows are the column's, and no concurrent write or read reaches them.
+    #[inline]
+    pub unsafe fn write(&self, stream: &primitives::stream::Stream, start: usize, values: &[F64]) {
+        debug_assert!(start + values.len() <= self.len);
+        let mask = (1usize << self.piece) - 1;
+        let mut u = start;
+        let mut values = values;
+        while !values.is_empty() {
+            // Up to the end of row `u`'s piece: shifts and masks only, as fills call this a few rows at a time.
+            let len = (mask - (u & mask) + 1).min(values.len());
+            let at = ((u >> self.piece) << self.lane) + (u & mask);
+            // SAFETY: forwarded to the caller; row `u`'s run lies in its piece.
+            unsafe { stream.copy_uninit(self.words.0.add(at), &values[..len]) };
+            values = &values[len..];
+            u += len;
+        }
+    }
+
+    /// Rows `start..start + len`, which lie in one piece, as a window of their own.
+    pub fn rows(&mut self, start: usize, len: usize) -> ColMut<'_> {
+        let piece = self.piece_len();
+        assert!(start + len <= self.len && (len == 0 || start / piece == (start + len - 1) / piece));
+        let at = ((start >> self.piece) << self.lane) + (start & ((1 << self.piece) - 1));
+        // SAFETY: the rows are in one piece of this window, which `self`'s borrow keeps from any other.
+        ColMut::whole(unsafe { std::slice::from_raw_parts_mut(self.words.0.add(at), len) })
+    }
+
+    /// Disjoint runs of `len` rows each, which split the column, every run in one piece.
+    pub fn runs_of(self, len: usize) -> Vec<&'a mut [F64]> {
+        assert!(len > 0 && self.len.is_multiple_of(len) && self.piece_len().is_multiple_of(len));
+        (0..self.len / len)
+            .map(|k| {
+                let start = k * len;
+                let at = ((start >> self.piece) << self.lane) + (start & ((1 << self.piece) - 1));
+                // SAFETY: the runs are disjoint rows of this window, each in one piece, and `self` is consumed.
+                unsafe { std::slice::from_raw_parts_mut(self.words.0.add(at), len) }
+            })
+            .collect()
     }
 }
 
@@ -173,75 +483,81 @@ const FILL_CHUNK: usize = 1 << 16;
 ///
 /// # Safety
 /// Every slot must be written before it is read. [`split_stack`] hands out one
-/// window per whole committed column and zeroes every word no column covers, and
-/// [`scatter`] writes a split column's pieces, which together cover the whole
-/// allocation, so the obligation reduces to each column's fill writing its own window.
+/// window per committed column and zeroes every word no column covers, so the
+/// obligation reduces to each column's fill writing its own window.
 pub unsafe fn alloc_stack(shape: StackShape) -> Vec<F64> {
     // SAFETY: forwarded to the caller by the contract above.
     unsafe { primitives::uninit_vec::<F64>(shape.committed_len()) }
 }
 
-/// Carve the stack into one mutable window per whole committed column, in column order,
-/// and zero every word no column covers. A virtual column gets an empty window: it is
-/// not in the stack, so its values need storage of their own. So does a split column,
-/// whose pieces [`scatter`] writes once it is filled.
+/// Carve the stack into one window per committed column, in column order, and zero every word no column covers. A
+/// split column's window is its pieces ([`ColMut`]). A virtual column gets an empty window: it is not in the stack, so
+/// its values need storage of their own.
 ///
 /// Writing each column into its final place is what lets the whole witness be
 /// written once. Copying columns in afterwards would move the entire stack a
 /// second time for nothing, and allocating the stack zeroed
 /// would memset all `2^m` slots only for the columns to overwrite them.
 ///
-/// Safe despite [`alloc_stack`]'s uninitialized allocation: the windows and the split
-/// columns' pieces are disjoint (checked here), this zeroes the rest, and a split
-/// column's pieces are left to [`scatter`].
-pub fn split_stack<'a>(q: &'a mut [F64], placements: &[Placement], lane: usize) -> Vec<&'a mut [F64]> {
-    // Every piece of every committed column: (offset, length, column, whole).
-    let mut pieces: Vec<(usize, usize, usize, bool)> = Vec::new();
-    for (i, p) in placements.iter().enumerate().filter(|(_, p)| !p.is_virtual()) {
-        if p.is_split() {
-            pieces.extend(
-                p.piece_offsets(lane)
-                    .map(|offset| (offset, 1 << p.piece_vars, i, false)),
-            );
-        } else {
-            pieces.push((p.offset, 1 << p.n_vars, i, true));
-        }
+/// Safe despite [`alloc_stack`]'s uninitialized allocation: the windows are disjoint (checked here), and this zeroes
+/// the rest.
+pub fn split_stack<'a>(q: &'a mut [F64], placements: &[Placement], lane: usize) -> Vec<ColMut<'a>> {
+    // Every piece of every committed column: (offset, length).
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for p in placements.iter().filter(|p| !p.is_virtual()) {
+        let len = 1usize << p.piece_vars.min(p.n_vars);
+        pieces.extend(p.piece_offsets(lane).map(|offset| (offset, len)));
     }
     pieces.sort_unstable();
-
-    let mut windows: Vec<&mut [F64]> = Vec::with_capacity(placements.len());
-    windows.resize_with(placements.len(), || &mut []);
-    let mut rest = q;
     let mut at = 0usize;
-    for (offset, len, i, whole) in pieces {
+    for (offset, len) in pieces {
         assert!(offset >= at, "the stacked columns overlap");
-        let (gap, tail) = rest.split_at_mut(offset - at);
-        parallel::chunks_mut(gap, FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
-        let (window, tail) = tail.split_at_mut(len);
-        if whole {
-            windows[i] = window;
-        }
-        rest = tail;
+        parallel::chunks_mut(&mut q[at..offset], FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
         at = offset + len;
     }
-    parallel::chunks_mut(rest, FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
-    windows
-}
+    parallel::chunks_mut(&mut q[at..], FILL_CHUNK, |_, pad| pad.fill(F64::ZERO));
 
-/// Write a split column, filled contiguously in `column`, into its pieces of the stack.
-pub fn scatter(q: &mut [F64], placement: &Placement, lane: usize, column: &[F64]) {
-    assert_eq!(column.len(), 1 << placement.n_vars, "a split column spans its rows");
-    for (offset, rows) in placement
-        .piece_offsets(lane)
-        .zip(column.chunks_exact(1 << placement.piece_vars))
-    {
-        q[offset..offset + rows.len()].copy_from_slice(rows);
-    }
+    let words = parallel::SendPtr(q.as_mut_ptr());
+    placements
+        .iter()
+        .map(|p| {
+            if p.is_virtual() {
+                return ColMut::EMPTY;
+            }
+            ColMut {
+                // SAFETY: the column's pieces lie in `q`, checked disjoint from every other column's above.
+                words: parallel::SendPtr(unsafe { words.add(p.offset) }),
+                piece: if p.is_split() {
+                    p.piece_vars
+                } else {
+                    usize::BITS as usize - 1
+                },
+                lane: if p.is_split() { lane } else { 0 },
+                len: 1 << p.n_vars,
+                _q: std::marker::PhantomData,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window inside one piece borrows the stack's words; one across pieces copies the same rows in order.
+    #[test]
+    fn a_window_is_its_rows_in_order() {
+        // 4 rows a piece, pieces 8 words apart: row `u` is word `(u / 4)·8 + u % 4`.
+        let words: Vec<u64> = (0..28).collect();
+        let col = Col::split(&words, 2, 3, 16);
+        let rows = |start: usize, end: usize| (start..end).map(|u| col[u]).collect::<Vec<_>>();
+        for (start, end) in [(0, 4), (5, 7), (4, 4), (16, 16), (2, 6), (3, 16), (0, 16)] {
+            let window = col.window(start, end);
+            assert_eq!(*window, rows(start, end));
+            let one_piece = end == start || start / 4 == (end - 1) / 4;
+            assert_eq!(matches!(window, std::borrow::Cow::Borrowed(_)), one_piece);
+        }
+    }
 
     /// The shape has to cover the placed columns with as few lanes as possible: the
     /// prover commits `committed_len()` words, so anything short of `placed` would
@@ -284,8 +600,8 @@ mod tests {
     }
 
     /// The opening reads every ring column (here the pointers) at one point, so the stripe layout must cut each into
-    /// one piece per lane of the first lanes, all at one in-lane offset. The windows of [`split_stack`] and the pieces
-    /// of [`scatter`] must then still cover every committed word once, the pieces holding the column's rows in order.
+    /// one piece per lane of the first lanes, all at one in-lane offset. The windows of [`split_stack`] must then still
+    /// cover every committed word once, the pieces holding the column's rows in order.
     #[test]
     fn ring_columns_are_striped_and_the_stack_holds_them() {
         // Pointer columns of several sizes among other columns, a virtual one included.
@@ -297,7 +613,7 @@ mod tests {
         let (kappas, pointer): (Vec<Option<usize>>, Vec<bool>) = columns.into_iter().unzip();
         let (placements, shape) = placements_of(&kappas, &pointer);
         let lane = shape.mu - crate::pcs::LOG_BATCH;
-        let width = shape.n_lanes.ilog2() as usize;
+        let width = (shape.n_lanes.ilog2() as usize).min(verifier::MAX_STRIPE_WIDTH);
         for i in (0..kappas.len()).filter(|&i| pointer[i] && kappas[i].is_some()) {
             let p = placements[i];
             assert_eq!(p.n_vars - p.piece_vars, width, "column {i} has a piece per stripe lane");
@@ -307,18 +623,33 @@ mod tests {
             assert!(p.offset < 1 << lane, "column {i} starts in lane 0");
         }
 
-        // Write column i's row u as i·2^32 + u + 1 through the windows and the scatter, and read it back.
+        // Write column i's row u as i·2^32 + u + 1 through the windows, and read it back.
         let value = |i: usize, u: usize| F64(((i as u64) << 32) + u as u64 + 1);
         let mut q = vec![F64(u64::MAX); shape.committed_len()];
         let windows = split_stack(&mut q, &placements, lane);
-        for (i, window) in windows.into_iter().enumerate() {
-            for (u, word) in window.iter_mut().enumerate() {
-                *word = value(i, u);
+        let stream = primitives::stream::Stream::new();
+        for (i, window) in windows.iter().enumerate() {
+            let column: Vec<F64> = (0..window.len()).map(|u| value(i, u)).collect();
+            // A write at an odd row and length crosses pieces.
+            let cut = column.len().min(3);
+            // SAFETY: the rows are the window's, written once.
+            unsafe {
+                window.write(&stream, 0, &column[..cut]);
+                window.write(&stream, cut, &column[cut..]);
             }
         }
-        for (i, p) in placements.iter().enumerate().filter(|(_, p)| p.is_split()) {
-            let column: Vec<F64> = (0..1 << p.n_vars).map(|u| value(i, u)).collect();
-            scatter(&mut q, p, lane, &column);
+        drop(windows);
+        for (i, p) in placements.iter().enumerate().filter(|(_, p)| !p.is_virtual()) {
+            let col = p.view(&q, lane);
+            assert!(
+                (0..1 << p.n_vars).all(|u| col[u] == value(i, u)),
+                "column {i} reads back in row order"
+            );
+            let runs: Vec<F64> = col
+                .runs(1, col.len())
+                .flat_map(|(_, run)| run.iter().copied())
+                .collect();
+            assert_eq!(runs, col.to_vec()[1..], "column {i}'s runs");
         }
         let mut covered = 0;
         for (i, p) in placements.iter().enumerate().filter(|(_, p)| !p.is_virtual()) {

@@ -214,7 +214,7 @@ impl Chunks {
     }
 
     /// [`Self::decode_all`] of several columns of words, in one dispatch.
-    pub fn decode_many(&self, columns: &[&[u64]]) -> Vec<Vec<u32>> {
+    pub fn decode_many(&self, columns: &[crate::witness::Col<u64>]) -> Vec<Vec<u32>> {
         const TASK: usize = 1 << 12;
         // SAFETY: the tasks cover every entry of every column once, and each task writes its entries.
         let mut out: Vec<Vec<u32>> = columns
@@ -229,11 +229,12 @@ impl Chunks {
         parallel::for_each(*first.last().unwrap(), |task| {
             let c = first.partition_point(|&f| f <= task) - 1;
             let start = (task - first[c]) * TASK;
-            let words = &columns[c][start..columns[c].len().min(start + TASK)];
-            // SAFETY: the task's entries are its own, inside column `c`.
-            let index = unsafe { std::slice::from_raw_parts_mut(ptrs[c].0.add(start), words.len()) };
-            for (o, &w) in index.iter_mut().zip(words) {
-                *o = self.decode(w).map_or(NO_INDEX, |sigma| sigma as u32);
+            for (at, words) in columns[c].runs(start, columns[c].len().min(start + TASK)) {
+                // SAFETY: the task's entries are its own, inside column `c`.
+                let index = unsafe { std::slice::from_raw_parts_mut(ptrs[c].0.add(at), words.len()) };
+                for (o, &w) in index.iter_mut().zip(words) {
+                    *o = self.decode(w).map_or(NO_INDEX, |sigma| sigma as u32);
+                }
             }
         });
         out

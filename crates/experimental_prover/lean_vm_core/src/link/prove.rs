@@ -15,9 +15,10 @@ use crate::leaf::{BusForm, ColumnClaim, Coord, accumulate_form};
 use crate::pcs::{RingSwitchClaim, StackClaim};
 use crate::tables::{self, Links, Table};
 use crate::transcript::ProverState;
+use crate::witness::{Col, mle_eval_cols};
 use ::pcs::stack_open::RingPiece;
 use primitives::field::{F64, F128};
-use primitives::multilinear::{eq_table, mle_eval_many_par};
+use primitives::multilinear::eq_table;
 use std::borrow::Cow;
 use verifier::layout::{BUS_BITS, MEMORY_0, MEMORY_1};
 
@@ -31,28 +32,39 @@ const MEMORY_SLOTS: usize = 256;
 /// instructions recur only once per pass through it and every worker runs the same hot loops.
 const PROGRAM_SLOTS: usize = 4096;
 
-/// The words of a pointer column.
-fn words(column: &[F64]) -> &[u64] {
-    // SAFETY: `F64` is `#[repr(transparent)]` over `u64`.
-    unsafe { std::slice::from_raw_parts(column.as_ptr().cast(), column.len()) }
+/// A pointer column's words: the column's own in the stack, or a test's changed copy.
+enum Words<'a> {
+    Stack(Col<'a, u64>),
+    #[cfg(test)]
+    Owned(Vec<u64>),
+}
+
+impl Words<'_> {
+    fn col(&self) -> Col<'_, u64> {
+        match self {
+            Words::Stack(words) => *words,
+            #[cfg(test)]
+            Words::Owned(words) => Col::whole(words),
+        }
+    }
 }
 
 /// The words of a table's pointer column that the index side scatters: the column's own.
 #[cfg(not(test))]
-fn index_words(_: usize, _: usize, words: &[u64]) -> Cow<'_, [u64]> {
-    Cow::Borrowed(words)
+fn index_words(_: usize, _: usize, words: Col<'_, u64>) -> Words<'_> {
+    Words::Stack(words)
 }
 
 /// The words of a table's pointer column that the index side scatters: the column's own, unless a test cheats.
 #[cfg(test)]
-fn index_words(t: usize, column: usize, words: &[u64]) -> Cow<'_, [u64]> {
+fn index_words(t: usize, column: usize, words: Col<'_, u64>) -> Words<'_> {
     match cheat::INDEX_WORD.get() {
         Some((ct, cc, u, word)) if (ct, cc) == (t, column) && u < words.len() => {
             let mut words = words.to_vec();
             words[u] = word;
-            Cow::Owned(words)
+            Words::Owned(words)
         }
-        _ => Cow::Borrowed(words),
+        _ => Words::Stack(words),
     }
 }
 
@@ -266,9 +278,9 @@ fn blocks(
 }
 
 /// One past the last row that differs from the padrow in any column, at least `rows`, even, at most `2^log_rows`.
-fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usize) -> usize {
+fn explicit_rows(columns: &[Col], padrow: &[F64], rows: usize, log_rows: usize) -> usize {
     let last = parallel::map_collect(columns.len(), |c| {
-        columns[c].iter().rposition(|&v| v != padrow[c]).map_or(0, |u| u + 1)
+        columns[c].rposition(|v| v != padrow[c]).map_or(0, |u| u + 1)
     });
     let e = last.into_iter().max().unwrap_or(0).max(rows);
     (e + (e & 1)).min(1 << log_rows)
@@ -276,13 +288,24 @@ fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usiz
 
 /// `f(j, g^j)` for `j < n`, in parallel: each task seeds `g^j` once and steps it by `g`.
 fn tabulate_powers(n: usize, f: impl Fn(usize, F64) -> F128 + Sync) -> Vec<F128> {
+    tabulate_powers_in(n, |_| (), |(), j, g_j| f(j, g_j))
+}
+
+/// [`tabulate_powers`] with `window` made once per task from its entries' range, for `f` to read from.
+fn tabulate_powers_in<W>(
+    n: usize,
+    window: impl Fn(std::ops::Range<usize>) -> W + Sync,
+    f: impl Fn(&W, usize, F64) -> F128 + Sync,
+) -> Vec<F128> {
     // SAFETY: every entry is written.
     unsafe {
         primitives::filled_vec(n, |out| {
             parallel::chunks_mut(out, TASK, |task, chunk| {
                 let mut g = primitives::field::g_pow(task * TASK);
+                let start = task * TASK;
+                let w = window(start..start + chunk.len());
                 for (k, o) in chunk.iter_mut().enumerate() {
-                    *o = f(task * TASK + k, g);
+                    *o = f(&w, start + k, g);
                     g = primitives::field::mul_by_g(g);
                 }
             })
@@ -320,7 +343,7 @@ pub(crate) struct LinkEnd {
 
 /// Prove the links of an execution whose committed columns are `columns` (every global column, virtual ones
 /// included), of `layout`, running `program`.
-pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], program: &[u64]) -> LinkEnd {
+pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], program: &[u64]) -> LinkEnd {
     let chunks = Chunks::new(layout.pointer_width);
     let width = chunks.width;
     let n = 1usize << width;
@@ -370,8 +393,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     // The base terms' `ω` blocks' first row round, which also gives the index side its payload.
     let mut base_firsts = Vec::new();
     // Each pointer column's indices, in `Plan::pointers` order, decoded once for both sides.
-    let pointer_words: Vec<&[u64]> = (0..tables::N_TABLES)
-        .flat_map(|t| plans[t].pointers.iter().map(move |&c| words(local(t)[c])))
+    let pointer_words: Vec<Col<u64>> = (0..tables::N_TABLES)
+        .flat_map(|t| plans[t].pointers.iter().map(move |&c| local(t)[c].words()))
         .collect();
     let mut decoded = chunks.decode_many(&pointer_words).into_iter();
     let mut indices: Vec<Vec<Vec<u32>>> = (0..tables::N_TABLES)
@@ -382,11 +405,12 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
         let pointer = |t: usize, c: usize| {
             let (plan, cols, n_t) = (&plans[t], local(t), rows[t]);
             let k = plan.pointers.iter().position(|&p| p == c).expect("a pointer column");
-            match index_words(t, c, &words(cols[c])[..n_t]) {
-                Cow::Borrowed(w) => (Cow::Borrowed(w), Cow::Borrowed(&indices[t][k][..n_t])),
-                Cow::Owned(w) => {
+            match index_words(t, c, cols[c].words().prefix(n_t)) {
+                Words::Stack(w) => (Words::Stack(w), Cow::Borrowed(&indices[t][k][..n_t])),
+                #[cfg(test)]
+                Words::Owned(w) => {
                     let index = chunks.decode_all(&w);
-                    (Cow::Owned(w), Cow::Owned(index))
+                    (Words::Owned(w), Cow::Owned(index))
                 }
             }
         };
@@ -397,7 +421,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             let arrays = lens.map(Scatter::new);
             let [w_plus, spine, cover, w_mem, w_bc] = &arrays;
             // Every table's cycles in one pass over the cycle-indexed arrays.
-            let cycle_words: Vec<(&[u64], &[u32])> = cycles_at.iter().map(|(w, at)| (&w[..], &at[..])).collect();
+            let cycle_words: Vec<(Col<u64>, &[u32])> = cycles_at.iter().map(|(w, at)| (w.col(), &at[..])).collect();
             let targets = [(w_plus, 1), (spine, 0), (cover, 0)];
             Scatter::add_sorted_words_to(&chunks, &cycle_words, targets, |t, u| {
                 [omegas[t][u], state_at(t, u), F128::ONE]
@@ -408,8 +432,8 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                 // Every access of the table in one pass over its rows.
                 let memory = &plan.links.memory[..plan.links.memory.len().min(ch.mu[t].len())];
                 let pointers: Vec<_> = memory.iter().map(|access| pointer(access.pointer)).collect();
-                let accesses: Vec<(&[u64], &[u32], usize)> = (pointers.iter().zip(memory))
-                    .map(|((words, at), access)| (&words[..], &at[..], access.shift))
+                let accesses: Vec<(Col<u64>, &[u32], usize)> = (pointers.iter().zip(memory))
+                    .map(|((words, at), access)| (words.col(), &at[..], access.shift))
                     .collect();
                 w_mem.add_repeated_accesses::<MEMORY_SLOTS>(&chunks, &accesses, |a, u| {
                     let w = ch.mu[t][a] * omega[u];
@@ -419,7 +443,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                     }
                 });
                 let (bc, at) = pointer(plan.links.bytecode.pointer);
-                w_bc.add_repeated_words::<PROGRAM_SLOTS>(&chunks, &bc, &at, 0, |u| omega[u]);
+                w_bc.add_repeated_words::<PROGRAM_SLOTS>(&chunks, bc.col(), &at, 0, |u| omega[u]);
             }
             arrays
         };
@@ -445,10 +469,15 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
         let (mem_len, bc_len) = (reach(1 << log_mem, w_mem.len()), reach(bytecode_size, w_bc.len()));
         let gm = ch.gamma_mem;
         let mem = &columns[MEMORY_0..=MEMORY_1];
-        let y_mem = tabulate_powers(mem_len, |j, g_j| {
+        // Each task reads its memory cells as one run of each column.
+        let cells = |r: std::ops::Range<usize>| {
+            let (start, end) = (r.start.min(1 << log_mem), r.end.min(1 << log_mem));
+            (start, mem[0].window(start, end), mem[1].window(start, end))
+        };
+        let y_mem = tabulate_powers_in(mem_len, cells, |(start, m0, m1), j, g_j| {
             let mut y = gm[0].mul_base(g_j);
             if j < 1 << log_mem {
-                y += gm[3] + gm[1].mul_base(mem[0][j]) + gm[2].mul_base(mem[1][j]);
+                y += gm[3] + gm[1].mul_base(m0[j - start]) + gm[2].mul_base(m1[j - start]);
             }
             y
         });
@@ -539,7 +568,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     let (w_plus_r, spine_r) = (index_end.values[0], index_end.values[1]);
     let r_mem = &r[..log_mem];
     let below_mem = below_power(r, log_mem);
-    let mem_values = mle_eval_many_par(&columns[MEMORY_0..=MEMORY_1], r_mem);
+    let mem_values = mle_eval_cols(&columns[MEMORY_0..=MEMORY_1], r_mem);
     let m1: F128 = (0..2).map(|c| ch.gamma_mem[1 + c] * mem_values[c]).sum::<F128>() * below_mem;
     let y_mem_r = index_end.values[4];
     let x_bc_r = index_end.values[6];
@@ -600,7 +629,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
                     _ => plan.access_coefs(pointer, &ch.mu[t], ch.eta_mem * y_mem_r),
                 };
                 row_columns.push(RowColumn {
-                    words: words(cols[pointer]),
+                    words: cols[pointer].words(),
                     index: std::mem::take(&mut indices[t][k]),
                     omega,
                     act,
@@ -654,7 +683,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     for t in 0..tables::N_TABLES {
         let point = &chi[..taus[t]];
         let cols = local(t);
-        let values = mle_eval_many_par(&plans[t].values.iter().map(|&c| cols[c]).collect::<Vec<_>>(), point);
+        let values = mle_eval_cols(&plans[t].values.iter().map(|&c| cols[c]).collect::<Vec<_>>(), point);
         ps.add_scalars(&values);
         for (&c, &value) in plans[t].values.iter().zip(&values) {
             let col = sch.base[t] + c;

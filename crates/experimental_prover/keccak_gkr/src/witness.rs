@@ -4,8 +4,6 @@
 //! per position, laid out position after position. Only every `depth`-th state is committed,
 //! as lanes.
 
-use std::marker::PhantomData;
-
 use parallel::SendPtr;
 use primitives::field::F64;
 use primitives::hash::positions::linear;
@@ -307,28 +305,48 @@ fn padding(shape: Shape, written: usize) -> Option<(Extent, Vec<u64>)> {
     })
 }
 
-/// The committed column, written a block at a time: slot `s` of instance `i` at word `s * n + i`.
+/// The committed block's slots as `n`-word slices, for a caller that holds the block as one run of words.
+pub fn slots(shape: Shape, committed: &[F64]) -> Vec<&[F64]> {
+    assert_eq!(committed.len(), 1 << shape.stack_log(), "the whole committed block");
+    committed.chunks_exact(shape.n()).collect()
+}
+
+/// [`slots`], to write: the first `committed.len() / n` slots.
+pub fn slots_mut(shape: Shape, committed: &mut [F64]) -> Vec<&mut [F64]> {
+    committed.chunks_exact_mut(shape.n()).collect()
+}
+
+/// The committed column, written a block at a time: slot `s` of instance `i` at word `i` of slot `s`.
 #[derive(Clone, Copy)]
 struct Column<'a> {
-    words: SendPtr<u64>,
-    n: usize,
+    words: &'a [SendPtr<u64>],
     slots: usize,
-    _committed: PhantomData<&'a mut [F64]>,
+}
+
+/// The start of each slot of `committed`, which holds at least the states' slots and at most the whole block's, each
+/// slot `n` words: any slot past the states' is zeroed, so a caller whose spare slots carry other columns passes the
+/// states' slots alone.
+fn slot_starts(shape: Shape, committed: Vec<&mut [F64]>) -> Vec<SendPtr<u64>> {
+    let (n, slots) = (shape.n(), shape.slots());
+    assert!((slots..=1 << shape.slot_log()).contains(&committed.len()));
+    committed
+        .into_iter()
+        .enumerate()
+        .map(|(slot, words)| {
+            assert_eq!(words.len(), n, "a slot is a word per instance");
+            if slot >= slots {
+                words.fill(F64(0));
+            }
+            SendPtr(words.as_mut_ptr().cast())
+        })
+        .collect()
 }
 
 impl<'a> Column<'a> {
-    /// The writer for `committed`, which holds at least the states' `slots * n` words and at
-    /// most the whole block: anything it has past the last slot is zeroed, so a caller whose
-    /// spare slots carry other columns passes the states' prefix alone.
-    fn new(shape: Shape, committed: &'a mut [F64]) -> Self {
-        let (n, slots) = (shape.n(), shape.slots());
-        assert!(committed.len() >= slots * n && committed.len() <= 1 << shape.stack_log());
-        committed[slots * n..].fill(F64(0));
+    fn new(shape: Shape, starts: &'a [SendPtr<u64>]) -> Self {
         Self {
-            words: SendPtr(committed.as_mut_ptr().cast()),
-            n,
-            slots,
-            _committed: PhantomData,
+            words: starts,
+            slots: shape.slots(),
         }
     }
 
@@ -337,8 +355,8 @@ impl<'a> Column<'a> {
     /// # Safety
     /// The words lie in the column, and no other call writes them.
     unsafe fn write(self, stream: &Stream, slot: usize, g: usize, at: usize, words: &[u64]) {
-        // SAFETY: forwarded to the caller, the column outliving `self`.
-        unsafe { stream.copy_uninit(self.words.add(slot * self.n + g * BLOCK + at), words) }
+        // SAFETY: forwarded to the caller, the slots outliving `self`.
+        unsafe { stream.copy_uninit(self.words[slot].add(g * BLOCK + at), words) }
     }
 
     /// Block `g` of every slot, its lanes as [`block_lanes`] keeps them.
@@ -362,7 +380,8 @@ impl Witness {
     /// the states' prefix alone. The blocks after the last input are run once, as the padding block.
     pub fn generate(shape: Shape, inputs: &[[u64; STATE_LANES]], committed: &mut [F64]) -> Self {
         assert!(inputs.len() <= shape.n());
-        let column = Column::new(shape, committed);
+        let starts = slot_starts(shape, slots_mut(shape, committed));
+        let column = Column::new(shape, &starts);
         let written = inputs.len().div_ceil(BLOCK);
         let padding = padding(shape, written);
         let mut extent = Extent::new(0, written);
@@ -385,12 +404,13 @@ impl Witness {
         unsafe { Self::from_extents(shape, vec![extent], written, padding.map(|(extent, _)| extent)) }
     }
 
-    /// Write the committed lanes of every block into `committed`, laid out as `generate` does.
+    /// Write the committed lanes of every block into `committed`, slot by slot, laid out as `generate` does.
     ///
     /// - Block `g`'s lanes are `lanes[g]`.
     /// - The blocks past them are the padding block.
-    pub fn write_committed(shape: Shape, lanes: &[Vec<u64>], committed: &mut [F64]) {
-        let column = Column::new(shape, committed);
+    pub fn write_committed(shape: Shape, lanes: &[Vec<u64>], committed: Vec<&mut [F64]>) {
+        let starts = slot_starts(shape, committed);
+        let column = Column::new(shape, &starts);
         let padding = (lanes.len() < shape.n_blocks()).then(|| block_lanes(shape.depth, &[]));
         parallel::for_each(shape.n_blocks(), |g| {
             let lanes = lanes
@@ -403,11 +423,11 @@ impl Witness {
 
     /// The witness of the first `instances` instances, rebuilt from their committed inputs.
     ///
-    /// - `committed` is laid out as `generate` writes it.
+    /// - `committed` is the slots, laid out as `generate` writes them.
     /// - The blocks past the last input are the padding block.
-    pub fn from_committed(shape: Shape, instances: usize, committed: &[F64]) -> Self {
+    pub fn from_committed(shape: Shape, instances: usize, committed: &[&[F64]]) -> Self {
         let n = shape.n();
-        assert!(instances <= n && committed.len() >= STATE_LANES * n);
+        assert!(instances <= n && committed.len() >= STATE_LANES && committed.iter().all(|s| s.len() == n));
         let written = instances.div_ceil(BLOCK);
         let mut extent = Extent::new(0, written);
         let slots: Vec<Slot> = (0..written).map(|g| extent.slot(g)).collect();
@@ -416,7 +436,7 @@ impl Witness {
             // input reads the all-zero input the block pads with. Read a slot at a time: the slots are
             // `n` words apart, so an instance at a time their 25 streams share cache sets.
             let mut inputs = vec![[0u64; STATE_LANES]; BLOCK];
-            for (lane, column) in committed[..STATE_LANES * n].chunks_exact(n).enumerate() {
+            for (lane, column) in committed[..STATE_LANES].iter().enumerate() {
                 for (input, word) in inputs.iter_mut().zip(&column[g * BLOCK..][..BLOCK]) {
                     input[lane] = word.0;
                 }

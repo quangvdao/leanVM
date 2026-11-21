@@ -10,7 +10,9 @@
 //! rows from the committed `K` columns, then folds those and the factor columns instead of every column a form reads.
 
 use crate::leaf::BusForm;
+use crate::witness::Col;
 use primitives::field::{F64, F128, F128Unreduced};
+use std::borrow::Cow;
 
 /// What a block's form is multiplied by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +110,7 @@ pub struct Base<'a> {
     factors: Vec<usize>,
     linears: Vec<Linear>,
     /// Round 1's columns, every row of each, by local index.
-    columns: Vec<&'a [F64]>,
+    columns: Vec<Col<'a>>,
     /// After round 1: the slots' values on the explicit rows, `stride` a row.
     folded: Option<Vec<F128>>,
     /// The slots' values on the padrow.
@@ -116,6 +118,27 @@ pub struct Base<'a> {
     stride: usize,
     /// `eq(τ_F, u)` on every row, when a block is weighted by it.
     eq: Option<Vec<F128>>,
+}
+
+/// Round 1's columns on one task's rows ([`Base::window`]), one run of words each.
+pub struct Window<'a> {
+    start: usize,
+    cols: Vec<Cow<'a, [F64]>>,
+}
+
+impl Window<'_> {
+    pub fn rows(&self) -> Rows<'_> {
+        Rows {
+            start: self.start,
+            cols: self.cols.iter().map(|c| &**c).collect(),
+        }
+    }
+}
+
+/// A [`Window`]'s runs: column `c` at row `u` is `cols[c][u - start]`.
+pub struct Rows<'r> {
+    start: usize,
+    cols: Vec<&'r [F64]>,
 }
 
 /// Rows per task of a fold.
@@ -163,7 +186,7 @@ fn form_at(b: &Factored, row: &[F128]) -> F128 {
 impl<'a> Base<'a> {
     /// `columns` holds every local column of the table, every row; `padrow` the table's padding row; `eq` the table
     /// of `eq(τ_F, ·)` when a block is weighted by it.
-    pub fn new(blocks: Vec<Block>, columns: Vec<&'a [F64]>, padrow: &[F64], eq: Option<Vec<F128>>) -> Self {
+    pub fn new(blocks: Vec<Block>, columns: Vec<Col<'a>>, padrow: &[F64], eq: Option<Vec<F128>>) -> Self {
         let mut factors: Vec<usize> = Vec::new();
         let mut linears: Vec<Linear> = Vec::new();
         let slot = |c: usize, factors: &mut Vec<usize>| {
@@ -247,17 +270,29 @@ impl<'a> Base<'a> {
         }
     }
 
-    /// Call `f` on the slots' values at row `u`.
+    /// Round 1's columns on rows `start..end`, or nothing once they are folded.
+    pub fn window(&self, start: usize, end: usize) -> Window<'a> {
+        let cols = match self.folded {
+            Some(_) => Vec::new(),
+            None => (self.columns.iter())
+                .map(|c| c.window(start.min(c.len()), end.min(c.len())))
+                .collect(),
+        };
+        Window { start, cols }
+    }
+
+    /// Call `f` on the slots' values at row `u`, which `rows` covers before the first fold.
     #[inline(always)]
-    fn with_row<R>(&self, u: usize, f: impl FnOnce(&[F128]) -> R) -> R {
+    fn with_row<R>(&self, rows: &Rows, u: usize, f: impl FnOnce(&[F128]) -> R) -> R {
         let s = self.stride;
         match &self.folded {
-            Some(rows) => f(rows.get(u * s..(u + 1) * s).unwrap_or(&self.tail)),
-            None if self.columns.first().is_some_and(|c| u < c.len()) => {
+            Some(folded) => f(folded.get(u * s..(u + 1) * s).unwrap_or(&self.tail)),
+            None if rows.cols.first().is_some_and(|c| u - rows.start < c.len()) => {
                 let mut row = [std::mem::MaybeUninit::<F128>::uninit(); MAX_SLOTS];
                 // SAFETY: `F128` is plain data, and `slots` writes each of the first `s` values before `f` reads them.
                 let row = unsafe { &mut *(std::ptr::from_mut(&mut row[..s]) as *mut [F128]) };
-                self.slots(|c| self.columns[c][u], row);
+                let u = u - rows.start;
+                self.slots(|c| rows.cols[c][u], row);
                 f(row)
             }
             None => f(&self.tail),
@@ -275,13 +310,16 @@ impl<'a> Base<'a> {
             pairs.div_ceil(FOLD_ROWS),
             || ([F128Unreduced::ZERO; 4], [F128::ZERO; 5]),
             |(factored, direct), task| {
-                for k in task * FOLD_ROWS..pairs.min((task + 1) * FOLD_ROWS) {
+                let range = task * FOLD_ROWS..pairs.min((task + 1) * FOLD_ROWS);
+                let window = self.window(2 * range.start, 2 * range.end);
+                let rows = window.rows();
+                for k in range {
                     let (w0, w1) = (omega[2 * k], at(omega, 2 * k + 1));
                     if w0.is_zero() && w1.is_zero() {
                         continue;
                     }
                     let (mut under, mut eq_blocks) = ([F128::ZERO; 4], [F128::ZERO; 5]);
-                    self.pair(k, true, &mut under, &mut eq_blocks);
+                    self.pair(&rows, k, true, &mut under, &mut eq_blocks);
                     if k < whole {
                         let s = w0 + w1;
                         for (f, &v) in factored.iter_mut().zip(&under) {
@@ -327,10 +365,10 @@ impl<'a> Base<'a> {
     /// Add the pair `(2k, 2k + 1)`'s round polynomial: the `ω` blocks without their weight to `omega` when
     /// `with_omega`, the others to `acc`.
     #[inline(always)]
-    pub fn pair(&self, k: usize, with_omega: bool, omega: &mut [F128], acc: &mut [F128]) {
+    pub fn pair(&self, rows: &Rows, k: usize, with_omega: bool, omega: &mut [F128], acc: &mut [F128]) {
         let eq = self.eq.as_ref().map(|e| (at(e, 2 * k), at(e, 2 * k + 1)));
-        self.with_row(2 * k, |lo| {
-            self.with_row(2 * k + 1, |hi| {
+        self.with_row(rows, 2 * k, |lo| {
+            self.with_row(rows, 2 * k + 1, |hi| {
                 for block in &self.blocks {
                     let (out, w) = match block.weight {
                         Weight::Omega if with_omega => (&mut *omega, None),
@@ -377,10 +415,14 @@ impl<'a> Base<'a> {
             primitives::filled_vec(explicit * s, |out| {
                 if s > 0 {
                     parallel::chunks_mut(out, s * FOLD_ROWS, |task, chunk| {
+                        let start = 2 * task * FOLD_ROWS;
+                        let window = self.window(start, start + 2 * FOLD_ROWS);
+                        let cols = window.rows();
                         for (j, row) in chunk.chunks_mut(s).enumerate() {
                             let k = task * FOLD_ROWS + j;
                             if self.folded.is_none() && 2 * k + 1 < rows {
-                                let column = |c: usize| (self.columns[c][2 * k], self.columns[c][2 * k + 1]);
+                                let u = 2 * j;
+                                let column = |c: usize| (cols.cols[c][u], cols.cols[c][u + 1]);
                                 for (o, &c) in row.iter_mut().zip(&self.factors) {
                                     let (a, b) = column(c);
                                     *o = F128::from(a) + x.mul_base(a + b);
@@ -394,8 +436,8 @@ impl<'a> Base<'a> {
                                 }
                                 continue;
                             }
-                            self.with_row(2 * k, |lo| {
-                                self.with_row(2 * k + 1, |hi| {
+                            self.with_row(&cols, 2 * k, |lo| {
+                                self.with_row(&cols, 2 * k + 1, |hi| {
                                     for ((o, &a), &b) in row.iter_mut().zip(lo).zip(hi) {
                                         *o = if a == b { a } else { a + x * (a + b) };
                                     }
@@ -420,7 +462,8 @@ impl<'a> Base<'a> {
     /// The base terms at the table's end, its rows bound: `omega` is `ω_F` there.
     pub fn end(&self, omega: F128) -> F128 {
         let eq = self.eq.as_ref().map(|e| e[0]);
-        self.with_row(0, |row| {
+        let window = self.window(0, 1);
+        self.with_row(&window.rows(), 0, |row| {
             self.blocks
                 .iter()
                 .map(|b| {
@@ -511,7 +554,7 @@ mod tests {
         let mut claim: F128 = (0..1 << m)
             .map(|u| row_value(&scales, omega[u], eq[u], &|c| F128::from(columns[c][u])))
             .sum();
-        let refs: Vec<&[F64]> = columns.iter().map(|c| &c[..]).collect();
+        let refs: Vec<Col> = columns.iter().map(Col::from).collect();
         let mut base = Base::new(blocks.clone(), refs, &padrow, Some(eq.clone()));
         let omega_only = [F128::ONE, F128::ONE, F128::ZERO];
         let omega_sum: F128 = (0..1 << m)
@@ -533,7 +576,8 @@ mod tests {
             let mut poly = [F128::ZERO; 5];
             for k in 0..explicit / 2 {
                 let mut under = [F128::ZERO; 4];
-                base.pair(k, true, &mut under, &mut poly);
+                let window = base.window(2 * k, 2 * k + 2);
+                base.pair(&window.rows(), k, true, &mut under, &mut poly);
                 let (w0, w1) = (om[2 * k], om[2 * k] + om[2 * k + 1]);
                 for j in 0..5 {
                     poly[j] += at(&under, j) * w0 + if j > 0 { under[j - 1] * w1 } else { F128::ZERO };

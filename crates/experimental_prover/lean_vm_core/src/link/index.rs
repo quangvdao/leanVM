@@ -7,6 +7,7 @@
 //! nonzero, so a table need only be stored as far as its partner reaches.
 
 use super::pointer::{Chunks, NO_INDEX};
+use crate::witness::Col;
 use primitives::field::{F64, F128, F128Unreduced};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -497,7 +498,7 @@ impl Scatter {
     pub fn add_words(
         &self,
         chunks: &Chunks,
-        words: &[u64],
+        words: Col<u64>,
         index: &[u32],
         shift: usize,
         weight: impl Fn(usize) -> F128 + Sync,
@@ -512,7 +513,7 @@ impl Scatter {
     /// array is swept once rather than once a table. Any order of words still adds each row once.
     pub fn add_sorted_words_to<const K: usize>(
         chunks: &Chunks,
-        tables: &[(&[u64], &[u32])],
+        tables: &[(Col<u64>, &[u32])],
         targets: [(&Scatter, usize); K],
         weights: impl Fn(usize, usize) -> [F128; K] + Sync,
     ) {
@@ -574,7 +575,7 @@ impl Scatter {
     pub fn add_repeated_words<const SLOTS: usize>(
         &self,
         chunks: &Chunks,
-        words: &[u64],
+        words: Col<u64>,
         index: &[u32],
         shift: usize,
         weight: impl Fn(usize) -> F128 + Sync,
@@ -593,7 +594,7 @@ impl Scatter {
     pub fn add_repeated_accesses<const SLOTS: usize>(
         &self,
         chunks: &Chunks,
-        accesses: &[(&[u64], &[u32], usize)],
+        accesses: &[(Col<u64>, &[u32], usize)],
         weight: impl Fn(usize, usize) -> F128 + Sync,
     ) {
         self.add_words_with(chunks, accesses, weight, || Combine::<SLOTS>::new(self));
@@ -602,7 +603,7 @@ impl Scatter {
     fn add_words_with<A: Adder>(
         &self,
         chunks: &Chunks,
-        accesses: &[(&[u64], &[u32], usize)],
+        accesses: &[(Col<u64>, &[u32], usize)],
         weight: impl Fn(usize, usize) -> F128 + Sync,
         adder: impl Fn() -> A + Sync,
     ) {
@@ -753,10 +754,10 @@ mod tests {
         let words: Vec<u64> = [3, 7, 2].iter().map(|&s| chunks.encode(s)).collect();
         let fits = Scatter::new(8);
         let index = chunks.decode_all(&words);
-        fits.add_words(&chunks, &words, &index, 0, |_| F128::ONE);
+        fits.add_words(&chunks, (&words).into(), &index, 0, |_| F128::ONE);
         assert!(!fits.overflowed());
         let short = Scatter::new(7);
-        short.add_words(&chunks, &words, &index, 0, |_| F128::ONE);
+        short.add_words(&chunks, (&words).into(), &index, 0, |_| F128::ONE);
         assert!(short.overflowed());
         assert_eq!(short.into_vec(), [0, 0, 1, 1].map(|b| F128::new(b, 0)));
     }
@@ -908,12 +909,12 @@ mod tests {
             .collect();
         for len in [top, 3000] {
             let (a, b) = (Scatter::new(len), Scatter::new(len));
-            let words: Vec<(&[u64], &[u32])> = tables.iter().zip(&indices).map(|(w, i)| (&w[..], &i[..])).collect();
+            let words: Vec<(Col<u64>, &[u32])> = tables.iter().zip(&indices).map(|(w, i)| (w.into(), &i[..])).collect();
             Scatter::add_sorted_words_to(&chunks, &words, [(&a, 1), (&b, 0)], |t, u| weights[t][u]);
             let (c, d) = (Scatter::new(len), Scatter::new(len));
             for (t, (w, i)) in tables.iter().zip(&indices).enumerate() {
-                c.add_words(&chunks, w, i, 1, |u| weights[t][u][0]);
-                d.add_words(&chunks, w, i, 0, |u| weights[t][u][1]);
+                c.add_words(&chunks, w.into(), i, 1, |u| weights[t][u][0]);
+                d.add_words(&chunks, w.into(), i, 0, |u| weights[t][u][1]);
             }
             assert_eq!(a.overflowed(), c.overflowed());
             assert_eq!(a.into_vec(), c.into_vec(), "length {len}");
@@ -952,7 +953,7 @@ mod tests {
             let index = chunks.decode_all(&words);
             for shift in [false, true] {
                 let scatter = Scatter::new(top);
-                scatter.add_words(&chunks, &words, &index, usize::from(shift), |u| weights[u]);
+                scatter.add_words(&chunks, (&words).into(), &index, usize::from(shift), |u| weights[u]);
                 let array = scatter.into_vec();
                 let rows: F128 = words
                     .iter()

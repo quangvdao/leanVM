@@ -143,7 +143,7 @@ fn outcome(tamper: impl FnOnce(&mut Witness)) -> Result<(), VerifierError> {
     let program = program();
     let tamper = |w: &mut Witness| {
         tamper(w);
-        w.scatter_split();
+        w.write_edits();
     };
     let (proof, _) = prove_tampered(&program, &[], PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
     cheat::INDEX_WORD.set(None);
@@ -444,7 +444,7 @@ fn rows_of_two_tables_at_the_same_index_with_swapped_cycles_are_rejected() {
     };
     let tamper = |w: &mut Witness| {
         tamper(w);
-        w.scatter_split();
+        w.write_edits();
     };
     let (proof, _) = prove_tampered(&program, &[], PI, crate::pcs::TEST_LOG_INV_RATE, tamper).expect("the prover runs");
     assert_eq!(

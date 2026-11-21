@@ -102,8 +102,8 @@ pub(crate) struct Reduction {
 }
 
 impl Reduction {
-    /// Rebuild the witness from `q_keccak`, the whole committed block, and run the reduction.
-    pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[F64], output: &OutputClaim) -> Openings {
+    /// Rebuild the witness from `q_keccak`, the whole committed block slot by slot, and run the reduction.
+    pub(crate) fn prove(self, ps: &mut ProverState, q_keccak: &[&[F64]], output: &OutputClaim) -> Openings {
         let witness =
             tracing::info_span!("Witness").in_scope(|| Witness::from_committed(self.shape, self.steps, q_keccak));
         witness.prove(ps, q_keccak, output)
@@ -241,14 +241,10 @@ impl Blocks {
     /// all-zero steps. `q_keccak` is the states' part of the committed block, its first [`SLOTS`]
     /// slots: the spare slots past them belong to the columns that ride there and are written by
     /// their own fill.
-    pub(crate) fn place(self, steps: usize, q_keccak: &mut [F64]) -> Reduction {
+    pub(crate) fn place(self, steps: usize, q_keccak: Vec<&mut [F64]>) -> Reduction {
         assert_eq!(self.steps, steps, "the blocks are of another run");
         let shape = shape(self.steps);
-        assert_eq!(
-            q_keccak.len(),
-            shape.slots() * shape.n(),
-            "the committed states are the wrong size"
-        );
+        assert_eq!(q_keccak.len(), shape.slots(), "the committed states are the wrong size");
         Witness::write_committed(shape, &self.lanes, q_keccak);
         Reduction { shape, steps }
     }
@@ -297,7 +293,7 @@ mod tests {
             });
             let mut q_keccak = vec![f(0xdead_beef); expected.len()];
             let states = SLOTS * (1 << n_steps_log(n));
-            let witness = blocks.place(n, &mut q_keccak[..states]);
+            let witness = blocks.place(n, keccak_gkr::slots_mut(shape(n), &mut q_keccak[..states]));
             assert_eq!(q_keccak[..states], expected[..states], "{n} steps");
             // What the columns riding the spare slots left there is none of the reduction's
             // business, but both openings fold it, so the two runs have to see the same.
@@ -305,9 +301,10 @@ mod tests {
             let point = (0..n_steps_log(n)).map(|i| F128::new(3 + i as u64, 5)).collect();
             let output = OutputClaim::of_inputs(shape(n), &instances, point);
             let mut ps = ProverState::from_label(b"blocks");
-            let deferred = (witness.prove(&mut ps, &q_keccak, &output), ps.into_proof());
+            let slots = keccak_gkr::slots(shape(n), &q_keccak);
+            let deferred = (witness.prove(&mut ps, &slots, &output), ps.into_proof());
             let mut ps = ProverState::from_label(b"blocks");
-            let one_pass = (reference.prove(&mut ps, &q_keccak, &output), ps.into_proof());
+            let one_pass = (reference.prove(&mut ps, &slots, &output), ps.into_proof());
             assert!(deferred == one_pass, "{n} steps");
         }
     }

@@ -3,6 +3,7 @@
 //! sizes and public input. Plus the prover-side witness build.
 
 use super::*;
+use crate::witness::{Col, ColMut};
 
 // ---- column schema -----------------------------------------------------------
 
@@ -145,69 +146,65 @@ pub struct Layout {
 pub(crate) struct Witness {
     pub(crate) q: Vec<F64>,
     /// The KECCAK output lanes' values as `(global column index, values)`. The links read
-    /// them but they are not committed, so they are not in `q`. A split pointer column
-    /// (the band layout) is here too, contiguous for the link, as well as in pieces in `q`.
+    /// them but they are not committed, so they are not in `q`.
     pub(crate) virt: Vec<(usize, Vec<F64>)>,
     pub(crate) layout: Layout,
     pub(crate) log_mem: usize,
     /// What the Keccak reduction needs beside `q`, which holds the states it rebuilds its witness from.
     pub(crate) keccak_reduction: crate::keccak::Reduction,
+    /// Columns a test changes, written back to the stack at [`Witness::write_edits`].
+    #[cfg(test)]
+    edits: Vec<(usize, Vec<F64>)>,
 }
 
 impl Witness {
-    /// One read-only view per column, in global column order: the window into the
+    /// One read-only view per column, in global column order: the column's rows in the
     /// stack for a committed column or a KECCAK input lane (its slot of `q_keccak`),
     /// the private buffer for an output lane.
-    pub(crate) fn columns(&self) -> Vec<&[F64]> {
-        let q_keccak = self.column(QKECCAK);
-        let steps = 1 << self.layout.taus[verifier::layout::OP_KECCAK];
-        let mut cols: Vec<&[F64]> = self
+    pub(crate) fn columns(&self) -> Vec<Col<'_>> {
+        let slots = keccak_slots(&self.q, &self.layout);
+        let mut cols: Vec<Col> = self
             .layout
             .placements
             .iter()
             .enumerate()
             .map(|(i, p)| match keccak_value(i) {
-                Some(KeccakLane::Slot(slot)) => &q_keccak[slot * steps..][..steps],
-                _ if p.is_virtual() => &[][..],
-                _ if p.is_split() => &[][..],
-                _ => &self.q[p.offset..][..1 << p.n_vars],
+                Some(KeccakLane::Slot(slot)) => Col::whole(slots[slot]),
+                _ if p.is_virtual() => Col::whole(&[]),
+                _ => self.column(i),
             })
             .collect();
         for (i, buf) in &self.virt {
-            cols[*i] = buf;
+            cols[*i] = Col::whole(buf);
         }
         cols
     }
 
-    /// A committed column's words in row order: its window of the stack, or for a split
-    /// column the buffer it was filled in before its pieces were scattered.
-    pub(crate) fn column(&self, i: usize) -> &[F64] {
-        column(&self.q, &self.virt, &self.layout.placements, i)
+    /// A committed column's rows in the stack.
+    pub(crate) fn column(&self, i: usize) -> Col<'_> {
+        self.layout.placements[i].view(&self.q, self.layout.shape.mu - crate::pcs::LOG_BATCH)
     }
 
-    /// [`Witness::column`], to change: a split column's change reaches the stack at
-    /// [`Witness::scatter_split`].
+    /// A committed column's rows, to change: the change reaches the stack at [`Witness::write_edits`].
     #[cfg(test)]
     pub(crate) fn column_mut(&mut self, i: usize) -> &mut [F64] {
-        let p = self.layout.placements[i];
-        if p.is_split() {
-            let (_, buf) = self
-                .virt
-                .iter_mut()
-                .find(|(c, _)| *c == i)
-                .expect("a split column keeps its buffer");
-            buf
-        } else {
-            &mut self.q[p.whole()..][..1 << p.n_vars]
+        if !self.edits.iter().any(|(c, _)| *c == i) {
+            let rows = self.column(i).to_vec();
+            self.edits.push((i, rows));
         }
+        let (_, rows) = self.edits.iter_mut().find(|(c, _)| *c == i).expect("just added");
+        rows
     }
 
-    /// Write every split column's buffer into its pieces of the stack again.
+    /// Write every column changed through [`Witness::column_mut`] back to the stack.
     #[cfg(test)]
-    pub(crate) fn scatter_split(&mut self) {
+    pub(crate) fn write_edits(&mut self) {
         let lane = self.layout.shape.mu - crate::pcs::LOG_BATCH;
-        for (i, column) in self.virt.iter().filter(|(i, _)| self.layout.placements[*i].is_split()) {
-            witness::scatter(&mut self.q, &self.layout.placements[*i], lane, column);
+        let stream = primitives::stream::Stream::new();
+        for (i, rows) in std::mem::take(&mut self.edits) {
+            let window = self.layout.placements[i].view_mut(&mut self.q, lane);
+            // SAFETY: the rows are the column's, and nothing else writes the stack meanwhile.
+            unsafe { window.write(&stream, 0, &rows) };
         }
     }
 
@@ -222,23 +219,14 @@ impl Witness {
     }
 }
 
-/// [`Witness::column`] on the witness's parts, for a caller that has moved another part out.
-pub(crate) fn column<'a>(
-    q: &'a [F64],
-    virt: &'a [(usize, Vec<F64>)],
-    placements: &[witness::Placement],
-    i: usize,
-) -> &'a [F64] {
-    let p = placements[i];
-    if p.is_split() {
-        let (_, buf) = virt
-            .iter()
-            .find(|(c, _)| *c == i)
-            .expect("a split column keeps its buffer");
-        buf
-    } else {
-        &q[p.whole()..][..1 << p.n_vars]
-    }
+/// `q_keccak`'s slots in the stack `q`, a run of words each, for a caller that has moved another part of the witness
+/// out.
+pub(crate) fn keccak_slots<'a>(q: &'a [F64], layout: &Layout) -> Vec<&'a [F64]> {
+    let column = layout.placements[QKECCAK].view(q, layout.shape.mu - crate::pcs::LOG_BATCH);
+    let steps = 1 << layout.taus[verifier::layout::OP_KECCAK];
+    (0..column.len() / steps)
+        .map(|slot| column.run(slot * steps, steps))
+        .collect()
 }
 
 /// The committed columns' kappa SOURCES, for the recursion guest's
@@ -446,9 +434,8 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
     // in place, so the stack can be their only home.
     //
     // SAFETY: the allocation is uninitialized. `split_stack` zeroes every word no
-    // column covers and hands out a window per whole column, and `scatter` below
-    // writes the split columns' pieces; `fill_table` checks that each table wrote
-    // every window it was given, and the shared columns below write theirs.
+    // column covers and hands out a window per column; `fill_table` checks that each
+    // table wrote every window it was given, and the shared columns below write theirs.
     let mut q = unsafe { witness::alloc_stack(l.shape) };
     // An output lane is neither in the stack nor in `q_keccak`, so its values need
     // storage of their own: the links read it. Every other column `q_keccak`
@@ -460,28 +447,20 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
         // `fill_table` asserts each table wrote all of its windows.
         .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
         .collect();
-    // A split column (a pointer, q_keccak, memory or any other column the stripe
-    // layout cuts across lanes) is filled contiguously, for the link and the Keccak
-    // reduction to read, and then scattered into its pieces of the stack.
+    // A split column (a pointer, q_keccak, memory or any other column the stripe layout cuts across lanes) is
+    // written piece by piece, straight into the stack.
     let lane = l.shape.mu - crate::pcs::LOG_BATCH;
-    let split: Vec<usize> = (0..sch.n).filter(|&i| l.placements[i].is_split()).collect();
-    // SAFETY: as for the output lanes.
-    virt.extend(
-        split
-            .iter()
-            .map(|&i| (i, unsafe { primitives::uninit_vec::<F64>(1 << l.placements[i].n_vars) })),
-    );
     let mut windows = witness::split_stack(&mut q, &l.placements, lane);
     for (i, buf) in virt.iter_mut() {
-        windows[*i] = buf;
+        windows[*i] = ColMut::whole(buf);
     }
     // q_keccak's window is the committed states and then the spare slots, a slot per
     // KECCAK column riding them: hand each its slot, so its fill writes it where it
-    // lives and the stack never holds it twice.
-    let (states, spare) = std::mem::take(&mut windows[QKECCAK]).split_at_mut(crate::keccak::SLOTS * steps);
-    windows[QKECCAK] = states;
-    for (k, window) in spare.chunks_exact_mut(steps).enumerate() {
-        windows[sch.base[verifier::layout::OP_KECCAK] + spare_local(k)] = window;
+    // lives and the stack never holds it twice. Each slot is one run of words: a piece holds whole slots.
+    let mut slots = std::mem::replace(&mut windows[QKECCAK], ColMut::EMPTY).runs_of(steps);
+    let spare = slots.split_off(crate::keccak::SLOTS);
+    for (k, window) in spare.into_iter().enumerate() {
+        windows[sch.base[verifier::layout::OP_KECCAK] + spare_local(k)] = ColMut::whole(window);
     }
 
     // Each table fills its own columns from the trace (local indices, offset
@@ -513,7 +492,7 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
         let page_log = Memory::page_log();
         let image = [MEMORY_0, MEMORY_1].map(|c| {
             assert_eq!(windows[c].len(), cells, "a memory column spans the image");
-            parallel::SendPtr(windows[c].as_mut_ptr())
+            &windows[c]
         });
         // Cell `i`'s two limbs.
         let values = |page: Option<&[Cell]>, i: usize| {
@@ -523,10 +502,11 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
         if cells < BLOCK {
             // A memory smaller than a block, cell by cell.
             let page = exec.mem.page(0);
+            let stream = primitives::stream::Stream::new();
             for i in 0..cells {
                 for (column, value) in image.iter().zip(values(page, i)) {
                     // SAFETY: `i` is below `cells`, every column's length.
-                    unsafe { column.add(i).write(value) };
+                    unsafe { column.write(&stream, i, &[value]) };
                 }
             }
         } else {
@@ -545,7 +525,7 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
                         for (column, values) in image.iter().zip(&buf) {
                             // SAFETY: block `b` owns cells `b·BLOCK..(b+1)·BLOCK` of every
                             // column, in bounds as `cells` is a whole number of blocks.
-                            unsafe { stream.copy_uninit(column.add(line), values) };
+                            unsafe { column.write(&stream, line, values) };
                         }
                     }
                 }
@@ -554,23 +534,18 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
     });
     // The committed Keccak states q_keccak, ALWAYS in this same stack: built from
     // the executed KECCAK rows in order (row j = step j).
-    let keccak_reduction = crate::stage!("Build q_keccak", || {
-        keccak_blocks.place(tr.keccak.len(), windows[QKECCAK])
-    });
+    let keccak_reduction = crate::stage!("Build q_keccak", || keccak_blocks.place(tr.keccak.len(), slots));
 
     // (`execute` already asserts the run halts at the sentinel (pc, fp) =
     // (g^{B-1}, 0), exactly the boundary the public layout derives.)
     drop(windows); // release the borrow of `q` and of the output lanes' buffers
-    crate::stage!("Scatter split columns", || {
-        for (i, column) in virt.iter().filter(|(i, _)| l.placements[*i].is_split()) {
-            witness::scatter(&mut q, &l.placements[*i], lane, column);
-        }
-    });
     Witness {
         q,
         virt,
         layout: l,
         log_mem,
         keccak_reduction,
+        #[cfg(test)]
+        edits: Vec::new(),
     }
 }

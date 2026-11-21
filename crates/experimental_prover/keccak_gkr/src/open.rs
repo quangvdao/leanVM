@@ -236,11 +236,8 @@ fn word_weights(shape: Shape, claim: &Claim) -> Vec<F128> {
 /// word-level `claim` on the committed segment outputs among them. An opening is of the whole
 /// block, so the slots the claim puts no weight on are evaluated too: the spare ones past
 /// [`Shape::slots`] carry other columns (§cpu), and the fold that follows must see them.
-pub fn output_claim(shape: Shape, committed: &[F64], instance: &[F128], claim: &Claim) -> (Vec<F128>, F128) {
-    let n = shape.n();
-    let words = parallel::map_collect(1 << shape.slot_log(), |slot| {
-        mle_eval(&committed[slot * n..][..n], instance)
-    });
+pub fn output_claim(shape: Shape, committed: &[&[F64]], instance: &[F128], claim: &Claim) -> (Vec<F128>, F128) {
+    let words = parallel::map_collect(1 << shape.slot_log(), |slot| mle_eval(committed[slot], instance));
     let value = dot(&words, &word_weights(shape, claim));
     (words, value)
 }
@@ -272,23 +269,23 @@ const CHUNK_VARS: usize = 8;
 /// nothing about them, but the claim it leaves is on the whole committed block, so the slot
 /// fold below has to carry their bits.
 ///
-/// Slice `z` of slot `s` is `Σ_step eq(instance, step) · bit z of committed[s·n + step]`. The
+/// Slice `z` of slot `s` is `Σ_step eq(instance, step) · bit z of committed[s][step]`. The
 /// `eq` table is the product of one on the low [`CHUNK_VARS`] instance variables and one on the
 /// rest, so a chunk of steps is one [`BitFold`] by the low table, row `z` being the chunk's bits
 /// `z` read off their transposed bytes, and only the chunk's 64 sums meet the high table.
-fn spare_slices(shape: Shape, committed: &[F64], instance: &[F128]) -> Vec<[F128; 64]> {
+fn spare_slices(shape: Shape, committed: &[&[F64]], instance: &[F128]) -> Vec<[F128; 64]> {
     let (n, spare) = (shape.n(), (1 << shape.slot_log()) - shape.slots());
     // An instance point has `Shape::n_log` variables, at least nine.
     let (low, high) = instance.split_at(CHUNK_VARS);
     let (fold, high) = (BitFold::new(&eq_table(low)), eq_table(high));
-    let slots = &committed[shape.slots() * n..];
+    let slots = &committed[shape.slots()..];
     // A task per chunk and slot: at small batches there are few of either.
     let slices = parallel::fold_reduce(
         (n >> CHUNK_VARS) * spare,
         || vec![[F128Unreduced::ZERO; 64]; spare],
         |acc, task| {
             let (chunk, slot) = (task / spare, task % spare);
-            let steps = &slots[slot * n + (chunk << CHUNK_VARS)..][..1 << CHUNK_VARS];
+            let steps = &slots[slot][chunk << CHUNK_VARS..][..1 << CHUNK_VARS];
             // Column `g` gathers bit `z` of the eight steps `8 * g ..` at byte `z`.
             let mut cols = [[0u8; ROWS]; (1 << CHUNK_VARS) / 8];
             for (col, steps) in cols.iter_mut().zip(steps.as_chunks::<8>().0) {
@@ -311,7 +308,7 @@ fn spare_slices(shape: Shape, committed: &[F64], instance: &[F128]) -> Vec<[F128
 }
 
 /// Open the claim on the inputs: the instances of a pack first, then the slot.
-pub fn open_inputs(ps: &mut ProverState, witness: &Witness, committed: &[F64], claim: &Claim) -> Opening {
+pub fn open_inputs(ps: &mut ProverState, witness: &Witness, committed: &[&[F64]], claim: &Claim) -> Opening {
     let shape = witness.shape;
     let pack = &claim.point[..shape.pack_vars()];
     let folded = fold_packs(witness, pack);

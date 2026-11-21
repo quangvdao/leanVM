@@ -26,6 +26,7 @@
 
 use super::base::Base;
 use super::pointer::{ChunkEq, Chunks, NO_INDEX, Shifts, SplitEq, chain, eval_chunk, mirror};
+use crate::witness::Col;
 use primitives::bit_fold::fold_sparse_bits;
 use primitives::field::{F128, F128Unreduced};
 
@@ -96,7 +97,7 @@ pub struct ShiftGroup {
 /// One pointer column, as the row side reads it.
 pub struct RowColumn<'a> {
     /// The words, one per row of the table.
-    pub words: &'a [u64],
+    pub words: Col<'a, u64>,
     /// Each word's index, or [`NO_INDEX`] ([`Chunks::decode_all`]).
     pub index: Vec<u32>,
     /// Coefficient on `ω_F` of the pointer itself, `Φ_0`.
@@ -1326,7 +1327,7 @@ fn fold_tags(a: u64, b: u64) -> u64 {
 /// A pointer column: its words, and after round 1 per row its chunk functionals laid out by `slots`, and per chunk a
 /// tag, the one-hot value the whole folded group holds or [`MIXED`], packed one byte a chunk.
 struct Column<'a> {
-    words: &'a [u64],
+    words: Col<'a, u64>,
     slots: Slots,
     /// Chunk 0's table per group and carry passed on, in slot order.
     starts: Vec<Vec<F128>>,
@@ -1456,7 +1457,7 @@ impl<'a> Column<'a> {
     fn group_words(&self, n: usize, k: usize) -> [u64; 2 * MAX_GROUP] {
         let mut group = [0u64; 2 * MAX_GROUP];
         for (o, u) in group[..n].iter_mut().enumerate() {
-            *u = self.words.get(k * n + o).copied().unwrap_or(0);
+            *u = self.words.get(k * n + o).unwrap_or(0);
         }
         group
     }
@@ -1813,14 +1814,28 @@ impl<'a> State<'a> {
         let mut factored = [F128Unreduced::ZERO; MAX_COEFFS];
         let mut under_one = [F128Unreduced::ZERO; MAX_COEFFS];
         let range = task * per_task..pairs.min((task + 1) * per_task);
+        let window = (self.base.as_ref()).map(|base| base.window(2 * range.start, 2 * range.end));
+        let base_rows = window.as_ref().map(super::base::Window::rows);
+        // Each word column's words on the task's pairs, as one run.
+        let first_word = (2 * range.start) << self.bound.len();
+        let word_runs: Vec<std::borrow::Cow<[u64]>> = (self.columns.iter())
+            .map(|c| match c.values {
+                None => {
+                    let len = c.words.len();
+                    c.words
+                        .window(first_word.min(len), ((2 * range.end) << self.bound.len()).min(len))
+                }
+                Some(_) => std::borrow::Cow::Borrowed(&[][..]),
+            })
+            .collect();
         for k in range.clone() {
             let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
             // The base terms under `ω`, reduced: at most `BASE_COEFFS` coefficients.
             let mut under_omega = [F128::ZERO; MAX_COEFFS];
-            if let Some(base) = &self.base {
+            if let (Some(base), Some(rows)) = (&self.base, &base_rows) {
                 let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
                 if with_omega || base.on_padding() {
-                    base.pair(k, with_omega, &mut under_omega, acc);
+                    base.pair(rows, k, with_omega, &mut under_omega, acc);
                 }
             }
             if is_zero_pair(omega) && 2 * k >= self.act.len() {
@@ -1830,11 +1845,15 @@ impl<'a> State<'a> {
             let aux = self.aux_pair(k);
             let mut cert = [F128Unreduced::ZERO; 3];
             let add_columns = |sums: &mut Sums| {
-                for ((column, tables), weighted) in self.columns.iter().zip(tables).zip(weighted) {
+                for (((column, tables), weighted), run) in self.columns.iter().zip(tables).zip(weighted).zip(&word_runs)
+                {
                     let words = (tables.as_slice(), weighted.as_slice());
                     let sums = sums.reborrow();
                     match &column.values {
-                        None => Self::pair_words(column, words, &self.bound, k, &aux, chunks, points, skip, sums),
+                        None => {
+                            let run = (first_word, &**run);
+                            Self::pair_words(column, words, run, &self.bound, k, &aux, chunks, points, skip, sums);
+                        }
                         Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, skip, sums),
                     }
                 }
@@ -1895,6 +1914,7 @@ impl<'a> State<'a> {
     fn pair_words(
         column: &Column,
         (tables, weighted): WordTables<'_, '_>,
+        (first_word, run): (usize, &[u64]),
         r: &[F128],
         k: usize,
         aux: &[(F128, F128)],
@@ -1915,7 +1935,8 @@ impl<'a> State<'a> {
                 return;
             }
         }
-        let word = |u: usize| column.words.get(u).copied().unwrap_or(0);
+        // `run` holds the column's words from `first_word` on, as far as the task's pairs and the column reach.
+        let word = |u: usize| run.get(u - first_word).copied().unwrap_or(0);
         let (mut lo, mut hi) = ([0u64; MAX_GROUP], [0u64; MAX_GROUP]);
         for t in 0..n {
             lo[t] = word(2 * k * n + t);
@@ -2400,7 +2421,10 @@ pub fn prove(
     let words: Vec<(&[u64], &[F128])> = states
         .iter()
         .flat_map(|s| &s.columns)
-        .flat_map(|c| c.words.chunks(1 << c.piece_log).map(|piece| (piece, eq(c.piece_log))))
+        .flat_map(|c| {
+            let piece = 1 << c.piece_log;
+            (0..c.words.len() / piece).map(move |j| (c.words.run(j * piece, piece), eq(c.piece_log)))
+        })
         .collect();
     let mut piece_slices = bit_slices_eq(&words).into_iter();
     let mut slices = states
@@ -2762,7 +2786,7 @@ mod tests {
                         .map(|(w, (o, a, g, e))| {
                             q += 1;
                             RowColumn {
-                                words: w,
+                                words: w.into(),
                                 index: chunks.decode_all(w),
                                 omega: *o,
                                 act: *a,
@@ -2775,14 +2799,14 @@ mod tests {
                         .collect(),
                     base: Some(Base::new(
                         t.blocks.clone(),
-                        t.k_columns.iter().map(|c| &c[..]).collect(),
+                        t.k_columns.iter().map(Col::from).collect(),
                         &t.padrow,
                         Some(eq_table(&t.tau)),
                     )),
                     base_first: Some(
                         Base::new(
                             t.blocks.clone(),
-                            t.k_columns.iter().map(|c| &c[..]).collect(),
+                            t.k_columns.iter().map(Col::from).collect(),
                             &t.padrow,
                             Some(eq_table(&t.tau)),
                         )

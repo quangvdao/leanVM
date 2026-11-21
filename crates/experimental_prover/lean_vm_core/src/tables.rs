@@ -289,9 +289,9 @@ pub struct FillCtx<'a> {
     filled: AtomicUsize,
 }
 
-/// Where one column's values go: its window in the stacked witness, or a private
-/// buffer if the column is virtual.
-pub(crate) type ColumnOut<'a> = &'a mut [F64];
+/// Where one column's values go: its window in the stacked witness, piece by piece for a split column, or a
+/// private buffer if the column is virtual.
+pub(crate) type ColumnOut<'a> = crate::witness::ColMut<'a>;
 
 /// Rows a fill gathers before streaming them out: whole cache lines of each column.
 const RUN: usize = 32;
@@ -362,10 +362,10 @@ impl<'a> FillCtx<'a> {
         let n = self.height;
         assert_eq!(out.len(), N, "a fill writes every column of its table");
         assert!(n_rows <= n, "a table's rows must fit its cube");
-        let dst: [Option<parallel::SendPtr<F64>>; N] = std::array::from_fn(|c| {
+        let dst: [Option<&ColumnOut>; N] = std::array::from_fn(|c| {
             (!out[c].is_empty()).then(|| {
                 assert_eq!(out[c].len(), n, "column {c} has the wrong window length");
-                parallel::SendPtr(out[c].as_mut_ptr())
+                &out[c]
             })
         });
         self.filled.store(N, Relaxed);
@@ -381,11 +381,11 @@ impl<'a> FillCtx<'a> {
                 if start < n_rows {
                     f(start, len.min(n_rows - start), &mut buf);
                 }
-                for (p, column) in dst.iter().zip(&buf) {
-                    if let Some(p) = p {
+                for (window, column) in dst.iter().zip(&buf) {
+                    if let Some(window) = window {
                         // SAFETY: block `b` writes rows `start..start + len` of each window, in bounds and disjoint
                         // from every other block's, and the dispatch blocks until every write is finished.
-                        unsafe { stream.copy_uninit(p.add(start), &column[..len]) };
+                        unsafe { window.write(&stream, start, &column[..len]) };
                     }
                 }
             }

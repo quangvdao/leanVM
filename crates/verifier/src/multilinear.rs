@@ -219,7 +219,8 @@ pub struct Spot {
 /// uses: every block it can, the ring ones first, cut into one piece per lane of the first `2^w` lanes, which puts
 /// each block's claims at one in-lane window for all those lanes. Failing that, the `ring` blocks go in a band:
 /// in-lane words `[0, 2^band)` of adjacent lanes, a block larger than `2^band` split into `2^band`-word pieces, one per
-/// lane, the band the narrowest one with which every block still fits ([`banded`]). With no ring block, or none that
+/// lane, the band the narrowest one with which every block still fits and no ring block has more than
+/// `2^MAX_STRIPE_WIDTH` pieces ([`banded`]). With no ring block, or none that
 /// fits, the layout is the dense one ([`dense`]).
 pub fn stack_offsets(sizes: &[usize], ring: &[bool], min_log: usize, lane_fold: usize) -> (Vec<Spot>, usize) {
     let total: u64 = sizes.iter().map(|&size| 1u64 << size).sum();
@@ -236,7 +237,15 @@ pub fn stack_offsets(sizes: &[usize], ring: &[bool], min_log: usize, lane_fold: 
         .map(|(&size, _)| 1u64 << size)
         .sum();
     if pointer > 0 {
-        for band in 0..=lane {
+        // No ring block is cut into more than `2^MAX_STRIPE_WIDTH` pieces, as in the stripe.
+        let widest = sizes
+            .iter()
+            .zip(ring)
+            .filter(|(_, r)| **r)
+            .map(|(&size, _)| size)
+            .max()
+            .unwrap_or(0);
+        for band in widest.saturating_sub(MAX_STRIPE_WIDTH)..=lane {
             if pointer.div_ceil(1 << band) > lanes {
                 continue;
             }
@@ -248,13 +257,17 @@ pub fn stack_offsets(sizes: &[usize], ring: &[bool], min_log: usize, lane_fold: 
     (dense(sizes, ring, lane), log)
 }
 
+/// The most lanes a stripe spans, log, and the most pieces a band cuts a ring block into: 32, which keeps every piece of
+/// q_keccak whole Keccak slots (it has at least 32), so the prover reads and writes each slot as one run of words.
+pub const MAX_STRIPE_WIDTH: usize = 5;
+
 /// The stripe layout of [`stack_offsets`], if it fits in `lanes` lanes. The stripe is the first `2^w` lanes, the most
-/// a power of two that `lanes` holds. Every `ring` block goes in it, and then every other block, largest first, that
+/// a power of two that `lanes` holds, and at most [`MAX_STRIPE_WIDTH`]. Every `ring` block goes in it, and then every other block, largest first, that
 /// still fits; a block of `2^s` words in it is `2^w` pieces of `2^(s - w)`, piece `j` in lane `j`, all at one in-lane
 /// offset. The blocks stack up from in-lane word 0, largest first, so each offset is aligned. The rest go largest
 /// first, ties by index, at the lowest free offset aligned to their size past the stripe, or above it in its lanes.
 fn striped(sizes: &[usize], ring: &[bool], lane: usize, log: usize, lanes: u64) -> Option<Vec<Spot>> {
-    let width = (lanes.max(1).ilog2() as usize).min(log - lane);
+    let width = (lanes.max(1).ilog2() as usize).min(log - lane).min(MAX_STRIPE_WIDTH);
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&index| (std::cmp::Reverse(sizes[index]), index));
     let rows = |index: usize| 1u64 << (sizes[index] - width);
@@ -490,10 +503,15 @@ mod tests {
             Band,
             Dense,
         }
-        let cases: [(Vec<(usize, bool)>, Kind); 6] = [
+        let cases: [(Vec<(usize, bool)>, Kind); 7] = [
             (blob, Kind::Stripe),
             (sphincs, Kind::Stripe),
-            (vec![(18, true); 64], Kind::Stripe),
+            // A full stack has 64 lanes, past the widest stripe: each block is then a whole lane of its own.
+            (vec![(18, true); 64], Kind::Dense),
+            (
+                vec![(18, true), (18, true), (17, false), (17, false), (16, false)],
+                Kind::Stripe,
+            ),
             (
                 vec![(23, true), (20, false), (19, true), (18, false), (18, false)],
                 Kind::Band,
@@ -516,7 +534,7 @@ mod tests {
                 assert!(offset + length <= lanes << lane, "a piece is in the fewest whole lanes");
                 assert!(length <= 1 << lane || offset % (1 << lane) == 0);
             }
-            let width = lanes.ilog2() as usize;
+            let width = (lanes.ilog2() as usize).min(MAX_STRIPE_WIDTH);
             let striped = (0..sizes.len()).all(|i| !ring[i] || sizes[i] - spots[i].piece == width);
             let split = (0..sizes.len()).any(|i| spots[i].piece < sizes[i]);
             let found = if striped && (width > 0) == split {

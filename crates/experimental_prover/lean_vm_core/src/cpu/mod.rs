@@ -185,9 +185,8 @@ pub(crate) fn prove_tampered(
             crate::link::prove::prove(&mut ps, &w.layout, &cols, program.stacked_bytecode())
         })
     };
-    // The link was the last reader of the output lanes and of the split columns' buffers, but a split q_keccak's,
-    // which the Keccak reduction reads below.
-    w.virt.retain(|(i, _)| *i == QKECCAK);
+    // The link was the last reader of the output lanes.
+    w.virt = Vec::new();
     let l = &w.layout;
 
     // The PI binding (§sec:e2e-pi) transmits nothing: its claims are the public
@@ -206,9 +205,9 @@ pub(crate) fn prove_tampered(
     let keccak_reduction = w.keccak_reduction;
     let witness::Placement { offset, piece_vars, .. } = w.layout.placements[QKECCAK];
     let lane = w.layout.shape.mu - crate::pcs::LOG_BATCH;
-    let q_keccak = layout::column(&w.q, &w.virt, &w.layout.placements, QKECCAK);
+    let q_keccak = layout::keccak_slots(&w.q, &w.layout);
     let openings = crate::stage!("Keccak reduction", || {
-        keccak_reduction.prove(&mut ps, q_keccak, &link.output)
+        keccak_reduction.prove(&mut ps, &q_keccak, &link.output)
     });
     let (mut ring, outputs) = openings.into_pcs_claims(offset, piece_vars, lane);
     ring.claims.push(link.ring);
