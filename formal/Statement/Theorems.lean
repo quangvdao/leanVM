@@ -43,7 +43,7 @@ structure Theorems
   `extractorComputedBy leanVmKnowledgeExtractor`: at most `(Q + 2^14) · 2^-125 +
   5 (Q + 2^14)² · 2^-256` for `Q ≤ 2^128` queries (`LeanVm.lean`). The program extracts nothing if
   its size or its run's price exceeds its bound or budget (`leanVmKnowledgeExtractorBudget μ N`, for
-  `N` permutation queries at a stack of `2^μ`: about `2^max(80, 2μ + 25)` up to `2^50` queries,
+  `N` permutation queries at a stack of `2^μ`: about `2^max(58, 2μ + 9) + 2^15·N·log²N`,
   `O(N·log³N)`), and extracting nothing from an accepted proof is a break; so, but with that
   probability, the program extracts a valid execution within its budget. That a price unit is a constant number of instructions of a 64-bit
   CPU is trusted (`CostMachine.lean`). -/
@@ -73,7 +73,7 @@ structure Theorems
   statementDigestBinds : LeanVM.Node.StatementDigestBinds
   /-- The leanISA guest program is complete, in at most `2^30` committed words, on every node within
   the deployed limits (`DeployedLimits`: at most `16` children holding `2^17` claims in all, `2048`
-  leanXMSS and `512` leanSPHINCS signatures, a blob matrix of `32` rows), under the deployed seed,
+  leanXMSS and `512` leanSPHINCS signatures, a blob matrix of `LeanDa.maxRows` rows), under the deployed seed,
   wherever every child carries the honest prover's proof (`HonestChild`)
   (`LeanVmGuestCompleteness.lean`). -/
   guestCompleteOnHonestChildren : LeanVM.Guest.Completeness.GuestCompleteOnHonestChildren

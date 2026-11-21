@@ -160,7 +160,7 @@ variable (prog : LeanIsaProgram) (s : Sizes)
 /-- Every opcode table has a column. -/
 theorem width_opIdx_pos : ∀ j : Fin 6, 0 < width (opIdx j) := by decide +kernel
 
-/-- A committed column of each table the cap counts: `MEM_LO`, `BFCNT`, and the last column of
+/-- A committed column of each table the cap counts: `MEMORY_0`, `BYTECODE_FINAL_COUNTERS`, and the last column of
 each opcode table. -/
 def capCol : Fin 8 → Col
   | ⟨0, _⟩ => memCol 0
@@ -214,8 +214,7 @@ theorem haltingRunC_eq_of_extracted {s : Sizes} {q : Column (leanIsaμ prog s)}
   omega
 
 /-- **A stack satisfying the leanISA relation at admissible sizes has a valid execution**, the one
-`candidateExecution` returns. With `haltingRunC_eq_of_extracted` this replaces `haltingRun_valid`
-and `haltingRun_imageOf` in `extractor_of_extracted`. -/
+`candidateExecution` returns. -/
 theorem candidateExecution_of_extracted {s : Sizes} {q : Column (leanIsaμ prog s)}
     (hs : s.Admissible prog) (h : M3Holds (leanIsaInstance prog s) input q) :
     ∃ t, candidateExecution prog input (verifierLayout prog s) (q.values : Vector K (2 ^ _)) =

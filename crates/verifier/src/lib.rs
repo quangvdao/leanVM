@@ -2,24 +2,26 @@
 //!
 //! Kept close enough to the Lean transcription (`formal/Statement/LeanVmVerifier.lean`) to read side by side: the same functions, in the same order, with the same constants.
 //!
-//! What the transcription has no counterpart for sits in modules of its own: the prepared [`Bytecode`] and what the statement of an aggregate adds, [`da`].
+//! What the transcription has no counterpart for sits in modules of its own: the prepared [`Bytecode`], the proof's byte encoding ([`Proof::to_bytes`]) and what the statement of an aggregate adds, [`da`].
 //!
 //! One walk of the protocol serves two entry points. [`verify_execution`] checks the proof. [`replay_unchecked`] reads the same [`Summary`] out of it and checks nothing: every check it leaves out is behind `Transcript::checked`.
 
 #![forbid(unsafe_code)]
 
+pub mod bus_layout;
 mod bytecode;
 pub mod da;
 mod field;
 mod hash;
-mod keccak;
-mod layout;
+pub mod keccak;
+pub mod layout;
 mod link;
 mod merkle;
 mod multilinear;
 mod ring_switch;
 mod transcript;
 mod whir;
+mod wire;
 
 pub use bytecode::Bytecode;
 pub use field::{E, K};
@@ -28,20 +30,29 @@ pub use layout::{
     min_execution_stacked_log,
 };
 pub use merkle::MerklePath;
+pub use transcript::{Proof, RATE_SCALARS, SECURITY_BITS, grinding_bits};
+pub use whir::{
+    BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, INITIAL_FOLDING_FACTOR, MAX_LOG_INV_RATE, MIN_LOG_INV_RATE,
+    OOD_GRINDING_BITS, QUERY_GRINDING_BITS, RESIDUAL_MAX_LOG, RS_DOMAIN_INITIAL_REDUCTION_FACTOR,
+    RS_DOMAIN_SUBSEQUENT_REDUCTION_FACTOR, SUBSEQUENT_FOLDING_FACTOR, whir_queries,
+};
+pub use wire::{MAX_HEIGHT, MAX_LEAF_WORDS, MAX_PHASES, MAX_QUERIES};
+
+// What the provers and the aggregation's guest constants and witness read of the protocol.
+pub use bus_layout::{N_BUS_TREES, bus_grinding_bits};
+pub use hash::Digest;
 pub use multilinear::{Spot, stack_offsets};
-pub use transcript::Proof;
-pub use transcript::SECURITY_BITS;
-pub use whir::{BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, OOD_GRINDING_BITS, QUERY_GRINDING_BITS, whir_queries};
+pub use whir::{Subspace, WhirConfig, derive_config, subspace_roots};
 
 use field::{ONE, ZERO, powers};
-use hash::{Digest, ROUNDS, STATE_LANES};
+use hash::{ROUNDS, STATE_LANES};
 use keccak::{KeccakShape, verify_keccak};
 use layout::{GLOBAL_COLUMN_BASES, KECCAK_OUT, Layout, MEMORY_0, MEMORY_1, N_TABLES, OP_KECCAK, QKECCAK, build_layout};
 use link::verify_link;
 use multilinear::{dot, eq_eval, multilinear_eval};
 use ring_switch::{RingClaim, RingPiece, ring_switch};
 use std::ops::Range;
-use transcript::{Transcript, grinding_bits};
+use transcript::Transcript;
 use whir::verify_whir;
 
 /// Why a proof was rejected.
@@ -74,6 +85,7 @@ pub enum VerifierError {
     PcsInverseRate,
     CommittedSize,
     StackedClaims,
+    BytecodeShape,
 }
 
 impl std::fmt::Display for VerifierError {
@@ -105,6 +117,7 @@ impl std::fmt::Display for VerifierError {
             Self::PcsInverseRate => "invalid PCS inverse rate",
             Self::CommittedSize => "committed size outside the PCS window",
             Self::StackedClaims => "too many stacked claims",
+            Self::BytecodeShape => "bytecode is not the encoding of a program",
         };
         f.write_str(message)
     }
@@ -275,7 +288,10 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     let log_memory = announced[0].c0;
     let table_rows: Vec<u64> = announced[1..1 + N_TABLES].iter().map(|value| value.c0).collect();
     let log_inverse_rate = announced[1 + N_TABLES].c0;
-    require((1..=4).contains(&log_inverse_rate), VerifierError::PcsInverseRate)?;
+    require(
+        (MIN_LOG_INV_RATE as u64..=MAX_LOG_INV_RATE as u64).contains(&log_inverse_rate),
+        VerifierError::PcsInverseRate,
+    )?;
     let layout = build_layout(bytecode, log_memory, &table_rows)?;
     require(
         (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&layout.stack_log),

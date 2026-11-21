@@ -7,6 +7,9 @@ public import LeanVM.Cost.Bounds.GuestReplay
 public import LeanVM.Cost.Decoder.Top
 public import LeanVM.Cost.Bounds.Decoder.EntryArray
 public import LeanVM.Cost.Prices
+public import LeanVM.Guest.GuestConst
+-- Private: `guest_const%` inserts literals, so importers need not see the guest's source.
+import LeanVM.Guest.Data.Source
 
 /-!
 # Bounds on the guest decoder's prices: the top
@@ -63,12 +66,12 @@ theorem babyTable_cost (hP : Includes P Decoder.babyTableC.costDeps) (b : K) (s 
       74 * (s * Nat.clog 2 s) + 120 * s + 16 := by
   rw [Decoder.babyTableC.costEq P hP, List.length_mergeSort, length_powPairsBy]
   have h1 := powPairsBy_cost P (by includes) b s 0 1 (by omega)
-  have h2 := mergeSortList_cost P (by includes) _ (.closure powTable.c237.lam0.costIdx [])
-    (fun a b ↦ RunsApp.of_spec (powTable.c237.lam0.costSpec P (by includes) a b)) 7
+  have h2 := mergeSortList_cost P (by includes) _ (.closure powTable.c110.lam0.costIdx [])
+    (fun a b ↦ RunsApp.of_spec (powTable.c110.lam0.costSpec P (by includes) a b)) 7
     (fun e ↦ e.1 < 2 ^ 64)
     (fun a b ha hb ↦ by
       simp only [appCost_fn, List.nil_append, List.length_nil]
-      rw [powTable.c237.lam0.costEq P (by includes), limbs_of_lt ha, limbs_of_lt hb]
+      rw [powTable.c110.lam0.costEq P (by includes), limbs_of_lt ha, limbs_of_lt hb]
       omega)
     (powPairsBy b s 0 1) (by rw [length_powPairsBy]; omega)
     (fun e he ↦ (mem_powPairsBy_lt b s 0 1 e he).1)
@@ -321,8 +324,8 @@ reader's `R`, a frame search at most `F`. -/
 @[expose] def sphincsReaderPrice (R S F : ℕ) : ℕ := 2 * S + 4 * F + 1507 * (R + 1551) + 351536
 
 /-- `da_verify`'s witness's price at a frame of the frame map of price `F`: its rows at most
-`1024 = 2^10` (`dvWitN_cost_1024`). -/
-@[expose] def dvFramePrice (G F : ℕ) : ℕ := (F + 9) + G + dvWitNRowsPrice 10 F (F + 9) + 22
+`DA_MAX_ROWS = 2^DA_LOG_MAX_ROWS` (`dvWitN_cost_maxRows`). -/
+@[expose] def dvFramePrice (G F : ℕ) : ℕ := (F + 9) + G + dvWitNRowsPrice (guest_const% DA_LOG_MAX_ROWS) F (F + 9) + 22
 
 /-- **The witness at the frames stage's closures** (`decWitNC`): the frame map's price at most
 `F` (`frameAtAC` on `table`), a frame search's at most `F` too (`frameFpAC`, the leanSPHINCS
@@ -354,7 +357,7 @@ theorem frameWit_cost (D : DiscreteLogTables) (hP : Includes P Decoder.decWitNC.
     {Kc N X : ℕ} (hc : CountsWithin D σ Kc N X) (L : ℕ) (hL32 : L ≤ 2 ^ 32)
     (hLk : ∀ c < Decoder.nKidsD D σ,
       Decoder.cursorLength D (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 25))
-        (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 1919)) ≤ L) :
+        (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 1885)) ≤ L) :
     machineCost P Decoder.decWitNC.costIdx [encodeValue D, encodeValue Tb, σV, rdV,
       .closure Decoder.decTopFramesC.lam0.costIdx [rdV, encodeValue table],
       .closure Decoder.decTopFramesC.lam1.costIdx [encodeValue Tb, rdV, encodeValue table],
@@ -368,7 +371,7 @@ theorem frameWit_cost (D : DiscreteLogTables) (hP : Includes P Decoder.decWitNC.
   have hC' := cursorClosure_cost P hL3 D C hC
   exact decWitN_cost P hrd hR hσ hS hVn hF' hcl hC' hL32 D Tb hTb hP hG
     (dvFramePrice G (F + 9)) (fun args rets hlen ↦ by
-      have := dvWitN_cost_1024 P hVn hF' (daFrame_runs P hVn (by includes) args rets)
+      have := dvWitN_cost_maxRows P hVn hF' (daFrame_runs P hVn (by includes) args rets)
         (daFrame_cost P hVn hF' (by includes) args rets hlen) D (by includes) hG
       unfold dvFramePrice; omega)
     (xmssClosure_runs P hrd table hL1 Tb)

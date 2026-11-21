@@ -144,13 +144,13 @@ variable {m : Type → Type} [Monad m] [HasQuery HashSpec m]
 def oracleHashWithHash (input : HashInput) : m HashOutput :=
   HasQuery.query (spec := HashSpec) (m := m) input
 
-/-- `Th(P, A, M) = Truncate_n(H(P || A || M))` (`th`, `lean_xmss/hash.rs:95-97`). -/
+/-- `Th(P, A, M) = Truncate_n(H(P || A || M))` (`th`, `lean_xmss/hash.rs`). -/
 def thWithHash (parameter : PublicParameter) (fields : TweakFields) (payload : HashInput) :
     m Digest := do
   return truncateHash (← oracleHashWithHash (thInput parameter fields payload))
 
 /-- `H(P || A || M)`, untruncated: two secrets for one hash (`th_pair`,
-`lean_xmss/hash.rs:105-108`). -/
+`lean_xmss/hash.rs`). -/
 def thPairWithHash (parameter : PublicParameter) (fields : TweakFields) (payload : HashInput) :
     m HashOutput :=
   oracleHashWithHash (thInput parameter fields payload)
@@ -367,8 +367,11 @@ noncomputable def schemeWithHash :
 attribute [local irreducible] KeyGenerationAndSigning.treeNodeWithHash
   KeyGenerationAndSigning.signWithHash
 
-/-- The rest of leanXMSS's key generation once `S` and `P` are derived: the top tree's root. -/
-def keygenRest (key : SchemeSeedKey) : OracleComp HashSpec (PublicKey × SchemeSeedKey) := do
+/-- The rest of leanXMSS's key generation once `S` and `P` are derived: the top tree's root. Its
+spec is `KeptKey`'s, `SufCma.SchemeHashSpec`: with the equal `HashSpec`, the kernel would unfold
+the computation's `support` before the specs when it checks `keptKey`. -/
+def keygenRest (key : SchemeSeedKey) :
+    OracleComp SufCma.SchemeHashSpec (PublicKey × SchemeSeedKey) := do
   let root ← KeyGenerationAndSigning.treeNodeWithHash key.parameter topLayer key.schemeSeed
     layerHeight 0
   return (⟨root, key.parameter⟩, key)

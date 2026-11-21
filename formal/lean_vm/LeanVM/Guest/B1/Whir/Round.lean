@@ -12,7 +12,7 @@ public import LeanVM.Guest.B1.Bits.MeaningP
 public import LeanVM.Guest.B1.Whir.Flat
 
 /-!
-# `opening_round` (`lean_ethereum.py:1212-1229`, G below)
+# `opening_round` (`lean_ethereum.py`, G below)
 
 One fold round of CWYZ26's affine combiner (`foldRound`, `Statement/LeanVmVerifier.lean`): the
 four scalars `u0, w, c0, c1`, a grind and `α`, then `β`; `α` stored for the point and, with
@@ -36,7 +36,7 @@ open LeanVM.Protocol LeanVM.Protocol.KeccakHash LeanVM.Protocol.Compile LeanVM.P
 
 /-! ## The template -/
 
-/-- `opening_round`'s body (G:1212-1229): the capacity copied, the four scalars `u0, w, c0, c1`
+/-- `opening_round`'s body: the capacity copied, the four scalars `u0, w, c0, c1`
 and their permutation, the grind's nonce and permutation, `α`, the squeeze of `β`, the stores,
 the claim. -/
 def roundBody : List Stmt :=
@@ -47,14 +47,13 @@ def roundBody : List Stmt :=
   fsNonceT (.n 5) 4 40 ++ padRunT 43 ++
   [keccakA (permIns 1 [.n 41, .n 42] 44 (osRun 35 5)) (osRun 48 13),
     .call "grind_check__L7" [.n 49, .n 7] []] ++
-  challengeT (.n 48) 61 ++
-  [keccakA (permIns 0 [] 44 (osRun 56 5)) (osRun 62 13)] ++ challengeT (.n 62) 75 ++
-  [osLd 61 8 0, osLd 61 9 0, osLd 75 9 1,
-    osMul 76 75 21, osAdd 77 15 76, osAdd 78 15 6, osMul 79 61 18, osAdd 80 78 79,
-    osAdd 81 21 24, osMul 82 75 81, osAdd 83 80 82, osMul 84 61 83, osAdd 85 77 84] ++
-  ((List.range 5).map fun i ↦ osCp (86 + i) (70 + i)) ++
-  [osCst 91 (word 32 0), osMul 92 5 91, osCp 93 92, osCp 94 85,
-    .ret [.n 86, .n 87, .n 88, .n 89, .n 90, .n 93, .n 94]]
+  [keccakA (permIns 0 [] 44 (osRun 56 5)) (osRun 61 13)] ++
+  [osLd 48 8 0, osLd 48 9 0, osLd 61 9 1,
+    osMul 74 61 21, osAdd 75 15 74, osAdd 76 15 6, osMul 77 48 18, osAdd 78 76 77,
+    osAdd 79 21 24, osMul 80 61 79, osAdd 81 78 80, osMul 82 48 81, osAdd 83 75 82] ++
+  ((List.range 5).map fun i ↦ osCp (84 + i) (69 + i)) ++
+  [osCst 89 (word 32 0), osMul 90 5 89, osCp 91 90, osCp 92 83,
+    .ret [.n 84, .n 85, .n 86, .n 87, .n 88, .n 91, .n 92]]
 
 /-! ## The meaning -/
 
@@ -65,11 +64,11 @@ def rdS2 (fs : List E) (m : List E) : Fs := (⟨fs, []⟩ : Fs).absorbAll m dsOb
 def rdG2 (fs : List E) (m : List E) (n2 : E) : E × Fs :=
   (rdS2 fs m).grindSqueeze _root_.LeanVM.Parameters.Whir.foldGrindingBits n2
 
-/-- The fold round's claim (G:1227-1228): `u0 + β c0 + α (u0 + claim + α w + β (c0 + c1))`. -/
+/-- The fold round's claim: `u0 + β c0 + α (u0 + claim + α w + β (c0 + c1))`. -/
 def roundClaim (claim alpha beta u0 w c0 c1 : E) : E :=
   u0 + beta * c0 + alpha * (u0 + claim + alpha * w + beta * (c0 + c1))
 
-/-- **`opening_round(fs0..fs4, cursor, claim, tabs, alphas, coefs)`** (G:1212-1229): the five
+/-- **`opening_round(fs0..fs4, cursor, claim, tabs, alphas, coefs)`**: the five
 stream words at the cursor `u0, w, c0, c1, n2`; from the carried capacity with nothing waiting,
 the four scalars are absorbed, the grind passes and draws `α`, then `β` is squeezed; `α` is stored
 at `alphas`, `α, β` at `coefs`; the function returns the capacity after `β`, the cursor five words

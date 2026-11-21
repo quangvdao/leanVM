@@ -2,7 +2,7 @@
   LeanVM.Guest.B1.VerifySub.Known
 
   `kappa_base` is in range after `verify_sub`'s placement and the stack's log check
-  (G:3591-3594): the facts of `VsKnown`.
+ : the facts of `VsKnown`.
 -/
 
 module
@@ -105,7 +105,7 @@ def PlaceKnown (rd : Reader) (σ : Val) (logMem : ℕ) (ds : List E) : Prop :=
         (Tables.stackTotal (columnKappas logMem Tables.guestLogBytecode hs))) ∧
       max 16 (log2Ceil (Tables.stackTotal (columnKappas logMem Tables.guestLogBytecode hs))) ≤ 30
 
-/-- **The placement and the stack's log** (G:3591-3594): the base's table entries are powers
+/-- **The placement and the stack's log**: the base's table entries are powers
 `g^τ_t`, and the stack at most `2^30` puts every committed column's log below `31`. -/
 theorem vsPlaceT_known {κ : ℕ} (hκ : κ ≤ 32) (hκ6 : 6 ≤ κ) (L : MemoryImage κ)
     (hC : CallRel.Le C (coreProgram.Rel L.read)) (hcp : Tables.certify_placement_Spec L.read)
@@ -215,11 +215,11 @@ theorem vsT_pre249 : vsT = (vsHeadT ++ vsReadsT ++ vsSizesT ++ vsPushT ++ vsRoot
   simp only [vsT, List.append_assoc]
 
 /-- **`VsKnown`** from `certify_placement`'s specification: `kappa_base`'s entries below
-`kbBound`, from the body's first `1545` statements (only its first `249` are read). -/
+`kbBound`, from the body's first `1511` statements (only its first `249` are read). -/
 theorem vsKnown_of {κ : ℕ} (L : MemoryImage κ) (_hmin : minLogMem ≤ κ) (h32 : κ ≤ maxLogMem)
     (hcp : Tables.certify_placement_Spec L.read)
     (σ : Val) (hexp : B1.ExpTables L.read (σ (.n 4)))
-    (h : Stmt.HoldsList (coreProgram.Rel L.read) L.read σ ((Fn.body fn% «verify_sub»).take 1545)
+    (h : Stmt.HoldsList (coreProgram.Rel L.read) L.read σ ((Fn.body fn% «verify_sub»).take 1511)
         True
       (fun _ ↦ True)) :
     ∀ i < 8, ∃ e < kbBound i, LoadHolds L.read (σ (.n 83)) i (ofK (addressOfIndex e)) := by

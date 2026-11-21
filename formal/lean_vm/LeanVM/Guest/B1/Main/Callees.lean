@@ -38,9 +38,13 @@ def SubSound (bytecode : List K) : Prop :=
       ExpTables rd gsq ∧ ExpWinTab rd gsq →
       ∃ π, VerifySubOut bytecode rd [pi0, pi1, s0, s1, gsq, out] π
 
+instance : NeZero LeanXmss.lifetime := ⟨by simp [LeanXmss.lifetime]⟩
+deriving instance Nonempty for LeanXmss.LayerSignature, LeanXmss.Signature
+deriving instance Nonempty for Sphincs.ForsTreeOpening, Sphincs.LayerSignature, Sphincs.Signature
+instance : Nonempty Proof := ⟨⟨[], []⟩⟩
+
 /-- **Witness functions for `main`'s callees exist.** -/
-theorem callees_exist [Nonempty LeanXmss.Signature] [Nonempty Sphincs.Signature] [Nonempty Proof]
-    {bytecode : List K} {sx : Val → LeanXmss.Signature}
+theorem callees_exist {bytecode : List K} {sx : Val → LeanXmss.Signature}
     {ss : Val → FrameMap → Sphincs.Signature} (hx : Sig.verify_lean_xmss_sound_Spec sx)
     (hs : Sig.verify_sig_lean_sphincs_sound_Spec ss) (hv : SubSound bytecode)
     (hd : Da.da_verify_sound_Spec) (ha : aggregate_claims_sound_Spec) {rd : Reader}
@@ -72,19 +76,19 @@ theorem callees_exist [Nonempty LeanXmss.Signature] [Nonempty Sphincs.Signature]
       exact ⟨sig, fun _ _ _ => hsig⟩
     · exact ⟨Classical.ofNonempty, fun bb hr hbb => absurd ⟨bb, hr, hbb⟩ h⟩
   -- the matrix
-  have edd : ∀ args rets : List E, ∃ w : LeanVM.Da.MatrixWitness, ∀ gsq, args = [gsq] →
-      coreProgram.Rel L.read "da_verify" [gsq] rets → Da.SquaresAt L.read gsq →
+  have edd : ∀ args rets : List E, ∃ w : LeanVM.Da.MatrixWitness, ∀ bb, args = [bb] →
+      coreProgram.Rel L.read "da_verify" [bb] rets → Da.CountWords L.read bb →
       ∃ (root : Digest) (z : E), w.Opens root z ∧ rets = digestCells root ++ [z] := by
     intro args rets
-    by_cases h : ∃ gsq, args = [gsq] ∧ coreProgram.Rel L.read "da_verify" [gsq] rets ∧
-        Da.SquaresAt L.read gsq
-    · obtain ⟨gsq, rfl, hr, hsq⟩ := h
-      obtain ⟨w, root, z, hop, hrets⟩ := hd L.read hm' [gsq] rets hr hsq
-      exact ⟨w, fun g hg _ _ => by
-        simp only [List.cons.injEq, and_true] at hg
-        subst hg
-        exact ⟨root, z, hop, hrets⟩⟩
-    · exact ⟨⟨[]⟩, fun g hg hr hsq => absurd ⟨g, hg, hr, hsq⟩ h⟩
+    by_cases h : ∃ bb, args = [bb] ∧ coreProgram.Rel L.read "da_verify" [bb] rets ∧
+        Da.CountWords L.read bb
+    · obtain ⟨bb, rfl, hr, hcw⟩ := h
+      obtain ⟨w, root, z, hop, hrets⟩ := hd L.read hm' [bb] rets hr hcw
+      refine ⟨w, fun bb' hargs _ _ => ?_⟩
+      simp only [List.cons.injEq, and_true] at hargs
+      subst hargs
+      exact ⟨root, z, hop, hrets⟩
+    · exact ⟨⟨[]⟩, fun bb ha hr hcw => absurd ⟨bb, ha, hr, hcw⟩ h⟩
   -- the proofs
   have ev : ∀ args : List E, ∃ π : Proof, ∀ pi0 pi1 s0 s1 gsq out,
       args = [pi0, pi1, s0, s1, gsq, out] →
@@ -103,7 +107,7 @@ theorem callees_exist [Nonempty LeanXmss.Signature] [Nonempty Sphincs.Signature]
       args = [ncg, cpi, cfresh, ccarried, dst, tabs] →
       coreProgram.Rel L.read "aggregate_claims" args [] → WinTabs L.read tabs →
       ∀ m, 1 ≤ m → m ≤ 16 → ncg = gen ^ m →
-      ∃ out : DeferredClaim, out.bytecodePoint.length = bytecodeVars ∧
+      ∃ out : DeferredBytecodeClaim, out.bytecodePoint.length = bytecodeVars ∧
         ReadsAt L.read dst out.cells ∧ ∀ cs : List ChildClaims, cs.length = m →
           (∀ c (hc : c < cs.length), ChildWordsAt L.read cpi cfresh ccarried c cs[c]) →
           batch cs hints = some out := by
@@ -128,14 +132,13 @@ theorem callees_exist [Nonempty LeanXmss.Signature] [Nonempty Sphincs.Signature]
   choose wV hwV using ev
   choose wA hwA using ea
   exact ⟨wX, wS, wD, wV, wA, fun args hr => hwX args hr, fun p bb hr hbb => hwS p bb hr hbb,
-    fun gsq rets hr hsq => hwD [gsq] rets gsq rfl hr hsq,
+    fun bb rets hr hcw => hwD [bb] rets bb rfl hr hcw,
     fun pi0 pi1 s0 s1 gsq out hr he => hwV _ _ _ _ _ _ _ rfl hr he,
     fun ncg cpi cfresh ccarried dst tabs hr hw m h1 h16 hn =>
       hwA _ _ _ _ _ _ _ rfl hr hw m h1 h16 hn⟩
 
 /-- **A run of `main` decodes to a statement of the public input's digest, held by a witness.** -/
-theorem main_sound_exists [Nonempty LeanXmss.Signature] [Nonempty Sphincs.Signature]
-    [Nonempty Proof] {bytecode : List K} {sx : Val → LeanXmss.Signature}
+theorem main_sound_exists {bytecode : List K} {sx : Val → LeanXmss.Signature}
     {ss : Val → FrameMap → Sphincs.Signature} (hx : Sig.verify_lean_xmss_sound_Spec sx)
     (hs : Sig.verify_sig_lean_sphincs_sound_Spec ss) (hv : SubSound bytecode)
     (hd : Da.da_verify_sound_Spec) (ha : aggregate_claims_sound_Spec)

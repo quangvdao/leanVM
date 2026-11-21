@@ -13,6 +13,7 @@ public import LeanVM.Protocol.Verifier.Claims
 public import LeanVM.Protocol.Compile.Cost
 public import LeanVM.Protocol.Verifier
 public import LeanVM.Protocol.WithHash
+public import LeanVM.Protocol.Verifier.KeccakPack
 
 /-!
 # The query cost of the leanVM verifier
@@ -55,7 +56,7 @@ right after a proof of work, which permutes nothing, is charged a permutation.
 ## Deployed behaviour
 
 The bound is a statement on the program `leanVmVerifierProgram` as transcribed in
-`Statement.LeanVmVerifier`, at the commit `leanvm-rev` names; it covers every proof, accepted or
+`Statement.LeanVmVerifier`,; it covers every proof, accepted or
 not, and the deferring program `deferringVerifierProgram` alike (`costLE_deferringProgram`).
 -/
 
@@ -583,17 +584,17 @@ theorem costs_publicInputPhase (layout : Layout) (publicInput : Digest) :
 
 /-- The pack rounds: one equality-mode round of three coefficients per coordinate, keeping the
 point's length. -/
-theorem costs_keccakPackRounds : ∀ (point : List E) (value scale : E),
-    VerifierProgram.Costs height (keccakPackRounds point value scale) (point.length * roundCost 3)
-      fun r ↦ r.2.2.length = point.length
-  | [], _, _ => rfl
-  | r :: rs, value, scale => by
+theorem costs_keccakPackRounds : ∀ (point : List E) (value : E),
+    VerifierProgram.Costs height (keccakPackRounds point value) (point.length * roundCost 3)
+      fun r ↦ r.2.length = point.length
+  | [], _ => rfl
+  | r :: rs, value => by
     refine VerifierProgram.Costs.seq (costs_sumcheckRoundPoly 3 _ _) (fun _ _ ↦
         VerifierProgram.Costs.seq
       VerifierProgram.Costs.sampleE (fun c _ ↦ VerifierProgram.Costs.seq (costs_keccakPackRounds
-          rs _ _)
+          rs _)
         (fun t ht ↦ ?_) ?_) ?_) ?_
-    · obtain ⟨v, s, p⟩ := t
+    · obtain ⟨v, p⟩ := t
       show (c :: p).length = (r :: rs).length
       simpa using ht
     all_goals simp only [List.length_cons, Nat.succ_mul, roundCost]; omega
@@ -602,14 +603,15 @@ theorem costs_keccakPackRounds : ∀ (point : List E) (value scale : E),
 theorem costs_verifyKeccakLayer (logSteps step : ℕ) (claim : KeccakClaim) :
     VerifierProgram.Costs height (verifyKeccakLayer logSteps step claim)
       (keccakLayerCost claim.point.length) fun c ↦ c.point.length = claim.point.length := by
+  rw [verifyKeccakLayer_packed]
   have hr4 : roundCost 4 = 12 := rfl
   have hr3 : roundCost 3 = 11 := rfl
   refine VerifierProgram.Costs.seq (VerifierProgram.Costs.readN _) (fun _ _ ↦
       VerifierProgram.Costs.seq (VerifierProgram.Costs.require (n := 0) _) (fun _ _ ↦
     VerifierProgram.Costs.seq (VerifierProgram.Costs.grindP _) (fun _ _ ↦
       VerifierProgram.Costs.seq VerifierProgram.Costs.sampleE (fun _ _ ↦
-      VerifierProgram.Costs.seq (costs_keccakPackRounds _ _ _) (fun r hr ↦ ?_) ?_) ?_) ?_) ?_) ?_
-  · obtain ⟨value, scale, point⟩ := r
+      VerifierProgram.Costs.seq (costs_keccakPackRounds _ _) (fun r hr ↦ ?_) ?_) ?_) ?_) ?_) ?_
+  · obtain ⟨value, point⟩ := r
     refine VerifierProgram.Costs.seq (costs_sumcheck 4 _ _) (fun r _ ↦ ?_) ?_
     · obtain ⟨localPoint, value⟩ := r
       refine VerifierProgram.Costs.seq (VerifierProgram.Costs.readN 3) (fun _ _ ↦
@@ -848,9 +850,9 @@ theorem costs_whirLevels (logN laneFolds : ℕ) (evaluateBasis : List E → E) :
           VerifierProgram.Costs.seq (costs_sumcheck 3 _ _) (fun r _ ↦ ?_) ?_) (Nat.zero_le _)) ?_
       · obtain ⟨tail, claim⟩ := r
         exact (VerifierProgram.Costs.require (n := 0) _).mono (Nat.zero_le _) fun _ _ ↦ trivial
-      all_goals (try simp only [hm, hP, hr3, List.length_replicate])
+      all_goals simp only [hm, hP, hr3, List.length_replicate]
       all_goals omega
-    all_goals (try simp only [hm, hP, hr3])
+    all_goals simp only [hm, hP, hr3]
     all_goals omega
   | level :: next :: rest, index, s, μ, hμ, hH, hD => by
     simp only [whirHeightsLE, Bool.and_eq_true, decide_eq_true_eq] at hH
@@ -876,7 +878,7 @@ theorem costs_whirLevels (logN laneFolds : ℕ) (evaluateBasis : List E → E) :
           (costs_whirLevels logN laneFolds evaluateBasis (next :: rest) (index + 1) _
             (μ - level.fold) (by rw [glueLevel_alphas]; exact hm) hH.2 hD.2).mono ?_
             fun _ h ↦ h) ?_) ?_
-      all_goals (try simp only [hm])
+      all_goals simp only [hm]
       all_goals omega
     all_goals (try simp only [hm])
     all_goals omega

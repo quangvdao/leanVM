@@ -15,7 +15,7 @@ public import LeanVM.Guest.B1.Fs.Templates
 # The templates of `opening_queries`
 
 `opening_queries(cap, flags, lam_inv, coefs, hs, positions, query_win_ptrs, n_iters_g)`
-(`crates/rec_aggregation/guests/lean_ethereum.py`) has 73 specializations, one per level shape
+(`guests/lean_ethereum.py`) has 73 specializations, one per level shape
 (`Oq`). One query (`opening_query`, inline, with `walk_path` and `novel_eval`) from its first
 value `b`, at the point `x`, is `oqQueryT`:
 
@@ -383,11 +383,10 @@ def oqNovel (s : Oq) (hs : V) (v : ℕ) : List Stmt × List ℕ × ℕ :=
   (nvLevel0T hs (.n (oqWs v 0)) s.nHs k ++ r.1, r.2.1, r.2.2)
 
 /-- The final level's check after the fold's value `v`: the chain, the novel sum, its equality with
-the value, the query's result `0`. -/
+the value (the query's result, the constant `0`, takes no cell). -/
 def oqFinT (s : Oq) (x hs : V) (v : ℕ) : List Stmt :=
   oqWsT s x v ++ (oqNovel s hs v).1 ++
-    [.atom (.assertEq (.n v) (.n ((oqNovel s hs v).2.1.headD 0))),
-      .atom (.const (.n (oqNovel s hs v).2.2) (word 0 0))]
+    [.atom (.assertEq (.n v) (.n ((oqNovel s hs v).2.1.headD 0)))]
 
 /-! ## One query -/
 
@@ -400,12 +399,13 @@ def oqPr (s : Oq) (b : ℕ) (emit : Bool) (pr : ℕ) : ℕ := if emit then oqK1 
 /-- The first value after the leaf hash: the fold's start. -/
 def oqCh (s : Oq) (b : ℕ) (emit : Bool) : ℕ := oqKL s b emit + s.chainLen
 
-/-- The query's result: the fold's value, or (final level) the constant `0` after the check. -/
+/-- The query's result: the fold's value, or (final level, where the result is the constant `0`
+and takes no cell) the first value after the check. -/
 def oqRes (s : Oq) (b : ℕ) (emit : Bool) : ℕ :=
   if s.final = 1 then (oqNovel s (.n 0) (oqVal s (oqCh s b emit))).2.2 else oqVal s (oqCh s b emit)
 
 /-- The first value after a query. -/
-def oqEnd (s : Oq) (b : ℕ) (emit : Bool) : ℕ := oqRes s b emit + 1
+def oqEnd (s : Oq) (b : ℕ) (emit : Bool) : ℕ := if s.final = 1 then oqRes s b emit else oqRes s b emit + 1
 
 /-- **One query** from the value `b` at the point `x`, its windows at `bp`, emitting the padding
 run (`emit`) or reusing the one at `pr`: the row, the leaf hash, the call of `walk`

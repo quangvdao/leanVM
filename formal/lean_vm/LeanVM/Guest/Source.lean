@@ -2,7 +2,7 @@
   LeanVM.Guest.Source
 
   The zkDSL source AST of a program after placeholder substitution, as the Rust parser builds it
-  (`crates/lean_compiler/src/ast.rs`), and the syntactic passes the compiler runs on it before
+  (`crates/zkdsl_compiler/src/ast.rs`), and the syntactic passes the compiler runs on it before
   lowering: substitution, free variables, the inline-safety test.
 -/
 
@@ -13,8 +13,8 @@ public import Init
 /-!
 # The zkDSL source AST
 
-A transcription of `crates/lean_compiler/src/ast.rs` (leanVM at `leanvm-rev`): what
-`lean_compiler::parse_with_replacements` returns. Placeholders and scalar global constants are
+A transcription of `crates/zkdsl_compiler/src/ast.rs`: what
+`zkdsl_compiler::parse_with_replacements` returns. Placeholders and scalar global constants are
 already substituted textually, `match` arms are already expanded per integer, and `x OP= e` is
 already `x = x OP (e)`; constant arrays stay named (`Program.constArrays`). A keyword argument
 `key=value` is the call `__kw_key(value)`, as the parser writes it. The guest's AST is generated data
@@ -22,7 +22,7 @@ already `x = x OP (e)`; constant arrays stay named (`Program.constArrays`). A ke
 
 The passes below are those of `ast.rs` and `parser/subst.rs`, used by the expansion
 (`LeanVM.Guest.Expand`): `Stmt.substList` (`subst_stmts`), `freeVarsStmt` (`free_vars_stmt`),
-`bindsAnywhere`, `containsReturn` and `inlineSafe` (`body_inlinable`).
+`bindsAnywhere`, `containsReturn` and `splitTailReturn` (`split_tail_return`).
 -/
 
 namespace LeanVM.Guest.Source
@@ -418,11 +418,12 @@ def Stmt.inlineSafeList : List Stmt → Bool
   | s :: ss => Stmt.inlineSafe s && Stmt.inlineSafeList ss
 end
 
-/-- `body_inlinable`: one tail return, preceded by inline-safe statements. -/
-def bodyInlinable (body : List Stmt) : Bool :=
+/-- `split_tail_return`: an inlinable body split at its single tail return, the statements before
+it, each inline-safe, and the return's values. -/
+def splitTailReturn (body : List Stmt) : Option (List Stmt × List Expr) :=
   match body.getLast? with
-  | some (.mk _ (.ret _)) => Stmt.inlineSafeList body.dropLast
-  | _ => false
+  | some (.mk _ (.ret es)) => if Stmt.inlineSafeList body.dropLast then some (body.dropLast, es) else none
+  | _ => none
 
 end
 end LeanVM.Guest.Source

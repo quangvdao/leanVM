@@ -187,7 +187,12 @@ pub fn stack_offsets(sizes: &[usize], shared: &[bool], min_log: usize, lane_fold
     let log = log2_ceil(total).max(min_log);
     let lane = log - lane_fold;
     let lanes = total.div_ceil(1 << lane);
-    let pointer: u64 = sizes.iter().zip(shared).filter(|(_, s)| **s).map(|(&size, _)| 1u64 << size).sum();
+    let pointer: u64 = sizes
+        .iter()
+        .zip(shared)
+        .filter(|(_, s)| **s)
+        .map(|(&size, _)| 1u64 << size)
+        .sum();
     if pointer > 0 {
         for band in 0..=lane {
             if pointer.div_ceil(1 << band) > lanes {
@@ -240,7 +245,11 @@ fn banded(sizes: &[usize], shared: &[bool], lane: usize, log: usize, band: usize
     let mut end = band_end << lane;
     for &index in order.iter().filter(|&&i| !shared[i]) {
         let size = sizes[index];
-        let (pick, _) = free.iter().enumerate().filter(|(_, b)| b.1 >= size).min_by_key(|(_, b)| b.0)?;
+        let (pick, _) = free
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.1 >= size)
+            .min_by_key(|(_, b)| b.0)?;
         let (offset, log) = free.swap_remove(pick);
         free.extend(aligned_blocks(offset + (1 << size), offset + (1 << log)));
         spots[index] = Spot { offset, piece: size };
@@ -345,7 +354,10 @@ mod tests {
         // The 16-blob and 500-SPHINCS aggregations' columns, `(log size, pointer?) × count`, a stack of only pointer
         // columns, a pointer larger than a lane, and no pointer at all.
         let expand = |counts: &[((usize, bool), usize)]| -> Vec<(usize, bool)> {
-            counts.iter().flat_map(|&(column, n)| std::iter::repeat_n(column, n)).collect()
+            counts
+                .iter()
+                .flat_map(|&(column, n)| std::iter::repeat_n(column, n))
+                .collect()
         };
         let blob = expand(&[
             ((22, false), 3),
@@ -370,11 +382,16 @@ mod tests {
             ((17, false), 10),
             ((17, true), 5),
         ]);
-        let cases: [(Vec<(usize, bool)>, Option<usize>); 5] = [
+        // Each case: its columns' sizes and whether each is shared, and the band it should place, if any.
+        type Case = (Vec<(usize, bool)>, Option<usize>);
+        let cases: [Case; 5] = [
             (blob, Some(20)),
             (sphincs, Some(20)),
             (vec![(18, true); 64], None),
-            (vec![(23, true), (20, false), (19, true), (18, false), (18, false)], None),
+            (
+                vec![(23, true), (20, false), (19, true), (18, false), (18, false)],
+                None,
+            ),
             (vec![(20, false), (19, false), (18, false)], None),
         ];
         for (case, expected_band) in cases {
@@ -401,7 +418,10 @@ mod tests {
             if let Some(band) = band {
                 for &(offset, length, block) in pieces.iter().filter(|p| shared[p.2]) {
                     let in_lane = offset % (1 << lane);
-                    assert!(in_lane + length <= 1 << band.max(sizes[block].min(lane)), "pointer {block} is in the band");
+                    assert!(
+                        in_lane + length <= 1 << band.max(sizes[block].min(lane)),
+                        "pointer {block} is in the band"
+                    );
                 }
             }
         }

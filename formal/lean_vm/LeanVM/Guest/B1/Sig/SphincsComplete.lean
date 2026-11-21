@@ -1,7 +1,7 @@
 /-
   LeanVM.Guest.B1.Sig.SphincsComplete
 
-  `verify_sig_lean_sphincs` (`lean_ethereum.py:4143-4244`) is complete, loading
+  `verify_sig_lean_sphincs` (`lean_ethereum.py`) is complete, loading
   only the claim and the byte table (`verify_sig_lean_sphincs_complete_loads_of`), given its
   blocks' completeness (`SphincsBlocksComplete`).
 -/
@@ -18,7 +18,7 @@ public import LeanVM.Guest.B1.Sig.SphincsLoads
 `G` is `lean_ethereum.py`. The body (`sBody_splitC`) is the statements before the root's check
 (`sPre`): the digest and FORS (`sBottom_complete`), the bottom layer, the middle layer's address
 (`sMidAddrs_vals`), the middle layer, the top layer's address (`sTopAddrs_vals`) and the top layer
-(`layer_stage`); then `root[0] == pk_root` (`G:4243`) and the return. The statement's verification
+(`layer_stage`); then `root[0] == pk_root` and the return. The statement's verification
 by stages (`verifyWithKeccak_iff_stages`) gives each layer's root from the one below, the FORS key
 at the bottom (`sForsKeyOf_eq`), the key's root at the top. The loads are the claim's and the byte
 table's (`listLoadsB` of `loadPtrs sPre`, `sBody_loads`).
@@ -45,12 +45,12 @@ theorem sBody_splitC : sBody = sPre ++ [.atom (.assertEq sLayerT.2.2 sRoot), .re
   simp only [sBody, sAfterDigest, sPre, List.append_assoc]
 
 theorem sMidAddrs_seq : SeqOK 5398 sMidAddrs 5407 := seqB_ok (by decide +kernel)
-theorem sTopAddrs_seq : SeqOK 5556 sTopAddrs 5562 := seqB_ok (by decide +kernel)
+theorem sTopAddrs_seq : SeqOK 5556 sTopAddrs 5561 := seqB_ok (by decide +kernel)
 theorem sBottom_nb : NumBelow 5249 (Stmt.valsList (sDigestBlock ++ (sForsAddrs ++ sForsB.1))) :=
   numBelow_of_all (by decide +kernel)
 theorem sLayerB_nb : NumBelow 5398 (Stmt.valsList sLayerB.1) := numBelow_of_all (by decide +kernel)
 theorem sLayerM_nb : NumBelow 5556 (Stmt.valsList sLayerM.1) := numBelow_of_all (by decide +kernel)
-theorem sLayerT_le : 5562 ≤ sLayerT.2.1 := by decide +kernel
+theorem sLayerT_le : 5561 ≤ sLayerT.2.1 := by decide +kernel
 theorem sLayerB_rootC : ∃ k < 5398, sLayerB.2.2 = .n k := ⟨(sLayerB.2.2).idx, by decide +kernel, by decide +kernel⟩
 theorem sLayerM_rootC : ∃ k < 5556, sLayerM.2.2 = .n k := ⟨(sLayerM.2.2).idx, by decide +kernel, by decide +kernel⟩
 theorem sAfterDigest_ptrs : loadPtrs (sForsAddrs ++ sForsB.1) = [] ∧ loadPtrs sMidAddrs = [] ∧
@@ -126,7 +126,7 @@ theorem sPre_complete (hB : SphincsBlocksComplete) (hC : SpWotsCalls C) (hm : Me
   have hR2 : layerRootCell pk (digestIdx pk m sig) sig ⟨2, by decide⟩ R1 = cellOf128 pk.root := by
     rw [hr2, cellOf128_cellVal]
   obtain ⟨σF, heF, ⟨hF2, hFp⟩, hhF⟩ := hL2
-  have tF : ∀ k < 5562, σF (.n k) = σE (.n k) := fun k hk => heF.apply (Or.inl hk)
+  have tF : ∀ k < 5561, σF (.n k) = σE (.n k) := fun k hk => heF.apply (Or.inl hk)
   have tFA : ∀ k < 5249, σF (.n k) = σA (.n k) := fun k hk => by rw [tF k (by omega), tEA k hk]
   have tFB : ∀ k < 5398, σF (.n k) = σB (.n k) := fun k hk => by
     rw [tF k (by omega), tE k (by omega), tD k (by omega), tC k hk]

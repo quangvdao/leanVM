@@ -1,7 +1,7 @@
 /-
   LeanVM.Guest.B1.Sig.XmssSegT
 
-  `verify_lean_xmss` (`lean_ethereum.py:3847-3919`), inline in `main`'s raw-leanXMSS loop
+  `verify_lean_xmss` (`lean_ethereum.py`), inline in `main`'s raw-leanXMSS loop
   `main_loop2`, as a template: statements 9 to 321 of `main_loop2`'s body, with the values numbered
   as the renumbered expansion numbers them.
 -/
@@ -64,32 +64,30 @@ def sTag (i : Nat) : V :=
 def bound255 : E := word 9223372036854810629 0
 
 /-- leanXMSS's chain step: `keccak([P, steps s], [v, tag i], walks[o:o + 1])` (`walk`,
-`lean_ethereum.py:3527-3531`), its constant at `c`. -/
+`lean_ethereum.py`), its constant at `c`. -/
 def sWots (steps : Nat → V) : WotsT where
   step i s v c o := k64 sLxPad sLxPP (steps s) v (sTag i) c o
   size := 1
   power := sPower
 
-/-- The prologue (`lean_ethereum.py:3624-3644`). -/
+/-- The prologue (`lean_ethereum.py`). -/
 def sPrologue : List Stmt :=
   [loadS sLxPP sSigner 1, hintW "lx_index" (runV 67 4), hintW "lx_windows" (runV 71 4)] ++
     (List.range 13).map (fun s => cst (75 + s) (word (2 ^ s) 0))
 
 /-! ## The codeword -/
 
-/-- Arm `k` of a group of `n` digits from base `b` (`walk_group`, `lean_ethereum.py:3765-3779`):
+/-- Arm `k` of a group of `n` digits from base `b` (`walk_group`, `lean_ethereum.py`):
 `armT` with the encoding of `k`'s own `n` digits, `k % 4^n` (`W.enc`, leanXMSS's default). -/
 def armM (W : WotsT) (slots : Nat → Nat → Nat) (first n : Nat) (fold : Bool)
     (prodIn encIn prodOut encOut : V) (k b : Nat) : List Stmt × Nat :=
-  let ws := walksT W slots first k (if k = 0 then W.size + 1 else W.size) n 0
-    (if fold then b + 1 else b)
-  let enc0 := if fold then V.n b else encIn
-  let pre := if fold then [cst b (word 0 0)] else []
-  let prod := if fold then copyS prodOut (W.power (digitSum k n))
-    else mulS prodOut prodIn (W.power (digitSum k n))
-  if k % 4 ^ n = 0 then (pre ++ ws.1 ++ [prod, copyS encOut enc0], ws.2)
-  else (pre ++ ws.1 ++ [prod, cst ws.2 (lit (W.enc first n (k % 4 ^ n))), addS encOut enc0 (.n ws.2)],
-    ws.2 + 1)
+  let ws := walksT W slots first k (if k = 0 then W.size + 1 else W.size) n 0 b
+  if fold then
+    (ws.1 ++ [copyS prodOut (W.power (digitSum k n)),
+      .atom (.const encOut (lit (W.enc first n (k % 4 ^ n))))], ws.2)
+  else if k % 4 ^ n = 0 then (ws.1 ++ [mulS prodOut prodIn (W.power (digitSum k n)), copyS encOut encIn], ws.2)
+  else (ws.1 ++ [mulS prodOut prodIn (W.power (digitSum k n)), cst ws.2 (lit (W.enc first n (k % 4 ^ n))),
+    addS encOut encIn (.n ws.2)], ws.2 + 1)
 
 /-- Arms `k ..< k + m` from base `b`; arm `0` allocates the outputs after its walks. -/
 def armsM (W : WotsT) (slots : Nat → Nat → Nat) (first n : Nat) (fold : Bool)
@@ -124,7 +122,7 @@ def sDigitChecks (dg : Nat) : List Stmt :=
   (List.range 15).flatMap fun p =>
     rangeS (.n (dg + p)) (if p < 14 then bound255 else word (2 ^ 15) 0) (dg + 15 + 4 * p)
 
-/-- The codeword of `58` chains, its digit words from `dg` (`lean_ethereum.py:3660-3675`): the
+/-- The codeword of `58` chains, its digit words from `dg` (`lean_ethereum.py`): the
 hint, the range checks, the hoisted `2^63`, the `15` dispatches, the digits stored where the
 digest's first cell `d0` is and the target sum `g^T` asserted. The statements, the next base and
 the chains' tips. -/
@@ -137,7 +135,7 @@ def sCodewordT (W : WotsT) (target : E) (d0 : V) (dg : Nat) : List Stmt × Nat �
 /-! ## The path, a window at a time -/
 
 /-- Level `r` of window `w` in arm `k` from base `b`, from the node `cur` (`lx_levels`,
-`lean_ethereum.py:3804-3828`): the address (`his[w + 1] · g^(7 - r)` plus the constant, `his[w + 1]`
+`lean_ethereum.py`): the address (`his[w + 1] · g^(7 - r)` plus the constant, `his[w + 1]`
 plus it at `r = 7`, the constant alone in the top window), the hinted sibling and the `KECCAK` of
 the pair in the order of `k`'s bit `r`. The last level writes `out`, numbered in arm `0`
 (`outO = none`). The statements, the next base and the parent. -/
@@ -188,7 +186,7 @@ def lxArmsT (w : Nat) (cur : V) (o : Nat) : Nat → Nat → Nat → List (List S
 /-- Where arm `0` of window `w` from base `b` numbers `out`. -/
 def lxOut0 (w b : Nat) : Nat := if w + 1 = 4 then b + 31 else b + 46
 
-/-- Window `w` from base `b`, from the node `cur` (`lean_ethereum.py:3680-3689`): the range check,
+/-- Window `w` from base `b`, from the node `cur` (`lean_ethereum.py`): the range check,
 the hoisted `2^63` and the dispatch over `256` arms. The statements, the next base and `out`. -/
 def lxWindowT (w : Nat) (cur : V) (b : Nat) : List Stmt × Nat × Nat :=
   let arms := lxArmsT w cur (lxOut0 w (b + 5)) 256 0 (b + 5)
@@ -246,7 +244,7 @@ def xSeg : List Stmt :=
   sPrologue ++ l0.1 ++ l1.1 ++
     [loadS (.n l1.2.1) sSigner 0, .atom (.assertEq l1.2.2 (.n l1.2.1))]
 
-/-- `main_loop2`'s statements before the check (`lean_ethereum.py:4546-4554`): the raw index, its
+/-- `main_loop2`'s statements before the check (`lean_ethereum.py`): the raw index, its
 range
 check, the cover word, the claim's pointer `lx_table · idx^4`. -/
 def l2Pre : List Stmt :=
@@ -258,10 +256,10 @@ def l2Pre : List Stmt :=
 /-- `main_loop2`'s statements after the check: the next counter and the self-call, the carried tags
 passed on unchanged. -/
 def l2Post : List Stmt :=
-  [cst 120764 (word 2 0), mulS (.n 120765) (.n 0) (.n 120764),
-    addS (.n 120766) (.n 120765) (.n 1), cst 120767 (word 2 0),
-    mulS (.n 120768) (.n 0) (.n 120767),
-    .callIf (.n 120766) name% «main_loop2» (.n 120768 :: (List.range 55).map fun j => V.n (j + 1)),
+  [cst 119742 (word 2 0), mulS (.n 119743) (.n 0) (.n 119742),
+    addS (.n 119744) (.n 119743) (.n 1), cst 119745 (word 2 0),
+    mulS (.n 119746) (.n 0) (.n 119745),
+    .callIf (.n 119744) name% «main_loop2» (.n 119746 :: (List.range 55).map fun j => V.n (j + 1)),
         .ret []]
 
 end

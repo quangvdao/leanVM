@@ -10,7 +10,7 @@ hash map), recording each state stepped from, its bytecode slot and the instruct
 (`runSteps`); then the six opcode tables' rows in one pass over the steps, each read carrying its
 cell's count so far, the counters stepping by `g` in place (`rowsOf`). The address indices and the
 public boundary are the knowledge extractor's too (`lean_vm`,
-`LeanVM/Protocol/Extraction/Extractor.lean`).
+`LeanVM/Protocol/Extraction/Fast/Address.lean`, `candidateExecutionTable_eq`).
 -/
 
 @[expose] public section
@@ -125,7 +125,7 @@ def limbsIn (memIdx : Std.HashMap UInt64 ℕ) {κ : ℕ} (img : MemoryImage κ) 
 
 /-- The cells an instruction reads, in the order its row's reads carry them (`readAddrs`,
 computed): a `KECCAK`'s thirteen cells read, then the output cells it writes, the first
-`outCells.cellCount` (a cell it does not write keeps its count, `execute.rs:951-956`). -/
+`outCells.cellCount` (a cell it does not write keeps its count, `execute.rs`). -/
 def addrsIn (memIdx : Std.HashMap UInt64 ℕ) {κ : ℕ} (img : MemoryImage κ) (fp : K) :
     LeanIsaInstruction → List K
   | .xor oA oB oC | .mulNative oA oB oC | .jump oA oB oC => [fp * oA, fp * oB, fp * oC]

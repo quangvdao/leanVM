@@ -109,7 +109,7 @@ theorem daWitness_cost (D : DiscreteLogTables) (hP : Includes P Decoder.daWitnes
   rw [Decoder.daWitnessC.costEq P hP D σ σV hσ wD wDV hwD]
   have := nDirect_cost P hσ hS D (by includes) hG
   have := dvClaim_cost P hσ hS (by includes)
-  have := hWD [σ (.n 28)] [σ (.n 369), σ (.n 370), σ (.n 371)] (by simp)
+  have := hWD [σ (.n 47)] [σ (.n 369), σ (.n 370), σ (.n 371)] (by simp)
   have : Decoder.nDirectD D σ < 2 ^ 34 := gLogD_lt D _
   cost_facts [hS]
   limbs_one
@@ -312,7 +312,7 @@ theorem decWitN_cost (D : DiscreteLogTables) (Tb : ReaderTabs) (hTb : ReaderTabs
     {WS : ℕ} (hWS : ∀ a : E, appCost P wSV [encodeValue a] ≤ WS) {K N X : ℕ}
     (hc : CountsWithin D σ K N X)
     (hLk : ∀ c < Decoder.nKidsD D σ, cl (Vn (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 25))
-      (Vn (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 1919)) ≤ L) :
+      (Vn (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 1885)) ≤ L) :
     machineCost P Decoder.decWitNC.costIdx [encodeValue D, encodeValue Tb, σV, rdV, VnV, wXV, wSV,
       clV] ≤ decWitNPrice G R S F C L DW WX WS K N X := by
   rw [Decoder.decWitNC.costEq P hP D Tb σ σV hσ rd rdV hrd Vn VnV hVn wX wXV hwX wS wSV hwS cl clV

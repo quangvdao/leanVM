@@ -26,9 +26,9 @@ public import LeanVM.Guest.B1.Sig.Frame
 /-!
 # The signature verifiers' interface
 
-`verify_lean_xmss(signer, tags)` (`lean_ethereum.py:3847-3920`, inline in `main`'s raw-leanXMSS loop
+`verify_lean_xmss(signer, tags)` (`lean_ethereum.py`, inline in `main`'s raw-leanXMSS loop
 `main_loop2`, `Fn.«main_loop2».core`, as its statements `xSeg`) and
-`verify_sig_lean_sphincs(signer, byte_bits)` (`lean_ethereum.py:4143-4244`,
+`verify_sig_lean_sphincs(signer, byte_bits)` (`lean_ethereum.py`,
 `Fn.«verify_sig_lean_sphincs».core`) check one signature of the claim at `signer`: four cells, the key
 (leanXMSS: its root and parameter; leanSPHINCS: `PK.seed` and `PK.root`), then the message's two
 halves, the low first. `verify_lean_xmss` calls nothing (every helper is `@inline`
@@ -124,7 +124,7 @@ def SphincsSigned (rd : Reader) (p : E) : Prop := ∃ sig, SphincsOut rd p sig
 
 /-! ## Preconditions -/
 
-/-- **The byte table** `main` writes (`lean_ethereum.py:4758-4760`): `byte_bits[g^v] = v` for every
+/-- **The byte table** `main` writes (`lean_ethereum.py`): `byte_bits[g^v] = v` for every
 byte `v`, the word whose bits spell `v`. -/
 def ByteBits (rd : Reader) (bb : E) : Prop := ∀ v < 256, LoadHolds rd bb v (word v 0)
 
@@ -161,14 +161,14 @@ def verify_sig_lean_sphincs_sound_SpecP (P : Program) (sigOf : Val → FrameMap 
 `σ (.n 65)` in its cells and a signature that verifies it, the carried chain indices
 holding their indices, on a memory of at least `256` words (the windows and the digit words are
 range-checked below `g^255`), the check `xSeg` holds of a valuation
-changing `σ` only on its own values `66 ..< 120764`, under any call relation. -/
+changing `σ` only on its own values `66 ..< 119742`, under any call relation. -/
 def verify_lean_xmss_complete_Spec : Prop :=
   ∀ (C : CallRel) (rd : Reader) (σ : Val) (pk : HashSig.PublicKey) (m : HashSig.Message)
     (sig : LeanXmss.Signature), MemOK rd 256 → LxTagsHold (fun j => σ (sTagParam j)) →
     ClaimAt rd (σ sSigner) (cellOf128 pk.root) (cellOf128 pk.parameter)
       (cellOf128 (m.extractLsb' 0 128)) (cellOf128 (m.extractLsb' 128 128)) →
     LeanXmss.verifyWithKeccak pk m sig = true →
-      Completes C rd 66 120764 xSeg σ (fun _ => True)
+      Completes C rd 66 119742 xSeg σ (fun _ => True)
 
 /-! ## The check, from the statement -/
 

@@ -32,7 +32,7 @@ fresh coordinate keeps a failing test failing except at one value at most
 `3/|E|`.
 
 Written from the specification (the Keccak reduction's first claim, `verify_keccak` in
-`crates/verifier/src/keccak.rs:247-263` at leanVM `40f877dc`); nothing here transcribes Rust.
+`crates/verifier/src/keccak.rs` at leanVM `40f877dc`); nothing here transcribes Rust.
 -/
 
 namespace LeanVM.Protocol
@@ -170,7 +170,8 @@ theorem card_forall_zeroOnHi_cons_le {ι : Type} (δ : ι → ℕ → E) {n : �
   obtain ⟨i, hi⟩ := hne
   refine le_trans ?_ (card_zeroOnHi_cons_le (δ i) hacc hi)
   have := Fintype.ofFinite E
-  exact Nat.card_mono (Set.toFinite _) fun c hc ↦ hc i
+  exact Nat.card_le_card_of_injective (fun c ↦ ⟨c.1, c.2 i⟩)
+    fun _ _ h ↦ Subtype.ext (congrArg Subtype.val h :)
 
 end KeccakZero
 

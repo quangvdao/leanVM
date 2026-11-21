@@ -18,7 +18,7 @@ Ported from the BLAKE2s-era `B1/Tables/Common` (branch `mumbai`), prefixed `tb`:
   words, `μ ≤ 32` (`rangeCheck_iff`), with a choice of the gadget's auxiliary words for an honest
   valuation.
 * `tb_gen_pow_eq_mul`: products of small g-powers are g-powers of the sums.
-* `tb_stackFold_*`, `tb_stackOffsets_fst`: the fold of `stackOffsets` (V:830) over an order without
+* `tb_stackFold_*`, `tb_stackOffsets_fst`: the fold of `stackOffsets` over an order without
   repeats sets each index to the sum of the sizes before it (`tbPrefixSize`).
 * `tb_group_stack_cert`: runs of columns of one size each (groups), named by ranks in
   `stackOffsets`'s order group by group, with each column at `g^` the sizes before it, are laid
@@ -88,7 +88,7 @@ theorem tb_gen_pow_eq_mul {a b d : ℕ} (ha : a < 2 ^ 62) (hb : b < 2 ^ 62) (hd 
 
 /-! ## Stack offsets -/
 
-/-- The fold of `stackOffsets` (V:877-884). -/
+/-- The fold of `stackOffsets`. -/
 def tbStackStep (size : ℕ → ℕ) (acc : List ℕ × ℕ) (i : ℕ) : List ℕ × ℕ :=
   (acc.1.set i acc.2, acc.2 + 2 ^ size i)
 
@@ -128,7 +128,7 @@ theorem tb_stackFold_take (size : ℕ → ℕ) (n : ℕ) (ord : List ℕ) (hnd :
         rw [List.getD_eq_getElem _ _ hmo, List.getD_eq_getElem?_getD, List.getElem?_set_self
           (by rw [hl]; exact hin), Option.getD_some, h2]
 
-/-- **`stackOffsets`'s offsets** (V:877-884): along its order, entry `order[r]` is the sum of the
+/-- **`stackOffsets`'s offsets**: along its order, entry `order[r]` is the sum of the
 sizes before it, and the total is their sum. -/
 theorem tb_stackOffsets_fst (sizes : List ℕ) (r : ℕ)
     (hr : r < sizes.length) :
@@ -156,16 +156,6 @@ theorem tb_stackOffsets_length (sizes : List ℕ) : (stackOffsets sizes).1.lengt
   rw [List.take_length] at h
   exact h.2.1
 
-theorem tb_prefixSize_full (size : ℕ → ℕ) (ord : List ℕ) :
-    tbPrefixSize size ord ord.length = (ord.map fun i => 2 ^ size i).sum := by
-  rw [tbPrefixSize, List.take_length]
-
-theorem tb_prefixSize_succ (size : ℕ → ℕ) (ord : List ℕ) (r : ℕ) (hr : r < ord.length) :
-    tbPrefixSize size ord (r + 1) = tbPrefixSize size ord r + 2 ^ size (ord.getD r 0) := by
-  rw [tbPrefixSize, tbPrefixSize, List.take_add_one, List.getElem?_eq_getElem hr, Option.toList_some,
-    List.map_append, List.sum_append, List.getD_eq_getElem _ _ hr]
-  simp
-
 /-! ## Stacking orders -/
 
 /-- `g^33`, as the data writes it: the range check below `SIZE_BITS = 34`. -/
@@ -174,20 +164,12 @@ theorem word_g33 : word 8589934592 0 = ofK (Parameters.addressOfIndex 33) := by
   show ofK (K.ofBits 8589934592) = ofK (Parameters.addressOfIndex 33)
   rw [show K.ofBits 8589934592 = Parameters.addressOfIndex 33 by decide +kernel]
 
-/-- `stackOffsets`'s order of the sizes `κs` (V:878-879): larger first, ties by index. -/
-def tbStackOrder (κs : List ℕ) : List ℕ :=
-  (List.range κs.length).mergeSort (stackLe (κs.getD · 0))
-
 /-- Choices below `n` as a function. -/
 theorem tb_exists_fun_of_forall {α : Type} [Inhabited α] {n : ℕ} {P : ℕ → α → Prop}
     (h : ∀ r < n, ∃ a, P r a) : ∃ f : ℕ → α, ∀ r < n, P r (f r) := by
   classical
   exact ⟨fun r => if hr : r < n then Classical.choose (h r hr) else default,
     fun r hr => by simp only [hr, ↓reduceDIte]; exact Classical.choose_spec (h r hr)⟩
-
-theorem tb_prefixSize_map (s : ℕ → ℕ) (l : List ℕ) (r : ℕ) :
-    tbPrefixSize s l r = tbPrefixSize id (l.map s) r := by
-  simp [tbPrefixSize, List.map_take, List.map_map, Function.comp_def]
 
 theorem tb_prefixSize_congr {f f' : ℕ → ℕ} {ord : List ℕ} (h : ∀ x ∈ ord, f x = f' x) (j : ℕ) :
     tbPrefixSize f ord j = tbPrefixSize f' ord j := by

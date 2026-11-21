@@ -61,6 +61,11 @@ theorem holds_ld1 {d p off : ℕ} {X : Prop} :
     Stmt.HoldsList C rd σ [vsLd d p off] X kret ↔ LoadHolds rd (σ (.n p)) off (σ (.n d)) ∧ X :=
   Iff.rfl
 
+theorem holds_cons1 {s : Stmt} {l : List Stmt} {X : Prop} :
+    Stmt.HoldsList C rd σ (s :: l) X kret ↔
+      Stmt.HoldsList C rd σ [s] (Stmt.HoldsList C rd σ l X kret) kret :=
+  Iff.rfl
+
 theorem holds_atom1 {a : Atom} {X : Prop} :
     Stmt.HoldsList C rd σ [.atom a] X kret ↔ a.Holds rd σ ∧ X := Iff.rfl
 
@@ -98,7 +103,7 @@ theorem vsHeadT_holds (h : Stmt.HoldsList C rd σ vsHeadT next kret) :
   simp only [Atom.Holds, word_zero] at h10 h11 h12 h13
   exact ⟨h10, h11, h12, h13, hk, hn⟩
 
-/-- **The seed** (G:3516-3520; V:2346): the four cells are two digests' halves, and the capacity
+/-- **The seed**: the four cells are two digests' halves, and the capacity
 the atom writes is the seed state's. -/
 theorem vs_seed (hk : vsSeedAtom.Holds rd σ) (h10 : σ (.n 8) = 0) (h11 : σ (.n 9) = 0)
     (h12 : σ (.n 10) = 0) (h13 : σ (.n 11) = 0) :
@@ -289,6 +294,25 @@ theorem vsSqzT_holds {capb o : ℕ} (h10 : σ (.n 8) = 0) (h11 : σ (.n 9) = 0)
   have hs := squeeze_atom (s := ⟨(vsRun capb 5).map σ, []⟩) (b := o + 13) hk
     (by simp only [List.map_append, List.map_cons, List.map_nil, h10, h11, h12, h13, rateOf_nil])
     hch
+  rw [vsRun_drop8] at hs
+  obtain ⟨e1, e2⟩ := hs
+  simp only [Fs.squeeze] at e1 e2 ⊢
+  rw [← e1, ← e2]
+  exact ⟨rfl, hn⟩
+
+/-- **A permutation with nothing waiting** (`vsPermT`), on the zero cells: its first output is
+the squeeze's challenge. -/
+theorem vsPermT_holds {capb o : ℕ} (h10 : σ (.n 8) = 0) (h11 : σ (.n 9) = 0)
+    (h12 : σ (.n 10) = 0) (h13 : σ (.n 11) = 0)
+    (h : Stmt.HoldsList C rd σ [vsPermT capb o] next kret) :
+    (⟨(vsRun capb 5).map σ, []⟩ : Fs).squeeze =
+        (σ (.n o), ⟨[σ (.n (o + 8)), σ (.n (o + 9)), σ (.n (o + 10)), σ (.n (o + 11)),
+          σ (.n (o + 12))], []⟩) ∧ next := by
+  simp only [vsPermT, Stmt.HoldsList, Stmt.Holds, keccakA] at h
+  obtain ⟨hk, hn⟩ := h
+  have hs := squeeze_atom (s := ⟨(vsRun capb 5).map σ, []⟩) (b := o) hk
+    (by simp only [List.map_append, List.map_cons, List.map_nil, h10, h11, h12, h13, rateOf_nil])
+    rfl
   rw [vsRun_drop8] at hs
   obtain ⟨e1, e2⟩ := hs
   simp only [Fs.squeeze] at e1 e2 ⊢

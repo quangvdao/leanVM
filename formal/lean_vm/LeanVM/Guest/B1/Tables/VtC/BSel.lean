@@ -17,7 +17,7 @@ public import LeanVM.Guest.B1.Selectors.BlockSelectorTabComplete
 public import LeanVM.Guest.B1.Selectors.BlockSelectorComplete
 
 /-!
-# The block selectors, complete (G:2179-2225)
+# The block selectors, complete
 
 `offBits off`: the `34` bits of an offset, as the `bitsExp` hint writes them; `selBitsOf off τ d`:
 its bits `τ ..< τ + d`, whose value shifted by `τ` is the offset when it is aligned to `2^τ` and
@@ -229,7 +229,7 @@ theorem vtc_selblock (hl : args.length = 20) {w b t pos : ℕ} {prev : Option �
     · exact hdisp
     · exact hasrt
     · cases prev <;> simp only [vtSelTail, List.mem_cons, List.not_mem_nil, or_false] at hs <;>
-        (try rcases hs with rfl | rfl) <;> simp [autoB, pureB, hintB] at ha
+        (rcases hs with rfl | rfl) <;> simp [autoB, pureB, hintB] at ha
   · have ht' : t ≠ 0 := by omega
     simp only [vtSelT, ht', ↓reduceIte, List.cons_append, List.mem_cons, List.nil_append] at hs
     simp only [eqt, gt, ht', ↓reduceIte] at hdisp
@@ -243,7 +243,7 @@ theorem vtc_selblock (hl : args.length = 20) {w b t pos : ℕ} {prev : Option �
     · exact hdisp
     · exact hasrt
     · cases prev <;> simp only [vtSelTail, List.mem_cons, List.not_mem_nil, or_false] at hs <;>
-        (try rcases hs with rfl | rfl) <;> simp [autoB, pureB, hintB] at ha
+        (rcases hs with rfl | rfl) <;> simp [autoB, pureB, hintB] at ha
 
 /-- **A framework block's selector, complete.** -/
 theorem vtc_fwblock (hl : args.length = 20) {w b kv pos : ℕ} {prev : Option ℕ}

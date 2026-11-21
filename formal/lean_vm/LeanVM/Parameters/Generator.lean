@@ -15,11 +15,11 @@ import Mathlib.Tactic.NormNum.Prime
 # The generator `g` and exponent addressing
 
 `g = x`, the word
-`0x2`, is transcribed from `crates/primitives/src/field/gf2_64.rs:25` (`F64::G = F64(2)`, "with
+`0x2`, is transcribed from `crates/primitives/src/field/gf2_64.rs` (`F64::G = F64(2)`, "with
 `ord(x) = 2^64 - 1`") at leanVM pin `127510d14c98ade4e8a97646c44fa7f1ff5e752d`, cross-checked
-against `crates/verifier/src/field.rs:113` at `leanvm-rev` (`GEN: E = E::new(2, 0)`).
+against `crates/verifier/src/field.rs` (`GEN: E = E::new(2, 0)`).
 Specification §2
-(`02-vm-specification.tex:12`) fixes a generator of `K^×` of order `2^64 - 1` without naming it.
+(`02-vm-specification.tex`) fixes a generator of `K^×` of order `2^64 - 1` without naming it.
 The value appears exactly once, in `g` (`Statement.Field`), and is symbolic everywhere else.
 
 The order is certified, not asserted. `|K^×| = 2^64 - 1 = 3·5·17·257·641·65537·6700417`;
@@ -92,7 +92,7 @@ theorem g_pow_div_6700417_ne_one : g ^ ((2 ^ 64 - 1) / 6700417) ≠ 1 :=
 
 /-- `g` generates `K^×`: its order is exactly `2^64 - 1`. -/
 theorem orderOf_g : orderOf g = 2 ^ 64 - 1 := by
-  refine orderOf_eq_of_pow_and_pow_div_prime (by norm_num) g_pow_card_sub_one
+  refine orderOf_eq_of_pow_and_pow_div_prime g_pow_card_sub_one
     fun p hp hdvd ↦ ?_
   rw [card_sub_one_factorization] at hdvd
   simp only [Nat.Prime.dvd_mul hp, or_assoc] at hdvd

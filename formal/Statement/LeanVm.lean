@@ -90,13 +90,13 @@ def leanVmHonestProver : HonestProver :=
 /-- **The committed size of an execution**: the number of cells the honest prover commits to, every
 committed column at its table's height, the least power of two holding the table's rows (`1` for no
 row), and at least `2^9` for the `KECCAK` table (`TABLE_LOG_FLOORS`,
-`crates/verifier/src/layout.rs:488`). The memory has three columns of `2^κ` rows (its two limbs and
+`crates/verifier/src/layout.rs`). The memory has three columns of `2^κ` rows (its two limbs and
 its final counts), and the bytecode's counts one of `2^logSize` rows (`NUM_GLOBAL_COLUMNS`,
-`layout.rs:71-76`, `kappas`, `:496-509`). Each opcode has a table of one row per instruction of
+`layout.rs`, `kappas`). Each opcode has a table of one row per instruction of
 that opcode the execution executes (`Execution.opcodeCount`), with `13, 13, 7, 14, 14, 28`
 committed columns for `XOR`, `MUL_NATIVE`, `SET_CONSTANT`, `DEREF`, `JUMP`, `KECCAK`
-(`layout.rs:380-394`; of the `KECCAK` table's `92` columns, the `25` input lanes and `14` more ride
-`q_keccak`'s slots and the `25` output lanes are not committed, `layout.rs:380-432`); and
+(`layout.rs`; of the `KECCAK` table's `92` columns, the `25` input lanes and `14` more ride
+`q_keccak`'s slots and the `25` output lanes are not committed, `layout.rs`); and
 `q_keccak` has `2^6` rows per row of the `KECCAK` table. -/
 noncomputable def Semantics.Execution.committedSize {program : LeanIsaProgram}
     (execution : Execution program) : ℕ :=
@@ -169,10 +169,11 @@ adversary of at most `Q ≤ 2^128` queries to `π` and `π⁻¹` (its coins free
 probability at most `(Q + 2^14) · 2^-125 + 5 (Q + 2^14)² · 2^-256`, `2^-125` the round-by-round
 error every verifier message is held to after its proof of work. The `2^14` covers the verifier's
 own Keccak-256 evaluations and duplex permutations, at most `13708` (the `Q + 13708` of `lean_vm`'s
-`soundnessError`; as calls of `π` they are up to `13708 · 2^30`, the IV hashing a bytecode of up to
-`2^30` instructions, which the transfer below pays), its `13708 · 2^-256` for a fresh hash answer
-equal to a stack root the adversary announced without computing it, and the transfer from two
-random oracles to one permutation. `Statement.Theorems`
+`soundnessErrorAS`; as calls of `π` they are up to `13708 · 2^30`, the IV hashing a bytecode of up to
+`2^30` instructions, which the transfer below pays), and three terms of at most `2^-125` each: a
+fresh hash answer of the verifier equal to a Merkle root the extractor reads (at most `2^16` roots
+per verifier query, `2^-256` each), a fresh permutation answer that passes the final query's proof
+of work (`2^-127`, once), and the transfer from two random oracles to one permutation. `Statement.Theorems`
 states it for the extractor a cost-machine program computes within its budget
 (`LeanVM.extractorComputedBy`, `CostMachine.lean`). The extractor must output some valid execution
 of the program on the input; nothing requires it to be the execution the proof commits to (its

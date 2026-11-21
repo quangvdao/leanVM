@@ -2,7 +2,7 @@
   LeanVM.Guest.B1.Sig.SphincsCompleteBlocks
 
   The completeness of `verify_sig_lean_sphincs`'s FORS block and of a layer of its hypertree
-  (`lean_ethereum.py:4005-4140, 4223-4228`), as the statements its assembly
+  (`lean_ethereum.py`), as the statements its assembly
   consumes; the byte table's pointers.
 -/
 
@@ -23,11 +23,11 @@ from the completeness of each block (`Completes`: a valuation extending the give
 block's fresh values, under which the block holds): the digest block's (`sDigestBlock_complete`)
 and `sp_from_bytes`'s (`sFromMarks_complete`), and the two stated here:
 
-* `ForsBlockCompletes` (`sForsB`, `G:4223-4228`): at the bottom key's `A0` and `A1`, the leaves `s c`
+* `ForsBlockCompletes` (`sForsB`): at the bottom key's `A0` and `A1`, the leaves `s c`
   (their bits, and their shifts with the trees' places, `fIdx`), any secrets and siblings, the FORS
   key is `T_k` of the roots
   (`forsRootCell`);
-* `HtLayerCompletes` (`sHtLayer`, `G:4133-4140`): a layer whose `sp_wots` call holds of the
+* `HtLayerCompletes` (`sHtLayer`): a layer whose `sp_wots` call holds of the
   encoding (`encDigestCell`) and a leaf `lv` reaches `pFold` of `pNodeE` from `lv`, along any
   siblings;
 * `SphincsBlocksComplete`: the two.
@@ -121,17 +121,19 @@ off the digest's bits and shifts, and any siblings, the layer's root is `pFold` 
 def HtLayerCompletes : Prop :=
   ∀ (C : CallRel) (rd : Reader) (σ : Val) (l : Nat) (a0 a1 signed ctr : V) (b : Nat) (lv : E)
     (e : Nat) (sib : Nat → E),
-    l < 3 → 1372 ≤ b → NBv b a0 → NBv b a1 → NBv b signed → NBv b ctr → PadOK σ sPad →
-    (∃ N < 2 ^ 32, σ ctr = eOfNat (beWordAt 0 N)) →
-    C "sp_wots" [σ sPP, σ a0, σ a1,
-      encDigestCell (σ sPP) (σ a0) (σ a1 + lit (7 * 2 ^ 24)) (σ signed) (σ ctr)] [lv] →
+    l < 3 → 1372 ≤ b → (sAcOf l = none → NBv b a0) → NBv b a1 → NBv b signed → NBv b ctr →
+    PadOK σ sPad → (∃ N < 2 ^ 32, σ ctr = eOfNat (beWordAt 0 N)) →
+    C "sp_wots" [σ sPP, a0Val σ a0 (sAcOf l), σ a1,
+      encDigestCell (σ sPP) (a0Val σ a0 (sAcOf l)) (σ a1 + lit (7 * 2 ^ 24)) (σ signed) (σ ctr)] [lv] →
     e < 2 ^ sHeightOf l →
     (∀ z < sHeightOf l, σ (sLeafBit (sOffOf l + z)) = if e.testBit z then 1 else 0) →
     (∀ z < sHeightOf l, σ (sLVal (sOffOf l + z)) = eOfNat (e >>> z)) →
-      Completes C rd b (sHtLayer sPad sPP a0 a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).2.1
-        (sHtLayer sPad sPP a0 a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).1 σ
-        (fun σ' => σ' (sHtLayer sPad sPP a0 a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).2.2 =
-          pFold (pNodeE (σ sPP) (σ a0) e sib) (sHeightOf l) lv)
+      Completes C rd b
+        (sHtLayer sPad sPP a0 (sAcOf l) a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).2.1
+        (sHtLayer sPad sPP a0 (sAcOf l) a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).1 σ
+        (fun σ' =>
+          σ' (sHtLayer sPad sPP a0 (sAcOf l) a1 signed ctr sLeafBit sLVal (sOffOf l) (sHeightOf l) b).2.2 =
+            pFold (pNodeE (σ sPP) (a0Val σ a0 (sAcOf l)) e sib) (sHeightOf l) lv)
 
 /-- **The blocks of `verify_sig_lean_sphincs` complete.** -/
 structure SphincsBlocksComplete : Prop where

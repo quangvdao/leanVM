@@ -9,7 +9,7 @@
 //!   its path count (`u32`); per path its `leaf_index` (`u64`), its leaf's length (`u32`) and
 //!   words (`u64` each), its sibling count (`u32`) and siblings (32 bytes each). Bytes left over,
 //!   or too few, are a rejection;
-//! * the wire: `Proof::to_bytes`'s one encoding (`crates/fiat_shamir/src/wire.rs`), decoded by
+//! * the wire: `Proof::to_bytes`'s one encoding (`crates/verifier/src/wire.rs`), decoded by
 //!   `Proof::from_bytes`, which unprunes the paths (`None` is a rejection), then verified.
 //!
 //! The bytecode is read as little-endian 64-bit words (a length that is not a multiple of 8 is
@@ -62,22 +62,9 @@ fn stream(bytes: &[u8]) -> Result<Vec<verifier::E>, String> {
     Ok(scalars.into_iter().map(|[c0, c1]| verifier::E { c0, c1 }).collect())
 }
 
-/// `Proof::from_bytes`, then the `verifier` crate's form of the proof (`leanvm_core::cpu::scalar_proof`).
+/// `Proof::from_bytes`.
 fn wire(bytes: &[u8]) -> Result<verifier::Proof, String> {
-    let proof = fiat_shamir::transcript::Proof::from_bytes(bytes).ok_or("wire decoding failed")?;
-    let path = |path: &fiat_shamir::merkle::MerklePath| verifier::MerklePath {
-        leaf_index: path.leaf_index,
-        leaf: path.leaf.iter().map(|word| verifier::K(word.0)).collect(),
-        siblings: path.siblings.clone(),
-    };
-    Ok(verifier::Proof {
-        stream: proof
-            .stream
-            .iter()
-            .map(|element| verifier::E { c0: element.c0, c1: element.c1 })
-            .collect(),
-        merkle_openings: proof.merkle.iter().map(|phase| phase.iter().map(path).collect()).collect(),
-    })
+    verifier::Proof::from_bytes(bytes).ok_or_else(|| "wire decoding failed".into())
 }
 
 fn verify_bytes(files: &[Vec<u8>]) -> Result<(), String> {
@@ -85,7 +72,7 @@ fn verify_bytes(files: &[Vec<u8>]) -> Result<(), String> {
     if bytecode.len() % 8 != 0 {
         return Err("bytecode is not a whole number of 64-bit words".into());
     }
-    let table: Vec<u64> = bytecode
+    let stacked_bytecode: Vec<u64> = bytecode
         .chunks_exact(8)
         .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
         .collect();
@@ -97,7 +84,7 @@ fn verify_bytes(files: &[Vec<u8>]) -> Result<(), String> {
         [_, _, scalars, phases] => verifier::Proof { stream: stream(scalars)?, merkle_openings: merkle_phases(phases)? },
         _ => unreachable!("three or four files"),
     };
-    let bytecode = verifier::Bytecode::new(&table);
+    let bytecode = verifier::Bytecode::new(&stacked_bytecode).map_err(|error| error.to_string())?;
     verifier::verify_execution(&bytecode, public_input, &proof)
         .map(|_| ())
         .map_err(|error| error.to_string())
