@@ -465,12 +465,14 @@ const BASE_COEFFS: usize = 4;
 type CertAcc = [F128Unreduced; 3];
 
 /// Where a column's terms at a pair go: those under `ω` times `scale` to `omega`, those under `act` to `act`, and the
-/// certificate's, which are under `ω` too but unscaled, to `cert`.
+/// certificate's, which are under `ω` too but unscaled, to `cert`. Without `x1`, the terms in `omega` and `cert` may
+/// leave out any part of their `X` coefficient: the round recovers it from its claim (see [`prove`]).
 struct Sums<'s> {
     omega: &'s mut Acc,
     act: &'s mut Acc,
     cert: &'s mut CertAcc,
     scale: F128,
+    x1: bool,
 }
 
 impl Sums<'_> {
@@ -480,6 +482,7 @@ impl Sums<'_> {
             act: &mut *self.act,
             cert: &mut *self.cert,
             scale: self.scale,
+            x1: self.x1,
         }
     }
 }
@@ -557,6 +560,7 @@ fn pointer_pair(
     same: impl Fn(usize) -> bool,
     first: impl Fn(usize) -> F128,
     pair: impl Fn(usize) -> (F128, F128),
+    x1: bool,
 ) {
     let d = slots.d;
     let mut p = [F128::ZERO; MAX_COEFFS];
@@ -652,33 +656,40 @@ fn pointer_pair(
     let s = clean.at(&codes);
     if p_live {
         let t = product(&factors[start..n]);
-        add_tail(acc, &p[..len], s, &t[..n - start + 1]);
+        add_tail(acc, &p[..len], s, &t[..n - start + 1], x1);
     }
     if let Some((act_acc, c)) = act {
         let t = product(&factors[..n]);
-        add_scaled(act_acc, s, c, &t[..n + 1]);
+        add_scaled(act_acc, s, c, &t[..n + 1], true);
     }
 }
 
-/// `acc ← acc + s·p·t`.
+/// `acc ← acc + s·p·t`, without the `X` coefficient unless `x1`.
 #[inline(always)]
-fn add_tail(acc: &mut Acc, p: &[F128], s: F128, t: &[F128]) {
+fn add_tail(acc: &mut Acc, p: &[F128], s: F128, t: &[F128], x1: bool) {
     for (i, &c) in p.iter().enumerate() {
         let c = s * c;
-        for (o, &v) in acc[i..].iter_mut().zip(t) {
-            *o ^= c.mul_unreduced(v);
+        for (j, (o, &v)) in acc[i..].iter_mut().zip(t).enumerate() {
+            if x1 || i + j != 1 {
+                *o ^= c.mul_unreduced(v);
+            }
         }
     }
 }
 
-/// `acc ← acc + c·f` for `c` of one or two coefficients and the linear `f` through `pair`.
+/// `acc ← acc + c·f` for `c` of one or two coefficients and the linear `f` through `pair`, without the `X`
+/// coefficient unless `x1`.
 #[inline(always)]
-fn add_times_pair(acc: &mut Acc, c: &[F128], pair: (F128, F128)) {
+fn add_times_pair(acc: &mut Acc, c: &[F128], pair: (F128, F128), x1: bool) {
     let (a, b) = (pair.0, pair.0 + pair.1);
     acc[0] ^= c[0].mul_unreduced(a);
-    acc[1] ^= c[0].mul_unreduced(b);
+    if x1 {
+        acc[1] ^= c[0].mul_unreduced(b);
+    }
     if c.len() == 2 && !c[1].is_zero() {
-        acc[1] ^= c[1].mul_unreduced(a);
+        if x1 {
+            acc[1] ^= c[1].mul_unreduced(a);
+        }
         acc[2] ^= c[1].mul_unreduced(b);
     }
 }
@@ -693,15 +704,16 @@ fn linear_pointer(
     act: Option<(&mut Acc, &[F128])>,
     phi: (F128, F128),
     shifted: impl Fn(usize) -> (F128, F128),
+    x1: bool,
 ) {
-    add_times_pair(acc, coef, phi);
+    add_times_pair(acc, coef, phi, x1);
     for (g, gc) in groups.iter().enumerate() {
         if !(gc[0].is_zero() && gc[1].is_zero()) {
-            add_times_pair(acc, gc, shifted(g));
+            add_times_pair(acc, gc, shifted(g), x1);
         }
     }
     if let Some((act_acc, c)) = act {
-        add_times_pair(act_acc, c, phi);
+        add_times_pair(act_acc, c, phi, true);
     }
 }
 
@@ -739,6 +751,7 @@ fn cert_pair(
     one_hot: impl Fn(usize) -> bool,
     same: impl Fn(usize) -> bool,
     pair: impl Fn(usize) -> (F128, F128),
+    x1: bool,
 ) {
     let mut m = [F128Unreduced::ZERO; 3];
     let mut constant = F128::ZERO;
@@ -749,13 +762,15 @@ fn cert_pair(
         let (x, y) = (pair(slots.eq(i)), pair(slots.bar(i)));
         if skip && one_hot(i) {
             let t = (x.0 + x.1).mul_unreduced(y.0 + y.1);
-            m[1] ^= t;
+            if x1 {
+                m[1] ^= t;
+            }
             m[2] ^= t;
         } else if skip && same(i) {
             m[0] ^= x.0.mul_unreduced(y.0);
             constant += cert_mirrors[i];
         } else {
-            add_pair_product(&mut m, x, y);
+            add_pair_product(&mut m, x, y, x1);
             constant += cert_mirrors[i];
         }
     }
@@ -840,17 +855,21 @@ fn product(f: &[(F128, F128)]) -> [F128; MAX_CHUNKS + 1] {
     out
 }
 
-/// `acc ← acc + s·c·p` for `c` of one or two coefficients.
+/// `acc ← acc + s·c·p` for `c` of one or two coefficients, without the `X` coefficient unless `x1`.
 #[inline(always)]
-fn add_scaled(acc: &mut Acc, s: F128, c: &[F128], p: &[F128]) {
+fn add_scaled(acc: &mut Acc, s: F128, c: &[F128], p: &[F128], x1: bool) {
     let t0 = s * c[0];
-    for (o, &v) in acc.iter_mut().zip(p) {
-        *o ^= t0.mul_unreduced(v);
+    for (j, (o, &v)) in acc.iter_mut().zip(p).enumerate() {
+        if x1 || j != 1 {
+            *o ^= t0.mul_unreduced(v);
+        }
     }
     if c.len() == 2 && !c[1].is_zero() {
         let t1 = s * c[1];
-        for (o, &v) in acc[1..].iter_mut().zip(p) {
-            *o ^= t1.mul_unreduced(v);
+        for (j, (o, &v)) in acc[1..].iter_mut().zip(p).enumerate() {
+            if x1 || j != 0 {
+                *o ^= t1.mul_unreduced(v);
+            }
         }
     }
 }
@@ -895,7 +914,7 @@ fn plain_terms(
                 factors[n] = (x.0, x.0 + x.1);
                 n += 1;
                 if !eps.is_zero() {
-                    add_pair_product(&mut m, x, y);
+                    add_pair_product(&mut m, x, y, sums.x1);
                     constant += column.cert_mirrors[i];
                 }
             }
@@ -911,21 +930,24 @@ fn plain_terms(
     let p = product(&factors[..n]);
     let p = &p[..n + 1];
     if live {
-        add_scaled(sums.omega, s * sums.scale, &coef[..len], p);
+        add_scaled(sums.omega, s * sums.scale, &coef[..len], p, sums.x1);
     }
     if !column.act.is_zero() {
         let (c, len) = coef_linear(column.act, aux);
-        add_scaled(sums.act, s, &c[..len], p);
+        add_scaled(sums.act, s, &c[..len], p, true);
     }
 }
 
-/// `m ← m + x(X)·y(X)` for the linear `x`, `y` through their pairs, by Karatsuba.
+/// `m ← m + x(X)·y(X)` for the linear `x`, `y` through their pairs, by Karatsuba, without the `X` coefficient
+/// unless `x1`.
 #[inline(always)]
-fn add_pair_product(m: &mut [F128Unreduced; 3], x: (F128, F128), y: (F128, F128)) {
+fn add_pair_product(m: &mut [F128Unreduced; 3], x: (F128, F128), y: (F128, F128), x1: bool) {
     let c0 = x.0.mul_unreduced(y.0);
     let c2 = (x.0 + x.1).mul_unreduced(y.0 + y.1);
     m[0] ^= c0;
-    m[1] ^= x.1.mul_unreduced(y.1) ^ c0 ^ c2;
+    if x1 {
+        m[1] ^= x.1.mul_unreduced(y.1) ^ c0 ^ c2;
+    }
     m[2] ^= c2;
 }
 
@@ -1549,8 +1571,8 @@ impl<'a> Column<'a> {
         &self,
         aux: &[(F128, F128)],
         sums: Sums<'_>,
-        pointer: impl FnOnce(&mut Acc, &[F128], &[[F128; 2]], Option<(&mut Acc, &[F128])>),
-        cert: impl FnOnce(&mut CertAcc),
+        pointer: impl FnOnce(&mut Acc, &[F128], &[[F128; 2]], Option<(&mut Acc, &[F128])>, bool),
+        cert: impl FnOnce(&mut CertAcc, bool),
     ) {
         let scale = sums.scale;
         let scaled = |c: Coef| {
@@ -1571,8 +1593,8 @@ impl<'a> Column<'a> {
         };
         let (act_coef, act_len) = coef_linear(self.act, aux);
         let act = (!self.act.is_zero()).then_some((sums.act, &act_coef[..act_len]));
-        pointer(sums.omega, &coef[..len], &groups[..self.shifts.len()], act);
-        cert(sums.cert);
+        pointer(sums.omega, &coef[..len], &groups[..self.shifts.len()], act, sums.x1);
+        cert(sums.cert, sums.x1);
     }
 
     /// The coefficient of `Φ_0`, of each shift `s` (at `s - 1`), and the certificate weights at a table's end, times
@@ -1760,7 +1782,9 @@ impl<'a> State<'a> {
         }
     }
 
-    /// One task's share of the round polynomial over this table's pairs, added to `acc`.
+    /// One task's share of the round polynomial over this table's pairs, added to `acc`. With `derive`, the share
+    /// leaves out part of the `X` coefficient of `factored`, which [`prove`] recovers from the round's claim.
+    #[allow(clippy::too_many_arguments)]
     fn round_task(
         &self,
         setup: &RoundSetup,
@@ -1768,6 +1792,7 @@ impl<'a> State<'a> {
         chunks: &Chunks,
         points: &RowPoints,
         skip: bool,
+        derive: bool,
         acc: &mut Poly,
     ) {
         let RoundSetup {
@@ -1823,13 +1848,16 @@ impl<'a> State<'a> {
                     act: &mut under_one,
                     cert: &mut cert,
                     scale,
+                    x1: !derive,
                 });
                 for (o, c) in under_omega.iter_mut().zip(&cert) {
                     *o += c.reduce();
                 }
                 debug_assert!(under_omega[BASE_COEFFS..].iter().all(|c| c.is_zero()));
-                for (f, &v) in factored.iter_mut().zip(&under_omega[..BASE_COEFFS]) {
-                    *f ^= scale.mul_unreduced(v);
+                for (j, (f, &v)) in factored.iter_mut().zip(&under_omega[..BASE_COEFFS]).enumerate() {
+                    if !derive || j != 1 {
+                        *f ^= scale.mul_unreduced(v);
+                    }
                 }
             } else {
                 let (mut cols_omega, mut cols_act) =
@@ -1839,6 +1867,7 @@ impl<'a> State<'a> {
                     act: &mut cols_act,
                     cert: &mut cert,
                     scale: F128::ONE,
+                    x1: true,
                 });
                 for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
                     *o += c.reduce();
@@ -1908,7 +1937,7 @@ impl<'a> State<'a> {
         column.add_terms(
             aux,
             sums,
-            |acc, coef, groups, act| {
+            |acc, coef, groups, act, x1| {
                 pointer_pair(
                     acc,
                     slots,
@@ -1923,9 +1952,10 @@ impl<'a> State<'a> {
                     same,
                     |i| points.eq.eval(chunks, lo[0], i),
                     pair,
+                    x1,
                 )
             },
-            |acc| {
+            |acc, x1| {
                 cert_pair(
                     acc,
                     slots,
@@ -1936,6 +1966,7 @@ impl<'a> State<'a> {
                     one_hot,
                     same,
                     pair,
+                    x1,
                 )
             },
         );
@@ -2017,7 +2048,7 @@ impl<'a> State<'a> {
         column.add_terms(
             aux,
             sums,
-            |acc, coef, groups, act| {
+            |acc, coef, groups, act, x1| {
                 if varying.count_ones() <= 1 {
                     let at = |sigma| points.split.at(sigma);
                     linear_pointer(
@@ -2030,6 +2061,7 @@ impl<'a> State<'a> {
                             let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
                             (fold_words(lo, r, at), fold_words(hi, r, at))
                         },
+                        x1,
                     )
                 } else {
                     pointer_pair(
@@ -2045,10 +2077,11 @@ impl<'a> State<'a> {
                         |_| false,
                         |_| F128::ZERO,
                         pair,
+                        x1,
                     )
                 }
             },
-            |acc| {
+            |acc, x1| {
                 let mut m = [F128Unreduced::ZERO; 3];
                 let mut constant = F128::ZERO;
                 let mut rest = varying;
@@ -2063,10 +2096,12 @@ impl<'a> State<'a> {
                         let t = eps.mul_unreduced(
                             points.cert_pairs[i][(digit(lo[0], i) << chunks.widths[i]) + digit(hi[0], i)],
                         );
-                        m[1] ^= t;
+                        if x1 {
+                            m[1] ^= t;
+                        }
                         m[2] ^= t;
                     } else {
-                        add_pair_product(&mut m, pair(slots.eq(i)), pair(slots.bar(i)));
+                        add_pair_product(&mut m, pair(slots.eq(i)), pair(slots.bar(i)), x1);
                         constant += column.cert_mirrors[i];
                     }
                 }
@@ -2124,7 +2159,7 @@ impl<'a> State<'a> {
         column.add_terms(
             aux,
             sums,
-            |acc, coef, groups, act| {
+            |acc, coef, groups, act, x1| {
                 let digit = |i: usize| {
                     let t = (lo_tags >> (8 * i)) as u8;
                     (skip && t != MIXED && t == (hi_tags >> (8 * i)) as u8).then_some(t)
@@ -2145,9 +2180,10 @@ impl<'a> State<'a> {
                     same,
                     first,
                     pair,
+                    x1,
                 )
             },
-            |acc| {
+            |acc, x1| {
                 cert_pair(
                     acc,
                     slots,
@@ -2158,6 +2194,7 @@ impl<'a> State<'a> {
                     |_| false,
                     same,
                     pair,
+                    x1,
                 )
             },
         );
@@ -2282,6 +2319,17 @@ pub fn prove(
                 .iter()
                 .map(|s| s.done.is_none().then(|| s.round_setup(points)))
                 .collect();
+            // Every table that factors out `eq(τ_h, X)` uses the same `τ_h`, the round's coordinate of the shared
+            // `τ`. Then, from the second round on, the tables leave out the `X` coefficient `f_1` of their summed
+            // `factored`, and the round recovers it from its claim: `f_1·X·eq(τ_h, X) = f_1·((1 + τ_h)·X + X²)`, and
+            // the claim is the sum of the coefficients from `X` up, so `f_1·τ_h` is the claim plus that sum.
+            let taus: Vec<F128> = states
+                .iter()
+                .filter(|s| s.done.is_none())
+                .filter_map(|s| s.tau.as_ref().map(|tau| tau[s.m - s.log_rows]))
+                .collect();
+            let tau = taus.first().copied().unwrap_or(F128::ZERO);
+            let derive = claim.is_some() && !tau.is_zero() && taus.iter().all(|&t| t == tau);
             let mut first = vec![0];
             for setup in &setups {
                 let tasks = setup.as_ref().map_or(0, |r| r.pairs.div_ceil(r.per_task));
@@ -2293,7 +2341,7 @@ pub fn prove(
                 |acc, task| {
                     let t = first.partition_point(|&f| f <= task) - 1;
                     let setup = setups[t].as_ref().unwrap();
-                    states[t].round_task(setup, task - first[t], chunks, points, skip, acc);
+                    states[t].round_task(setup, task - first[t], chunks, points, skip, derive, acc);
                 },
                 |mut a, b| {
                     add_into(&mut a, &b);
@@ -2312,6 +2360,11 @@ pub fn prove(
                         poly[1] += value * corner;
                     }
                 }
+            }
+            if derive {
+                let f1 = (claim.unwrap() + poly[1..].iter().copied().sum::<F128>()) * tau.inv();
+                poly[1] += f1 * (F128::ONE + tau);
+                poly[2] += f1;
             }
         });
         debug_assert!(claim.is_none_or(|c: F128| c == poly[1..].iter().copied().sum::<F128>()));
@@ -2456,6 +2509,7 @@ fn prove_columns(
                 |_| false,
                 |_| F128::ZERO,
                 pair,
+                true,
             );
             add_into(&mut poly, &terms.map(F128Unreduced::reduce));
             for i in 0..d {
