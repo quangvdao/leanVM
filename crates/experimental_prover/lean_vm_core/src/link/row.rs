@@ -2291,7 +2291,8 @@ impl<'a> State<'a> {
 type ColumnAt = (F128, Vec<F128>, Vec<F128>, Vec<F128>);
 
 /// The row side over `tables`. `round` takes each round polynomial's coefficients and returns the challenge;
-/// `claim` is what the rows sum to, checked in debug builds. `skip` turns equal-value skipping on, which every
+/// `claim`, when given, is what the rows sum to, and every round derives part of its polynomial from its claim.
+/// `skip` turns equal-value skipping on, which every
 /// proof does; off, it is only there to measure. The pointer-column rounds run over `q_vars` variables, each column
 /// at its own `q`.
 pub fn prove(
@@ -2299,6 +2300,7 @@ pub fn prove(
     points: &RowPoints,
     tables: Vec<RowTable>,
     q_vars: usize,
+    claim: Option<F128>,
     skip: bool,
     round: &mut dyn FnMut(&[F128]) -> F128,
 ) -> RowEnd {
@@ -2308,7 +2310,7 @@ pub fn prove(
     let mut states: Vec<State> =
         tracing::info_span!("Setup").in_scope(|| tables.into_iter().map(|t| State::new(t, chunks, points)).collect());
     let mut point = Vec::with_capacity(n_rounds);
-    let mut claim = None;
+    let mut claim = claim;
     let rounds = tracing::info_span!("Row rounds").entered();
     for h in 0..n_rounds {
         let _round = tracing::info_span!("Row round", round = h).entered();
@@ -2320,9 +2322,9 @@ pub fn prove(
                 .map(|s| s.done.is_none().then(|| s.round_setup(points)))
                 .collect();
             // Every table that factors out `eq(τ_h, X)` uses the same `τ_h`, the round's coordinate of the shared
-            // `τ`. Then, from the second round on, the tables leave out the `X` coefficient `f_1` of their summed
-            // `factored`, and the round recovers it from its claim: `f_1·X·eq(τ_h, X) = f_1·((1 + τ_h)·X + X²)`, and
-            // the claim is the sum of the coefficients from `X` up, so `f_1·τ_h` is the claim plus that sum.
+            // `τ`. Then, when the round's claim is known, the tables leave out the `X` coefficient `f_1` of their
+            // summed `factored`, and the round recovers it from the claim: `f_1·X·eq(τ_h, X) = f_1·((1 + τ_h)·X + X²)`,
+            // and the claim is the sum of the coefficients from `X` up, so `f_1·τ_h` is the claim plus that sum.
             let taus: Vec<F128> = states
                 .iter()
                 .filter(|s| s.done.is_none())
@@ -2841,7 +2843,7 @@ mod tests {
             let mut claim = total;
             let mut n_coeffs = Vec::new();
             let mut claims = Vec::new();
-            let end = prove(&chunks, &points, tables, q_vars, skip, &mut |poly| {
+            let end = prove(&chunks, &points, tables, q_vars, Some(total), skip, &mut |poly| {
                 assert_eq!(claim, poly[1..].iter().copied().sum::<F128>(), "a round's sum");
                 claims.push(claim);
                 n_coeffs.push(poly.len());

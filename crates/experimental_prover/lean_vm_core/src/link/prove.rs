@@ -558,6 +558,15 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
     };
     let eq0_r = below_power(r, 0);
     let eq_zeta_r = index_end.values[7];
+    // The row side's claim, as the verifier forms it from the index side's.
+    let eq_cycles_r: F128 = (r.iter().enumerate())
+        .map(|(h, &x)| if cycles >> h & 1 == 1 { x } else { F128::ONE + x })
+        .product();
+    let row_claim = index_end.claim
+        + w_plus_r * spine_r
+        + ch.eta_start * eq0_r * spine_r
+        + fresh.plus * w_plus_r
+        + fresh.spine * (spine_r + eq_cycles_r * s_fin);
 
     let row_end = tracing::info_span!("Row side").in_scope(|| {
         let max_shift = plans.iter().map(|p| p.links.max_shift()).max().unwrap_or(0).max(1);
@@ -623,10 +632,18 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             });
         }
         let q_vars = q.next_power_of_two().trailing_zeros() as usize;
-        row::prove(&chunks, &points, tables_in, q_vars, true, &mut |poly| {
-            ps.add_round_poly(poly, false);
-            ps.sample()
-        })
+        row::prove(
+            &chunks,
+            &points,
+            tables_in,
+            q_vars,
+            Some(row_claim),
+            true,
+            &mut |poly| {
+                ps.add_round_poly(poly, false);
+                ps.sample()
+            },
+        )
     });
 
     // Each table's other columns at its row point, then the pointer columns' bit-slices.
