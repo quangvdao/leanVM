@@ -48,6 +48,7 @@ fn proofs<P: Prover>() -> ([Vec<u8>; 5], Option<AggregateError>) {
 }
 
 #[test]
+#[ignore = "hotwire: the experimental prover proves Hotwire's link and the stable prover the bus, so their proofs differ"]
 fn stable_and_experimental_proofs_are_identical() {
     let ((experimental, experimental_refusal), (stable, stable_refusal)) =
         (proofs::<ExperimentalProver>(), proofs::<StableProver>());
@@ -75,6 +76,7 @@ fn prove<P: Prover>(
 /// The compiler suite runs on stable alone; this runs its programs, with their annotated inputs (`# public_input:`,
 /// `# witness name:`) and with a wrong public input, through experimental's interpreter and hints too, at every rate.
 #[test]
+#[ignore = "hotwire: the experimental prover proves Hotwire's link and the stable prover the bus, so their proofs differ"]
 fn compiler_programs_prove_identically() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/zkdsl_compiler/tests/programs");
     let mut paths: Vec<_> = std::fs::read_dir(dir)

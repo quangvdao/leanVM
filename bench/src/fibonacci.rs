@@ -108,9 +108,9 @@ fn fibonacci_program(fib_n: usize) -> (String, [E; 2]) {
 mod tests {
     #[test]
     fn fibonacci() {
-        super::run_fibonacci::<stable_lean_vm_core::StableProver>(
+        super::run_fibonacci::<experimental_lean_vm_core::ExperimentalProver>(
             200_000,
-            stable_lean_vm_core::pcs::TEST_LOG_INV_RATE,
+            experimental_lean_vm_core::pcs::TEST_LOG_INV_RATE,
             bench_harness::Plan::default(),
         );
     }

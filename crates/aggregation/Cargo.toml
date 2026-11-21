@@ -30,3 +30,4 @@ signers-cache = ["dep:rand"]
 
 [dev-dependencies]
 rand.workspace = true
+experimental_lean_vm_core = { path = "../experimental_prover/lean_vm_core" }

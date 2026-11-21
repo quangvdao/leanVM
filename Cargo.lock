@@ -7,6 +7,7 @@ name = "aggregation"
 version = "0.1.0"
 dependencies = [
  "claims",
+ "experimental_lean_vm_core",
  "fiat_shamir_prover",
  "isa",
  "keccak256",
@@ -249,6 +250,7 @@ dependencies = [
  "isa",
  "tracing",
  "verifier",
+ "zkdsl_compiler",
 ]
 
 [[package]]
@@ -929,11 +931,11 @@ dependencies = [
 name = "zkdsl_compiler"
 version = "0.1.0"
 dependencies = [
+ "experimental_lean_vm_core",
+ "experimental_parallel",
+ "experimental_primitives",
  "fiat_shamir_prover",
  "isa",
  "keccak256",
- "stable_lean_vm_core",
- "stable_parallel",
- "stable_primitives",
  "verifier",
 ]
