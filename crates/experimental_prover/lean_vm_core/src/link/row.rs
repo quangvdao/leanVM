@@ -810,22 +810,34 @@ enum ChunkPair {
     Values((F128, F128), (F128, F128)),
 }
 
-/// The product of two linear factors `a + b·X`, by Karatsuba.
+/// The product of two linear factors `a + b·X`, by Karatsuba; without `x1`, its `X` coefficient is left zero.
 #[inline(always)]
-fn quad(f: (F128, F128), g: (F128, F128)) -> [F128; 3] {
+fn quad_x(f: (F128, F128), g: (F128, F128), x1: bool) -> [F128; 3] {
     let c0 = f.0.mul_unreduced(g.0);
     let c2 = f.1.mul_unreduced(g.1);
-    let m = (f.0 + f.1).mul_unreduced(g.0 + g.1);
-    [c0.reduce(), (m ^ c0 ^ c2).reduce(), c2.reduce()]
+    let mid = if x1 {
+        ((f.0 + f.1).mul_unreduced(g.0 + g.1) ^ c0 ^ c2).reduce()
+    } else {
+        F128::ZERO
+    };
+    [c0.reduce(), mid, c2.reduce()]
 }
 
-/// `out ← p·q` for `p` of `P` and `q` of `Q` coefficients.
+/// The product of two linear factors `a + b·X`.
 #[inline(always)]
-fn conv<const P: usize, const Q: usize>(p: &[F128], q: &[F128], out: &mut [F128]) {
+fn quad(f: (F128, F128), g: (F128, F128)) -> [F128; 3] {
+    quad_x(f, g, true)
+}
+
+/// `out ← p·q` for `p` of `P` and `q` of `Q` coefficients; without `x1`, the `X` coefficient is left zero.
+#[inline(always)]
+fn conv<const P: usize, const Q: usize>(p: &[F128], q: &[F128], out: &mut [F128], x1: bool) {
     let mut u = [F128Unreduced::ZERO; MAX_CHUNKS + 1];
     for i in 0..P {
         for j in 0..Q {
-            u[i + j] ^= p[i].mul_unreduced(q[j]);
+            if x1 || i + j != 1 {
+                u[i + j] ^= p[i].mul_unreduced(q[j]);
+            }
         }
     }
     for (o, v) in out[..P + Q - 1].iter_mut().zip(u) {
@@ -833,37 +845,49 @@ fn conv<const P: usize, const Q: usize>(p: &[F128], q: &[F128], out: &mut [F128]
     }
 }
 
+/// The product of three linear factors; without `x1`, its `X` coefficient is left zero.
+#[inline(always)]
+fn cubic_x(f: &[(F128, F128)], x1: bool) -> [F128; 4] {
+    let mut out = [F128::ZERO; 4];
+    conv::<3, 2>(&quad(f[0], f[1]), &[f[2].0, f[2].1], &mut out, x1);
+    out
+}
+
 /// The product of three linear factors.
 #[inline(always)]
 fn cubic(f: &[(F128, F128)]) -> [F128; 4] {
-    let mut out = [F128::ZERO; 4];
-    conv::<3, 2>(&quad(f[0], f[1]), &[f[2].0, f[2].1], &mut out);
-    out
+    cubic_x(f, true)
 }
 
 /// The product of the linear factors `a + b·X` in `f`, as a balanced tree; its length is `f.len() + 1`.
 #[inline(always)]
 fn product(f: &[(F128, F128)]) -> [F128; MAX_CHUNKS + 1] {
+    product_x(f, true)
+}
+
+/// [`product`], its `X` coefficient left zero without `x1`: only the last multiplication changes.
+#[inline(always)]
+fn product_x(f: &[(F128, F128)], x1: bool) -> [F128; MAX_CHUNKS + 1] {
     let mut out = [F128::ZERO; MAX_CHUNKS + 1];
     match f.len() {
         0 => out[0] = F128::ONE,
         1 => (out[0], out[1]) = f[0],
-        2 => out[..3].copy_from_slice(&quad(f[0], f[1])),
-        3 => out[..4].copy_from_slice(&cubic(f)),
-        4 => conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut out),
-        5 => conv::<3, 4>(&quad(f[0], f[1]), &cubic(&f[2..]), &mut out),
-        6 => conv::<4, 4>(&cubic(f), &cubic(&f[3..]), &mut out),
+        2 => out[..3].copy_from_slice(&quad_x(f[0], f[1], x1)),
+        3 => out[..4].copy_from_slice(&cubic_x(f, x1)),
+        4 => conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut out, x1),
+        5 => conv::<3, 4>(&quad(f[0], f[1]), &cubic(&f[2..]), &mut out, x1),
+        6 => conv::<4, 4>(&cubic(f), &cubic(&f[3..]), &mut out, x1),
         7 => {
             let mut four = [F128::ZERO; 5];
-            conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut four);
-            conv::<5, 4>(&four, &cubic(&f[4..]), &mut out)
+            conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), &mut four, true);
+            conv::<5, 4>(&four, &cubic(&f[4..]), &mut out, x1)
         }
         _ => {
             let mut four = [[F128::ZERO; 5]; 2];
             for (o, f) in four.iter_mut().zip(f.chunks(4)) {
-                conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), o);
+                conv::<3, 3>(&quad(f[0], f[1]), &quad(f[2], f[3]), o, true);
             }
-            conv::<5, 5>(&four[0], &four[1], &mut out)
+            conv::<5, 5>(&four[0], &four[1], &mut out, x1)
         }
     }
     out
@@ -941,7 +965,9 @@ fn plain_terms(
         return;
     }
     let s = points.clean.at(&codes);
-    let p = product(&factors[..n]);
+    // Without `x1`, a constant coefficient alone reads the product's `X` coefficient into the sum's, which is not
+    // wanted, so the product leaves it out.
+    let p = product_x(&factors[..n], sums.x1 || len == 2 || !column.act.is_zero());
     let p = &p[..n + 1];
     if live {
         add_scaled(sums.omega, s, &coef[..len], p, sums.x1);
