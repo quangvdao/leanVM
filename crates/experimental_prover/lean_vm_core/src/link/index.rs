@@ -431,6 +431,8 @@ pub fn prove(
 pub struct Scatter {
     limbs: Vec<AtomicU64>,
     overflow: AtomicBool,
+    /// Whether the pool has one worker, so no two adds run at once and an add needs no read-modify-write.
+    alone: bool,
 }
 
 impl Scatter {
@@ -447,6 +449,7 @@ impl Scatter {
         Self {
             limbs,
             overflow: AtomicBool::new(false),
+            alone: parallel::num_threads() == 1,
         }
     }
 
@@ -484,7 +487,12 @@ impl Scatter {
             return;
         };
         for (c, limb) in cell.iter().zip(value.to_limbs()) {
-            if limb != 0 {
+            if limb == 0 {
+                continue;
+            }
+            if self.alone {
+                c.store(c.load(Ordering::Relaxed) ^ limb, Ordering::Relaxed);
+            } else {
                 c.fetch_xor(limb, Ordering::Relaxed);
             }
         }
