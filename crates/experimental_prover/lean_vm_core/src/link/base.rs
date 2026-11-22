@@ -172,6 +172,34 @@ fn add_block(acc: &mut [F128], w: Option<(F128, F128)>, gate: Option<(F128, F128
     }
 }
 
+/// [`add_block`] for a gate that is still a `K` column, by mixed products.
+#[inline(always)]
+fn add_block_base(acc: &mut [F128], w: Option<(F128, F128)>, gate: Option<(F64, F64)>, f: [F128; 3]) {
+    let mut p = [f[0], f[1], f[2], F128::ZERO, F128::ZERO];
+    let mut len = 3;
+    if let Some((a0, a1)) = gate {
+        let b = a0 + a1;
+        p[3] = p[2].mul_base(b);
+        for j in (1..3).rev() {
+            p[j] = (p[j].mul_base_unreduced(a0) ^ p[j - 1].mul_base_unreduced(b)).reduce();
+        }
+        p[0] = p[0].mul_base(a0);
+        len = 4;
+    }
+    if let Some((a0, a1)) = w {
+        let b = a0 + a1;
+        p[len] = p[len - 1] * b;
+        for j in (1..len).rev() {
+            p[j] = (p[j].mul_unreduced(a0) ^ p[j - 1].mul_unreduced(b)).reduce();
+        }
+        p[0] *= a0;
+        len += 1;
+    }
+    for (o, v) in acc.iter_mut().zip(&p[..len]) {
+        *o += *v;
+    }
+}
+
 /// A block's gate times its form at a row of slot values, unweighted.
 #[inline(always)]
 fn form_at(b: &Factored, row: &[F128]) -> F128 {
@@ -367,6 +395,10 @@ impl<'a> Base<'a> {
     #[inline(always)]
     pub fn pair(&self, rows: &Rows, k: usize, with_omega: bool, omega: &mut [F128], acc: &mut [F128]) {
         let eq = self.eq.as_ref().map(|e| (at(e, 2 * k), at(e, 2 * k + 1)));
+        if self.folded.is_none() && rows.cols.first().is_some_and(|c| 2 * k + 1 - rows.start < c.len()) {
+            self.pair_columns(rows, k, with_omega, eq, omega, acc);
+            return;
+        }
         self.with_row(rows, 2 * k, |lo| {
             self.with_row(rows, 2 * k + 1, |hi| {
                 for block in &self.blocks {
@@ -392,6 +424,62 @@ impl<'a> Base<'a> {
                 }
             })
         });
+    }
+
+    /// [`Self::pair`] on two rows of the `K` columns, before the first fold: a factor or gate is a column's value,
+    /// so each product with it is a mixed one.
+    #[inline(always)]
+    fn pair_columns(
+        &self,
+        rows: &Rows,
+        k: usize,
+        with_omega: bool,
+        eq: Option<(F128, F128)>,
+        omega: &mut [F128],
+        acc: &mut [F128],
+    ) {
+        let (u0, u1) = (2 * k - rows.start, 2 * k + 1 - rows.start);
+        let n = self.factors.len();
+        let factor = |f: usize| {
+            let c = rows.cols[self.factors[f]];
+            (c[u0], c[u1])
+        };
+        // The linear slots at both rows.
+        let mut lo = [std::mem::MaybeUninit::<F128>::uninit(); MAX_SLOTS];
+        let mut hi = [std::mem::MaybeUninit::<F128>::uninit(); MAX_SLOTS];
+        for ((l, a), b) in self.linears.iter().zip(&mut lo).zip(&mut hi) {
+            a.write(l.at(|c| rows.cols[c][u0]));
+            b.write(l.at(|c| rows.cols[c][u1]));
+        }
+        let m = self.linears.len();
+        // SAFETY: `F128` is plain data, and the loop above wrote the first `m` values of each.
+        let (lo, hi) = unsafe {
+            (
+                &*(std::ptr::from_ref(&lo[..m]) as *const [F128]),
+                &*(std::ptr::from_ref(&hi[..m]) as *const [F128]),
+            )
+        };
+        for block in &self.blocks {
+            let (out, w) = match block.weight {
+                Weight::Omega if with_omega => (&mut *omega, None),
+                Weight::Omega => continue,
+                Weight::Eq => (&mut *acc, eq),
+            };
+            if w.is_some_and(|w| w.0.is_zero() && w.1.is_zero()) {
+                continue;
+            }
+            let (mut c0, mut c1, mut c2) = (F128Unreduced::ZERO, F128Unreduced::ZERO, F128Unreduced::ZERO);
+            for &(f, l) in &block.products {
+                let ((a0, a1), (b0, b1)) = (factor(f), (lo[l - n], hi[l - n]));
+                c0 ^= b0.mul_base_unreduced(a0);
+                c1 ^= b1.mul_base_unreduced(a1);
+                c2 ^= (b0 + b1).mul_base_unreduced(a0 + a1);
+            }
+            let f0 = lo[block.linear - n] + c0.reduce();
+            let f1 = hi[block.linear - n] + c1.reduce();
+            let f2 = c2.reduce();
+            add_block_base(out, w, block.gate.map(factor), [f0, f0 + f1 + f2, f2]);
+        }
     }
 
     /// Bind the lowest row variable at `x`: `explicit` rows after.
