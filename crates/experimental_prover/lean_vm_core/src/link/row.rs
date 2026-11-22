@@ -58,6 +58,84 @@ struct RoundSetup<'b> {
     per_task: usize,
     tables: Vec<Vec<(usize, &'b [F128])>>,
     weighted: Vec<Vec<Vec<F128>>>,
+    /// Per column, whether its pairs below `whole` with one-hot words are summed by [`State::repeated_terms`]
+    /// instead of pair by pair.
+    repeated: Vec<bool>,
+}
+
+/// Pairs a column's index groups are sampled at to tell whether they repeat.
+const REPEAT_SAMPLE: usize = 4096;
+
+/// Sums of field weights by key: open addressing with linear probing, `u128::MAX` the empty key.
+struct KeyWeights {
+    keys: Vec<u128>,
+    weights: Vec<F128>,
+    len: usize,
+    shift: u32,
+}
+
+impl KeyWeights {
+    fn new(capacity: usize) -> Self {
+        let n = capacity.next_power_of_two().max(16);
+        Self {
+            keys: vec![u128::MAX; n],
+            weights: vec![F128::ZERO; n],
+            len: 0,
+            shift: 64 - n.trailing_zeros(),
+        }
+    }
+
+    #[inline(always)]
+    fn slot(&self, key: u128) -> usize {
+        let h = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    /// Add `w` to `key`'s weight.
+    #[inline(always)]
+    fn add(&mut self, key: u128, w: F128) {
+        if 2 * (self.len + 1) > self.keys.len() {
+            self.grow();
+        }
+        let mask = self.keys.len() - 1;
+        let mut i = self.slot(key);
+        loop {
+            let k = self.keys[i];
+            if k == key {
+                self.weights[i] += w;
+                return;
+            }
+            if k == u128::MAX {
+                self.keys[i] = key;
+                self.weights[i] = w;
+                self.len += 1;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let mut next = Self::new(2 * self.keys.len());
+        for (&k, &w) in self.keys.iter().zip(&self.weights) {
+            if k != u128::MAX {
+                next.add(k, w);
+            }
+        }
+        *self = next;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u128, F128)> + '_ {
+        (self.keys.iter().zip(&self.weights))
+            .filter(|(k, _)| **k != u128::MAX)
+            .map(|(&k, &w)| (k, w))
+    }
+}
+
+/// The key of a pair's `2·n` indices, `n ≤ 2`, 32 bits each from the first.
+#[inline(always)]
+fn pack_key(sigmas: &[u32]) -> u128 {
+    (sigmas.iter().enumerate()).fold(0, |key, (t, &s)| key | u128::from(s) << (32 * t))
 }
 
 /// Chunks of a word, at most.
@@ -1491,6 +1569,16 @@ impl<'a> Column<'a> {
         Some((sigmas, diff))
     }
 
+    /// The key of pair `k`'s two groups of `n` indices, when every word of both is one-hot.
+    #[inline(always)]
+    fn pair_key(&self, n: usize, k: usize) -> Option<u128> {
+        let mut sigmas = [0u32; 2 * MAX_GROUP];
+        for (o, s) in sigmas[..2 * n].iter_mut().enumerate() {
+            *s = self.index.get(2 * k * n + o).copied().unwrap_or(NO_INDEX);
+        }
+        (!sigmas[..2 * n].contains(&NO_INDEX)).then(|| pack_key(&sigmas[..2 * n]))
+    }
+
     /// Row `k`'s group of `n` words.
     #[inline(always)]
     fn group_words(&self, n: usize, k: usize) -> [u64; 2 * MAX_GROUP] {
@@ -1777,6 +1865,89 @@ impl<'a> State<'a> {
         self.done = Some((value + end.base, F128::ONE));
     }
 
+    /// Pairs whose rows are all executed, when `ω` is `θ·eq(τ, ·)` there: below them `act` is one and `ω` factors
+    /// `eq(τ_h, X)` out.
+    fn whole(&self) -> usize {
+        if self.tau.is_some() { self.full / 2 } else { 0 }
+    }
+
+    /// The terms under `ω` of each column [`RoundSetup::repeated`] picks, at its pairs below `whole` whose words are
+    /// one-hot, added to `acc`: per distinct pair of index groups, its terms once, times the sum of the `ω_0 + ω_1`
+    /// of the pairs that have it, then all times `eq(τ_h, X)`. Without `derive` all of the `X` coefficient.
+    fn repeated_terms(
+        &self,
+        setup: &RoundSetup,
+        column: usize,
+        chunks: &Chunks,
+        points: &RowPoints,
+        derive: bool,
+    ) -> Poly {
+        let c = &self.columns[column];
+        let n = 1 << self.bound.len();
+        let below = setup.pairs.min(self.whole());
+        let mut sums = KeyWeights::new(REPEAT_SAMPLE);
+        for k in 0..below {
+            if let Some(key) = c.pair_key(n, k) {
+                sums.add(key, at(&self.omega, 2 * k) + at(&self.omega, 2 * k + 1));
+            }
+        }
+        let len = (chunks.d() + 2).max(4);
+        let tables = (setup.tables[column].as_slice(), setup.weighted[column].as_slice());
+        let aux = [(F128::ZERO, F128::ZERO); 4];
+        let mut total = [F128Unreduced::ZERO; MAX_COEFFS];
+        for (key, w) in sums.iter() {
+            if w.is_zero() {
+                continue;
+            }
+            let (mut omega, mut act, mut cert) = (
+                [F128Unreduced::ZERO; MAX_COEFFS],
+                [F128Unreduced::ZERO; MAX_COEFFS],
+                [F128Unreduced::ZERO; 3],
+            );
+            let sums = Sums {
+                omega: &mut omega,
+                act: &mut act,
+                cert: &mut cert,
+                x1: !derive,
+            };
+            let sigma = |t: usize| (key >> (32 * t)) as u32;
+            match n {
+                1 => Self::pair_indices::<1>(
+                    c,
+                    tables,
+                    &self.bound,
+                    [[sigma(0)], [sigma(1)]],
+                    &aux,
+                    chunks,
+                    points,
+                    sums,
+                ),
+                _ => Self::pair_indices::<2>(
+                    c,
+                    tables,
+                    &self.bound,
+                    [[sigma(0), sigma(1)], [sigma(2), sigma(3)]],
+                    &aux,
+                    chunks,
+                    points,
+                    sums,
+                ),
+            }
+            for (j, (t, o)) in total[..len].iter_mut().zip(&omega).enumerate() {
+                if derive && j == 1 {
+                    continue;
+                }
+                let v = o.reduce() + cert.get(j).map_or(F128::ZERO, |c| c.reduce());
+                *t ^= w.mul_unreduced(v);
+            }
+        }
+        let total = total.map(F128Unreduced::reduce);
+        let tau = self.tau.as_ref().map_or(F128::ZERO, |tau| tau[self.m - self.log_rows]);
+        let mut out = [F128::ZERO; MAX_COEFFS];
+        add_mul_pair(&mut out, 0, &total, len, (F128::ONE + tau, tau));
+        out
+    }
+
     #[inline(always)]
     fn aux_pair(&self, k: usize) -> [(F128, F128); 4] {
         let mut out = [(F128::ZERO, F128::ZERO); 4];
@@ -1788,7 +1959,7 @@ impl<'a> State<'a> {
     }
 
     /// What every task of this round's sum shares: the columns' tables and the pairs each task takes.
-    fn round_setup<'b>(&'b self, points: &'b RowPoints) -> RoundSetup<'b> {
+    fn round_setup<'b>(&'b self, points: &'b RowPoints, skip: bool) -> RoundSetup<'b> {
         let pairs = if self.base.as_ref().is_some_and(Base::on_padding) {
             self.explicit.div_ceil(2)
         } else {
@@ -1808,11 +1979,35 @@ impl<'a> State<'a> {
             .collect();
         // A small round still spreads over the workers.
         let per_task = (pairs / 64).clamp(8, TASK_PAIRS);
+        let n = 1 << self.bound.len();
+        let below = pairs.min(self.whole());
+        let repeated = (self.columns.iter())
+            .map(|c| {
+                // A column whose terms at a pair are its coefficient times what its index groups give: when few of
+                // its pairs are distinct, summing each distinct pair's weights first costs less.
+                skip && n <= 2
+                    && c.values.is_none()
+                    && c.shifts.is_empty()
+                    && c.act.is_zero()
+                    && c.omega.aux.is_none()
+                    && below >= REPEAT_SAMPLE
+                    && {
+                        let mut seen = KeyWeights::new(2 * REPEAT_SAMPLE);
+                        for k in 0..REPEAT_SAMPLE {
+                            if let Some(key) = c.pair_key(n, k) {
+                                seen.add(key, F128::ZERO);
+                            }
+                        }
+                        4 * seen.len <= 3 * REPEAT_SAMPLE
+                    }
+            })
+            .collect();
         RoundSetup {
             pairs,
             per_task,
             tables,
             weighted,
+            repeated,
         }
     }
 
@@ -1834,7 +2029,9 @@ impl<'a> State<'a> {
             per_task,
             ref tables,
             ref weighted,
+            ref repeated,
         } = *setup;
+        let n = 1 << self.bound.len();
         // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
         // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
         // `eq(τ_h, X)` multiplies their sum once per task. The pair's terms are summed unscaled first, so the scale
@@ -1879,8 +2076,12 @@ impl<'a> State<'a> {
             let aux = self.aux_pair(k);
             let mut cert = [F128Unreduced::ZERO; 3];
             let add_columns = |sums: &mut Sums| {
-                for (((column, tables), weighted), run) in self.columns.iter().zip(tables).zip(weighted).zip(&word_runs)
+                for ((((column, tables), weighted), run), &repeated) in
+                    (self.columns.iter().zip(tables).zip(weighted).zip(&word_runs)).zip(repeated)
                 {
+                    if repeated && k < whole && column.pair_key(n, k).is_some() {
+                        continue;
+                    }
                     let words = (tables.as_slice(), weighted.as_slice());
                     let sums = sums.reborrow();
                     match &column.values {
@@ -2378,7 +2579,7 @@ pub fn prove(
             // Every live table's tasks in one dispatch.
             let setups: Vec<Option<RoundSetup>> = states
                 .iter()
-                .map(|s| s.done.is_none().then(|| s.round_setup(points)))
+                .map(|s| s.done.is_none().then(|| s.round_setup(points, skip)))
                 .collect();
             // Every table that factors out `eq(τ_h, X)` uses the same `τ_h`, the round's coordinate of the shared
             // `τ`. Then, when the round's claim is known, the tables leave out the `X` coefficient `f_1` of their
@@ -2409,6 +2610,23 @@ pub fn prove(
                     a
                 },
             );
+            let repeated: Vec<(usize, usize)> = (setups.iter().enumerate())
+                .filter_map(|(t, s)| s.as_ref().map(|s| (t, s)))
+                .flat_map(|(t, s)| {
+                    s.repeated
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| **r)
+                        .map(move |(c, _)| (t, c))
+                })
+                .collect();
+            let terms = parallel::map_collect(repeated.len(), |j| {
+                let (t, c) = repeated[j];
+                states[t].repeated_terms(setups[t].as_ref().unwrap(), c, chunks, points, derive)
+            });
+            for p in &terms {
+                add_into(&mut poly, p);
+            }
             for state in &states {
                 match state.done {
                     None => {
