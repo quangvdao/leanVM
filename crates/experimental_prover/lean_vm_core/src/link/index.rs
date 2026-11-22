@@ -578,8 +578,9 @@ impl Scatter {
         });
     }
 
-    /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: each worker sums the
-    /// adds to an index that rows hit again soon after, holding back up to `SLOTS` indices ([`Combine`]).
+    /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: with several workers,
+    /// each sums the adds to an index that rows hit again soon after, holding back up to `SLOTS` indices
+    /// ([`Combine`]).
     pub fn add_repeated_words<const SLOTS: usize>(
         &self,
         chunks: &Chunks,
@@ -588,12 +589,7 @@ impl Scatter {
         shift: usize,
         weight: impl Fn(usize) -> F128 + Sync,
     ) {
-        self.add_words_with(
-            chunks,
-            &[(words, index, shift)],
-            |_, u| weight(u),
-            || Combine::<SLOTS>::new(self),
-        );
+        self.add_repeated_accesses::<SLOTS>(chunks, &[(words, index, shift)], |_, u| weight(u));
     }
 
     /// [`Scatter::add_repeated_words`] for several pointers into the same rows in one pass, such as a table's
@@ -605,7 +601,12 @@ impl Scatter {
         accesses: &[(Col<u64>, &[u32], usize)],
         weight: impl Fn(usize, usize) -> F128 + Sync,
     ) {
-        self.add_words_with(chunks, accesses, weight, || Combine::<SLOTS>::new(self));
+        // One worker contends with no one, so it adds each row straight in.
+        if self.alone {
+            self.add_words_with(chunks, accesses, weight, || Direct(self));
+        } else {
+            self.add_words_with(chunks, accesses, weight, || Combine::<SLOTS>::new(self));
+        }
     }
 
     fn add_words_with<A: Adder>(
