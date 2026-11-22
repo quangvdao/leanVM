@@ -1482,17 +1482,19 @@ impl<'a> Column<'a> {
             values = rest;
             let order = &layout.order[..len];
             // Every word one-hot: a chunk is uniform where its digit agrees across the group's indices.
-            if let Some((sigmas, diff)) = self.group_sigmas(n, k) {
+            // The tags hold each uniform chunk's digit, so only the varying chunks read the indices' digits.
+            if let Some((sigmas, _)) = self.group_sigmas(n, k) {
                 let sigmas = &sigmas[..n];
-                let digit = |sigma: u32, i: usize| chunks.digit(sigma as usize, i);
                 for (o, &slot) in row.iter_mut().zip(order) {
                     let (i, table) = tables[usize::from(slot)];
-                    *o = if chunks.digit(diff, i) == 0 {
-                        table[digit(sigmas[0], i)]
+                    let tag = (t >> (8 * i)) as u8;
+                    *o = if tag != MIXED {
+                        table[usize::from(tag)]
                     } else {
                         let (len, weighted) = (table.len(), &weighted[usize::from(slot)]);
-                        (sigmas.iter().enumerate())
-                            .fold(F128::ZERO, |sum, (t, &s)| sum + weighted[t * len + digit(s, i)])
+                        (sigmas.iter().enumerate()).fold(F128::ZERO, |sum, (t, &s)| {
+                            sum + weighted[t * len + chunks.digit(s as usize, i)]
+                        })
                     };
                 }
                 continue;
