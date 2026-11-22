@@ -552,15 +552,8 @@ impl Scatter {
         parallel::for_each(ranges, |r| {
             for (t, &(words, index)) in tables.iter().enumerate() {
                 let rows = starts[t][r]..starts[t][r + 1];
-                for u in rows.clone() {
-                    if u + PREFETCH < rows.end
-                        && let j = index[u + PREFETCH]
-                        && j != NO_INDEX
-                    {
-                        for &(array, shift) in &targets {
-                            array.prefetch(j as usize + shift);
-                        }
-                    }
+                // Words sorted by index, as the callers pass, read each array in order, so the rows need no prefetch.
+                for u in rows {
                     let w = weights(t, u);
                     let mut add = |j: usize| {
                         for (&(array, shift), &w) in targets.iter().zip(&w) {
