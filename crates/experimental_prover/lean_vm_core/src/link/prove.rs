@@ -474,23 +474,26 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             let (start, end) = (r.start.min(1 << log_mem), r.end.min(1 << log_mem));
             (start, mem[0].window(start, end), mem[1].window(start, end))
         };
+        // Each entry's mixed products are summed unreduced and reduced once.
         let y_mem = tabulate_powers_in(mem_len, cells, |(start, m0, m1), j, g_j| {
-            let mut y = gm[0].mul_base(g_j);
+            let y = gm[0].mul_base_unreduced(g_j);
             if j < 1 << log_mem {
-                y += gm[3] + gm[1].mul_base(m0[j - start]) + gm[2].mul_base(m1[j - start]);
+                let cell = gm[1].mul_base_unreduced(m0[j - start]) ^ gm[2].mul_base_unreduced(m1[j - start]);
+                (y ^ cell).reduce() + gm[3]
+            } else {
+                y.reduce()
             }
-            y
         });
         let a = &ch.alpha_bc;
         let x_bc = tabulate_powers(bc_len, |j, g_j| {
-            let mut x = a[1].mul_base(g_j);
+            let mut x = a[1].mul_base_unreduced(g_j);
             if j < bytecode_size {
-                x += a[2];
                 for (s, column) in program.iter().enumerate() {
-                    x += a[3 + s].mul_base(column[j]);
+                    x ^= a[3 + s].mul_base_unreduced(column[j]);
                 }
+                return x.reduce() + a[2];
             }
-            x
+            x.reduce()
         });
         let firsts: Vec<[F128; 5]> = (0..tables::N_TABLES)
             .map(|t| {
