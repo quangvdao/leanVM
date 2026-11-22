@@ -46,6 +46,19 @@ impl Linear {
         });
         self.constant + sum.reduce()
     }
+
+    /// The form at two rows, `column(c)` giving column `c` at both, in one pass over the terms.
+    #[inline(always)]
+    fn at_pair(&self, column: impl Fn(usize) -> (F64, F64)) -> (F128, F128) {
+        let (lo, hi) = self
+            .terms
+            .iter()
+            .fold((F128Unreduced::ZERO, F128Unreduced::ZERO), |(lo, hi), &(c, w)| {
+                let (a, b) = column(c);
+                (lo ^ w.mul_base_unreduced(a), hi ^ w.mul_base_unreduced(b))
+            });
+        (self.constant + lo.reduce(), self.constant + hi.reduce())
+    }
 }
 
 /// A linear form's constant and each term's column with its coefficient times `1 + x` and times `x`: the form at a
@@ -457,8 +470,12 @@ impl<'a> Base<'a> {
         let mut lo = [std::mem::MaybeUninit::<F128>::uninit(); MAX_SLOTS];
         let mut hi = [std::mem::MaybeUninit::<F128>::uninit(); MAX_SLOTS];
         for ((l, a), b) in self.linears.iter().zip(&mut lo).zip(&mut hi) {
-            a.write(l.at(|c| rows.cols[c][u0]));
-            b.write(l.at(|c| rows.cols[c][u1]));
+            let (x, y) = l.at_pair(|c| {
+                let col = rows.cols[c];
+                (col[u0], col[u1])
+            });
+            a.write(x);
+            b.write(y);
         }
         let m = self.linears.len();
         // SAFETY: `F128` is plain data, and the loop above wrote the first `m` values of each.
