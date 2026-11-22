@@ -465,14 +465,13 @@ const BASE_COEFFS: usize = 4;
 /// A certificate's terms at a pair, unreduced: three coefficients.
 type CertAcc = [F128Unreduced; 3];
 
-/// Where a column's terms at a pair go: those under `ω` times `scale` to `omega`, those under `act` to `act`, and the
-/// certificate's, which are under `ω` too but unscaled, to `cert`. Without `x1`, the terms in `omega` and `cert` may
+/// Where a column's terms at a pair go: those under `ω` to `omega`, those under `act` to `act`, and the certificate's,
+/// which are under `ω` too, to `cert`. Without `x1`, the terms in `omega` and `cert` may
 /// leave out any part of their `X` coefficient: the round recovers it from its claim (see [`prove`]).
 struct Sums<'s> {
     omega: &'s mut Acc,
     act: &'s mut Acc,
     cert: &'s mut CertAcc,
-    scale: F128,
     x1: bool,
 }
 
@@ -482,7 +481,6 @@ impl Sums<'_> {
             omega: &mut *self.omega,
             act: &mut *self.act,
             cert: &mut *self.cert,
-            scale: self.scale,
             x1: self.x1,
         }
     }
@@ -931,7 +929,7 @@ fn plain_terms(
     let p = product(&factors[..n]);
     let p = &p[..n + 1];
     if live {
-        add_scaled(sums.omega, s * sums.scale, &coef[..len], p, sums.x1);
+        add_scaled(sums.omega, s, &coef[..len], p, sums.x1);
     }
     if !column.act.is_zero() {
         let (c, len) = coef_linear(column.act, aux);
@@ -1566,9 +1564,8 @@ impl<'a> Column<'a> {
         self.tags = tags;
     }
 
-    /// Add the column's terms at a pair to `sums`, each without its weight: the pointer's under `ω`, its
-    /// coefficients times `sums.scale`, to `omega`, and under `act` to `act`. `pointer(acc, coef, groups)` adds a
-    /// pointer term, `cert(acc)` the certificate's, unscaled.
+    /// Add the column's terms at a pair to `sums`, each without its weight: the pointer's under `ω` to `omega`, and
+    /// under `act` to `act`. `pointer(acc, coef, groups)` adds a pointer term, `cert(acc)` the certificate's.
     #[inline(always)]
     fn add_terms(
         &self,
@@ -1577,14 +1574,7 @@ impl<'a> Column<'a> {
         pointer: impl FnOnce(&mut Acc, &[F128], &[[F128; 2]], Option<(&mut Acc, &[F128])>, bool),
         cert: impl FnOnce(&mut CertAcc, bool),
     ) {
-        let scale = sums.scale;
-        let scaled = |c: Coef| {
-            let (mut v, len) = coef_linear(c, aux);
-            for x in &mut v[..len] {
-                *x *= scale;
-            }
-            (v, len)
-        };
+        let scaled = |c: Coef| coef_linear(c, aux);
         let mut groups = [[F128::ZERO; 2]; 4];
         for (o, g) in groups.iter_mut().zip(&self.shifts) {
             *o = scaled(g.coef).0;
@@ -1806,8 +1796,8 @@ impl<'a> State<'a> {
         } = *setup;
         // Below `whole` pairs, both rows' groups are executed, so `act` is one at both and `ω` is
         // `(ω_0 + ω_1)·eq(τ_h, X)`: the pair's terms under `ω` add to `factored` scaled by `ω_0 + ω_1`, and
-        // `eq(τ_h, X)` multiplies their sum once per task. The columns' terms take that scale through their
-        // coefficients, so only the base and certificate terms, a few coefficients, are scaled per pair.
+        // `eq(τ_h, X)` multiplies their sum once per task. The pair's terms are summed unscaled first, so the scale
+        // costs one product per coefficient the pair reaches, not one per column coefficient.
         let (whole, tau) = match &self.tau {
             Some(tau) => (self.full / 2, tau[self.m - self.log_rows]),
             None => (0, F128::ZERO),
@@ -1861,24 +1851,29 @@ impl<'a> State<'a> {
                 }
             };
             if k < whole {
-                // The columns scale their terms under `ω` by `ω_0 + ω_1` and add them to `factored` and those under
-                // `act` to `under_one`; the base and certificate terms take the scale here.
-                let scale = omega.0 + omega.1;
+                // The columns add their terms under `ω` to `cols_omega` and those under `act` to `under_one`; the
+                // pair's terms under `ω` then take the scale `ω_0 + ω_1` together.
+                let mut cols_omega = [F128Unreduced::ZERO; MAX_COEFFS];
                 add_columns(&mut Sums {
-                    omega: &mut factored,
+                    omega: &mut cols_omega,
                     act: &mut under_one,
                     cert: &mut cert,
-                    scale,
                     x1: !derive,
                 });
                 for (o, c) in under_omega.iter_mut().zip(&cert) {
                     *o += c.reduce();
                 }
-                debug_assert!(under_omega[BASE_COEFFS..].iter().all(|c| c.is_zero()));
-                for (j, (f, &v)) in factored.iter_mut().zip(&under_omega[..BASE_COEFFS]).enumerate() {
-                    if !derive || j != 1 {
-                        *f ^= scale.mul_unreduced(v);
+                debug_assert!(under_omega[len.max(BASE_COEFFS)..].iter().all(|c| c.is_zero()));
+                let scale = omega.0 + omega.1;
+                for (j, (f, (c, &v))) in factored[..len]
+                    .iter_mut()
+                    .zip(cols_omega.iter().zip(&under_omega))
+                    .enumerate()
+                {
+                    if (derive && j == 1) || (*c == F128Unreduced::ZERO && v.is_zero()) {
+                        continue;
                     }
+                    *f ^= scale.mul_unreduced(c.reduce() + v);
                 }
             } else {
                 let (mut cols_omega, mut cols_act) =
@@ -1887,7 +1882,6 @@ impl<'a> State<'a> {
                     omega: &mut cols_omega,
                     act: &mut cols_act,
                     cert: &mut cert,
-                    scale: F128::ONE,
                     x1: true,
                 });
                 for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
