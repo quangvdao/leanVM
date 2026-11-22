@@ -694,25 +694,40 @@ fn add_times_pair(acc: &mut Acc, c: &[F128], pair: (F128, F128), x1: bool) {
 }
 
 /// [`pointer_pair`] when at most one chunk differs across the pair's words: the pointer and every shifted chain are
-/// then linear in `X`, through their values `phi` and `shifted(g)` at the two rows.
+/// then linear in `X`, through their values `phi(row)` and `shifted(g, row)` at the two rows. A term reads the second
+/// row only when it reaches past the constant coefficient, or its `X` coefficient is wanted.
 #[inline(always)]
 fn linear_pointer(
     acc: &mut Acc,
     coef: &[F128],
     groups: &[[F128; 2]],
     act: Option<(&mut Acc, &[F128])>,
-    phi: (F128, F128),
-    shifted: impl Fn(usize) -> (F128, F128),
+    phi: impl Fn(usize) -> F128,
+    shifted: impl Fn(usize, usize) -> F128,
     x1: bool,
 ) {
-    add_times_pair(acc, coef, phi, x1);
-    for (g, gc) in groups.iter().enumerate() {
-        if !(gc[0].is_zero() && gc[1].is_zero()) {
-            add_times_pair(acc, gc, shifted(g), x1);
+    let linear = |c: &[F128]| c.len() == 2 && !c[1].is_zero();
+    let live = !coef[0].is_zero() || linear(coef);
+    if live || act.is_some() {
+        let lo = phi(0);
+        let hi = if x1 || linear(coef) || act.is_some() {
+            phi(1)
+        } else {
+            F128::ZERO
+        };
+        if live {
+            add_times_pair(acc, coef, (lo, hi), x1);
+        }
+        if let Some((act_acc, c)) = act {
+            add_times_pair(act_acc, c, (lo, hi), true);
         }
     }
-    if let Some((act_acc, c)) = act {
-        add_times_pair(act_acc, c, phi, true);
+    for (g, gc) in groups.iter().enumerate() {
+        if !(gc[0].is_zero() && gc[1].is_zero()) {
+            let lo = shifted(g, 0);
+            let hi = if x1 || linear(gc) { shifted(g, 1) } else { F128::ZERO };
+            add_times_pair(acc, gc, (lo, hi), x1);
+        }
     }
 }
 
@@ -2067,16 +2082,16 @@ impl<'a> State<'a> {
             sums,
             |acc, coef, groups, act, x1| {
                 if varying.count_ones() <= 1 {
-                    let at = |sigma| points.split.at(sigma);
+                    let rows = [lo, hi];
                     linear_pointer(
                         acc,
                         coef,
                         groups,
                         act,
-                        (fold_words(lo, r, at), fold_words(hi, r, at)),
-                        |g| {
+                        |row| fold_words(rows[row], r, |sigma| points.split.at(sigma)),
+                        |g, row| {
                             let at = |sigma| points.split.at_shifted(&column.split_starts[g], sigma);
-                            (fold_words(lo, r, at), fold_words(hi, r, at))
+                            fold_words(rows[row], r, at)
                         },
                         x1,
                     )
