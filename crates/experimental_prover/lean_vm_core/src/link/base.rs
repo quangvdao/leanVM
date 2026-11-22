@@ -347,7 +347,7 @@ impl<'a> Base<'a> {
                         continue;
                     }
                     let (mut under, mut eq_blocks) = ([F128::ZERO; 4], [F128::ZERO; 5]);
-                    self.pair(&rows, k, true, &mut under, &mut eq_blocks);
+                    self.pair(&rows, k, true, true, &mut under, &mut eq_blocks);
                     if k < whole {
                         let s = w0 + w1;
                         for (f, &v) in factored.iter_mut().zip(&under) {
@@ -391,9 +391,9 @@ impl<'a> Base<'a> {
     }
 
     /// Add the pair `(2k, 2k + 1)`'s round polynomial: the `ω` blocks without their weight to `omega` when
-    /// `with_omega`, the others to `acc`.
+    /// `with_omega`, the others to `acc`. Without `x1`, the `X` coefficient added to `omega` may be anything.
     #[inline(always)]
-    pub fn pair(&self, rows: &Rows, k: usize, with_omega: bool, omega: &mut [F128], acc: &mut [F128]) {
+    pub fn pair(&self, rows: &Rows, k: usize, with_omega: bool, x1: bool, omega: &mut [F128], acc: &mut [F128]) {
         let eq = self.eq.as_ref().map(|e| (at(e, 2 * k), at(e, 2 * k + 1)));
         if self.folded.is_none() && rows.cols.first().is_some_and(|c| 2 * k + 1 - rows.start < c.len()) {
             self.pair_columns(rows, k, with_omega, eq, omega, acc);
@@ -410,17 +410,26 @@ impl<'a> Base<'a> {
                     if w.is_some_and(|w| w.0.is_zero() && w.1.is_zero()) {
                         continue;
                     }
+                    // A block that is its form alone puts the form's `X` coefficient only in the sum's, which
+                    // without `x1` is not wanted: its value at the second row is skipped.
+                    let exact = x1 || w.is_some() || block.gate.is_some();
                     let (mut c0, mut c1, mut c2) = (F128Unreduced::ZERO, F128Unreduced::ZERO, F128Unreduced::ZERO);
                     for &(f, l) in &block.products {
                         let (a0, a1, b0, b1) = (lo[f], hi[f], lo[l], hi[l]);
                         c0 ^= a0.mul_unreduced(b0);
-                        c1 ^= a1.mul_unreduced(b1);
+                        if exact {
+                            c1 ^= a1.mul_unreduced(b1);
+                        }
                         c2 ^= (a0 + a1).mul_unreduced(b0 + b1);
                     }
                     let f0 = lo[block.linear] + c0.reduce();
-                    let f1 = hi[block.linear] + c1.reduce();
                     let f2 = c2.reduce();
-                    add_block(out, w, block.gate.map(|g| (lo[g], hi[g])), [f0, f0 + f1 + f2, f2]);
+                    let mid = if exact {
+                        f0 + hi[block.linear] + c1.reduce() + f2
+                    } else {
+                        F128::ZERO
+                    };
+                    add_block(out, w, block.gate.map(|g| (lo[g], hi[g])), [f0, mid, f2]);
                 }
             })
         });
@@ -665,7 +674,7 @@ mod tests {
             for k in 0..explicit / 2 {
                 let mut under = [F128::ZERO; 4];
                 let window = base.window(2 * k, 2 * k + 2);
-                base.pair(&window.rows(), k, true, &mut under, &mut poly);
+                base.pair(&window.rows(), k, true, true, &mut under, &mut poly);
                 let (w0, w1) = (om[2 * k], om[2 * k] + om[2 * k + 1]);
                 for j in 0..5 {
                     poly[j] += at(&under, j) * w0 + if j > 0 { under[j - 1] * w1 } else { F128::ZERO };

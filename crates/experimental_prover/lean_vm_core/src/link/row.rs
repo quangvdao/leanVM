@@ -1842,7 +1842,8 @@ impl<'a> State<'a> {
             if let (Some(base), Some(rows)) = (&self.base, &base_rows) {
                 let with_omega = !is_zero_pair(omega) && self.base_first.is_none();
                 if with_omega || base.on_padding() {
-                    base.pair(rows, k, with_omega, &mut under_omega, acc);
+                    // Below `whole` with `derive`, the round leaves out the `X` coefficient of the terms under `ω`.
+                    base.pair(rows, k, with_omega, !(derive && k < whole), &mut under_omega, acc);
                 }
             }
             if is_zero_pair(omega) && 2 * k >= self.act.len() {
