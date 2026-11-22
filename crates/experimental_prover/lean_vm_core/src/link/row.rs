@@ -2235,7 +2235,7 @@ impl<'a> State<'a> {
                         for (j, o) in chunk.iter_mut().enumerate() {
                             let k = task * TASK_PAIRS * 16 + j;
                             let (a, b) = (at(v, 2 * k), at(v, 2 * k + 1));
-                            *o = a + x * (a + b);
+                            *o = if a == b { a } else { a + x * (a + b) };
                         }
                     });
                 })
