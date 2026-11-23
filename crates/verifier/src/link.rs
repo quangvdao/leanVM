@@ -10,7 +10,7 @@
 //! carry matrices of Binary Jolt's precompile link. The prover's side is `leanvm_core::link`.
 
 use crate::field::{E, ONE, ZERO};
-use crate::layout::{Access, BUS_BITS, GLOBAL_COLUMN_BASES, K_BITS, Layout, N_TABLES, gpow};
+use crate::layout::{Access, BUS_BITS, GLOBAL_COLUMN_BASES, K_BITS, Layout, N_TABLES, OP_DEREF, Read, Table, Y, gpow};
 use crate::multilinear::{eq_eval, eq_kernel, index_mle, log2_ceil, padding_weight};
 use crate::ring_switch::{RingClaim, RingPiece};
 use crate::transcript::{Transcript, grinding_bits, sumcheck};
@@ -226,12 +226,72 @@ fn round_coefficients(d: usize) -> (usize, usize) {
     ((d + 2).max(4) + 1, (d + 1).max(3) + 1)
 }
 
+/// What the program side weighs each opcode's slots by, per table `F` and slot `s`: on the rows' weight `ω`
+/// (`omega`, and `pc` for a slot read times `pc`), and on `ω·fp` (`frame`).
+pub struct SlotWeights {
+    pub omega: Vec<[E; 1 << BUS_BITS]>,
+    pub pc: Vec<[E; 1 << BUS_BITS]>,
+    pub frame: Vec<[E; 1 << BUS_BITS]>,
+}
+
+/// The program side's weights: the opcode on every row; each operand equation's slots under its first slot's
+/// challenge; and each access's reads of its instruction, under `η_mm·μ` and the address or word challenge.
+/// `gamma` is `(γ_addr, γ_word)`.
+pub fn slot_weights(tables: &[Table], slot: &[E], gamma: [E; 2], mu: &[Vec<E>], eta_mem: E, eta_bc: E) -> SlotWeights {
+    let zero = [ZERO; 1 << BUS_BITS];
+    let mut w = SlotWeights {
+        omega: vec![zero; tables.len()],
+        pc: vec![zero; tables.len()],
+        frame: vec![zero; tables.len()],
+    };
+    for (t, table) in tables.iter().enumerate() {
+        let links = &table.links;
+        w.omega[t][3] = eta_bc * slot[3];
+        for (slots, _) in &links.bytecode_link().operands {
+            for &s in slots {
+                w.omega[t][s] += eta_bc * slot[slots[0]];
+            }
+        }
+        for (access, &m) in links.memory.iter().zip(&mu[t]) {
+            let m = eta_mem * m;
+            if let Some((s, e)) = access.frame {
+                w.frame[t][s] += m * gamma[0] * gpow(e);
+            }
+            for read in &access.reads {
+                match *read {
+                    Read::Word { .. } => {}
+                    Read::Slot { slot, scale } => w.omega[t][slot] += m * gamma[1] * scale,
+                    Read::Frame { slot, scale } => w.frame[t][slot] += m * gamma[1] * scale,
+                    Read::Pc { slot, scale } => w.pc[t][slot] += m * gamma[1] * scale,
+                }
+            }
+        }
+    }
+    w
+}
+
+/// The `(opcode, slot)` pairs any table reads times `pc`.
+pub fn pc_slots(tables: &[Table]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for table in tables {
+        for access in &table.links.memory {
+            for read in &access.reads {
+                if let Read::Pc { slot, .. } = *read {
+                    out.push((table.opcode, slot));
+                }
+            }
+        }
+    }
+    debug_assert!(out.iter().all(|&(op, _)| op == OP_DEREF));
+    out
+}
+
 /// A table's row point and its non-pointer columns' values there, as local column and value.
 pub type TableValues = (Vec<E>, Vec<(usize, E)>);
 
 /// What the link leaves on the commitment, and where it read the program.
 pub struct LinkEnd {
-    /// The memory term at `r`: the memory's low point, each limb's scale, and the value.
+    /// The memory term at `r`, the word table there: the memory's low point, each limb's scale, and the value.
     pub memory: (Vec<E>, [E; 2], E),
     /// Per table, its row point and its non-pointer columns' values there, as local column and value.
     pub columns: Vec<TableValues>,
@@ -268,7 +328,11 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let theta = transcript.samples(N_TABLES);
     let tau = transcript.samples(n_rows);
     let gamma_state = transcript.samples(2);
-    let gamma_mem = transcript.samples(4);
+    // On the address, the word and the presence coordinate; a word `lo + y·hi` takes `γ_word·y` on its high limb.
+    let gamma_mem = {
+        let g = transcript.samples(3);
+        [g[0], g[1], g[1] * Y, g[2]]
+    };
     let mu: Vec<Vec<E>> = tables
         .iter()
         .map(|t| transcript.samples(t.links.memory.len()))
@@ -290,14 +354,25 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let (w_plus, spine, m1) = (sent[0], sent[1], sent[2]);
     let [plus, spine_coef, cert, jump_0, jump_1] = [0; 5].map(|_| transcript.sample());
     let below = |k: usize| product(r[k.min(width)..].iter().map(|&x| ONE + x));
-    let y_mem = gamma_mem[0] * index_mle(&r) + gamma_mem[3] * below(layout.log_memory) + m1;
+    let y_mem = gamma_mem[0] * index_mle(&r) + gamma_mem[3] * below(layout.log_memory) + gamma_mem[1] * m1;
     let bytecode_point = [&r[..layout.log_bytecode], &alpha[..]].concat();
-    let program = if transcript.checked() {
-        layout.bytecode.evaluate(&bytecode_point)?
-    } else {
-        ZERO
-    };
-    let x_bc = slot[1] * index_mle(&r) + below(layout.log_bytecode) * (slot[2] + program);
+    // The program side's targets at `r`: `X_ω` on the rows' weight, `P_fp` on `ω·fp`. Both weigh an instruction's
+    // slots by its opcode.
+    let weights = slot_weights(tables, &slot, [gamma_mem[0], gamma_mem[1]], &mu, eta_mem, eta_bc);
+    let (mut program, mut frame_program) = (ZERO, ZERO);
+    if transcript.checked() {
+        let split = layout.bytecode.split(&r[..layout.log_bytecode], &pc_slots(tables))?;
+        for t in 0..N_TABLES {
+            program += weights.omega[t][3] * gpow(t as u64) * split.count[t];
+            for s in 4..1 << BUS_BITS {
+                program += weights.omega[t][s] * split.slots[t][s] + weights.pc[t][s] * split.pc[t][s];
+                frame_program += weights.frame[t][s] * split.slots[t][s];
+            }
+        }
+    }
+    let below_bc = below(layout.log_bytecode);
+    let x_bc = eta_bc * slot[1] * index_mle(&r) + below_bc * (eta_bc * slot[2] + program);
+    let p_fp = below_bc * frame_program;
     let eq0_r = below(0);
     let claim = claim
         + w_plus * spine
@@ -333,15 +408,9 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
         let s_gamma = gamma_state[0] * values[state.pc] + gamma_state[1] * values[state.fp];
 
         // The base terms: the payload under ω, and JUMP's identities on every row.
+        // An access's committed part: its reads are the pointers' coefficients.
         let access_value = |a: &Access| {
-            gamma_mem[0] * a.address.evaluate(&values)
-                + gamma_mem[3]
-                + E::sum(
-                    a.values
-                        .iter()
-                        .zip(&gamma_mem[1..3])
-                        .map(|(v, &g)| g * v.evaluate(&values)),
-                )
+            gamma_mem[0] * a.address.evaluate(&values) + gamma_mem[3] + gamma_mem[1] * a.value.evaluate(&values)
         };
         let bc = links.bytecode_link();
         let r_bc = slot[1] * values[bc.pc]
@@ -350,8 +419,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
             + E::sum(
                 bc.operands
                     .iter()
-                    .enumerate()
-                    .map(|(i, f)| slot[4 + i] * f.evaluate(&values)),
+                    .map(|(slots, f)| slot[slots[0]] * f.evaluate(&values)),
             );
         let next = gamma_state[0] * state.next[0].evaluate(&values) + gamma_state[1] * state.next[1].evaluate(&values);
         let memory = E::sum(links.memory.iter().zip(&mu[t]).map(|(a, &m)| {
@@ -374,8 +442,18 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
                     coef += e * act * (eta_cover * eq_eval(&zeta, &r) + spine_coef * s_gamma);
                     shifts[0] += e * omega * plus;
                 }
-                1 => coef += e * omega * eta_bc * x_bc,
+                1 => coef += e * omega * (x_bc + values[state.fp] * p_fp),
                 _ => {
+                    // The word reads at this pointer weigh `word(r)`, the memory term.
+                    for (access, &m) in links.memory.iter().zip(&mu[t]) {
+                        for read in &access.reads {
+                            if let Read::Word { pointer: p, scale } = read
+                                && *p == pointer
+                            {
+                                coef += e * omega * eta_mem * m * gamma_mem[1] * m1 * scale.evaluate(&values);
+                            }
+                        }
+                    }
                     for (access, &m) in links.memory.iter().zip(&mu[t]).filter(|(a, _)| a.pointer == pointer) {
                         let gate = access.gate.map_or(ONE, |g| values[g]);
                         let c = e * omega * gate * eta_mem * m * y_mem;
@@ -414,11 +492,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     }
     let below_mem = below(layout.log_memory);
     Ok(LinkEnd {
-        memory: (
-            r[..layout.log_memory].to_vec(),
-            [gamma_mem[1] * below_mem, gamma_mem[2] * below_mem],
-            m1,
-        ),
+        memory: (r[..layout.log_memory].to_vec(), [below_mem, Y * below_mem], m1),
         columns,
         ring: RingClaim { pieces, slices },
         bytecode_point,

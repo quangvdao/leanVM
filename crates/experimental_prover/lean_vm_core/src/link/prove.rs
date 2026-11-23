@@ -154,7 +154,7 @@ pub(crate) struct Challenges {
     pub tau: Vec<F128>,
     /// On `pc`, `fp`.
     pub gamma_state: [F128; 2],
-    /// On the address, the two limbs and the presence coordinate.
+    /// On the address, the two limbs (`γ_word` and `γ_word·y`) and the presence coordinate.
     pub gamma_mem: [F128; 4],
     /// Per table, per access.
     pub mu: Vec<Vec<F128>>,
@@ -179,7 +179,9 @@ impl Challenges {
         let theta = ps.sample_vec(tables::N_TABLES);
         let tau = ps.sample_vec(m);
         let gamma_state = [ps.sample(), ps.sample()];
-        let gamma_mem = std::array::from_fn(|_| ps.sample());
+        // A word `lo + y·hi` takes `γ_word·y` on its high limb.
+        let [g_addr, g_word, g_pres] = std::array::from_fn(|_| ps.sample());
+        let gamma_mem = [g_addr, g_word, g_word * F128::Y, g_pres];
         let mu = plans.iter().map(|p| ps.sample_vec(p.links.memory.len())).collect();
         let alpha_bc = ps.sample_vec(crate::leaf::N_BYTECODE_SELECTORS);
         let zeta = ps.sample_vec(chunks.width);
@@ -211,7 +213,8 @@ struct Fresh {
     jump: [F128; 2],
 }
 
-/// `γ_0·addr + γ_pres + Σ_c γ_{c+1}·v_c` of one access, at weight `w`, into `form`.
+/// `γ_0·addr + γ_pres + Σ_c γ_{c+1}·v_c` of one access's committed part, at weight `w`, into `form`: its reads are
+/// the pointers' coefficients.
 fn access_form(access: &tables::Access, gamma: &[F128; 4], w: F128, form: &mut BusForm) {
     accumulate_form(&access.addr, w * gamma[0], 0, form);
     form.constant += w * gamma[3];
@@ -233,8 +236,8 @@ fn payload_forms(table: &dyn Table, plan: &Plan, ch: &Challenges, t: usize) -> (
     let bc = &links.bytecode;
     accumulate_form(&Coord::Col(bc.pc), ch.eta_bc * a[1], 0, &mut ungated);
     ungated.constant += ch.eta_bc * a[2] + (ch.eta_bc * a[3]).mul_base(bc.opcode);
-    for (i, operand) in bc.operands.iter().enumerate() {
-        accumulate_form(operand, ch.eta_bc * a[4 + i], 0, &mut ungated);
+    for (slots, operand) in &bc.operands {
+        accumulate_form(operand, ch.eta_bc * a[slots[0]], 0, &mut ungated);
     }
     let mut gated: Vec<BusForm> = plan.gates.iter().map(|_| BusForm::new(n)).collect();
     for (access, &mu) in links.memory.iter().zip(&ch.mu[t]) {
@@ -332,6 +335,105 @@ fn below_power(point: &[F128], k: usize) -> F128 {
     point[k.min(point.len())..].iter().map(|&x| F128::ONE + x).product()
 }
 
+/// What the program side weighs each opcode's slots by, per table and slot (`verifier::link::SlotWeights`): on the
+/// rows' weight `ω` (`omega`, and `pc` for a slot read times `pc`), and on `ω·fp` (`frame`).
+struct SlotWeights {
+    omega: Vec<[F128; 16]>,
+    pc: Vec<[F128; 16]>,
+    frame: Vec<[F128; 16]>,
+}
+
+impl SlotWeights {
+    fn new(plans: &[Plan], ch: &Challenges) -> Self {
+        let n = plans.len();
+        let mut w = Self {
+            omega: vec![[F128::ZERO; 16]; n],
+            pc: vec![[F128::ZERO; 16]; n],
+            frame: vec![[F128::ZERO; 16]; n],
+        };
+        let (a, gm) = (&ch.alpha_bc, &ch.gamma_mem);
+        for (t, plan) in plans.iter().enumerate() {
+            w.omega[t][3] = ch.eta_bc * a[3];
+            for (slots, _) in &plan.links.bytecode.operands {
+                for &s in slots {
+                    w.omega[t][s] += ch.eta_bc * a[slots[0]];
+                }
+            }
+            for (access, &mu) in plan.links.memory.iter().zip(&ch.mu[t]) {
+                let m = ch.eta_mem * mu;
+                if let Some((s, e)) = access.frame {
+                    w.frame[t][s] += (m * gm[0]).mul_base(primitives::field::g_pow(e as usize));
+                }
+                for read in &access.reads {
+                    match *read {
+                        tables::Read::Word { .. } => {}
+                        tables::Read::Slot { slot, scale } => w.omega[t][slot] += m * gm[1] * scale,
+                        tables::Read::Frame { slot, scale } => w.frame[t][slot] += m * gm[1] * scale,
+                        tables::Read::Pc { slot, scale } => w.pc[t][slot] += m * gm[1] * scale,
+                    }
+                }
+            }
+        }
+        w
+    }
+}
+
+/// A table's reads of the word at one pointer: `(constant + Σ c·col)·word(σ)` summed over its accesses under `μ`.
+struct WordReads {
+    pointer: usize,
+    constant: F128,
+    cols: Vec<(usize, F128)>,
+}
+
+/// Each pointer a table reads words at, with what it reads there under `scale·μ`.
+fn word_reads(plan: &Plan, mu: &[F128], scale: F128) -> Vec<WordReads> {
+    let mut out: Vec<WordReads> = Vec::new();
+    for (access, &mu) in plan.links.memory.iter().zip(mu) {
+        for read in &access.reads {
+            let tables::Read::Word {
+                pointer,
+                constant,
+                cols,
+            } = read
+            else {
+                continue;
+            };
+            let at = match out.iter().position(|w| w.pointer == *pointer) {
+                Some(at) => at,
+                None => {
+                    out.push(WordReads {
+                        pointer: *pointer,
+                        constant: F128::ZERO,
+                        cols: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            let w = &mut out[at];
+            w.constant += scale * mu * *constant;
+            for &(c, coef) in cols {
+                match w.cols.iter_mut().find(|(d, _)| *d == c) {
+                    Some((_, v)) => *v += scale * mu * coef,
+                    None => w.cols.push((c, scale * mu * coef)),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Where a pointer column of `2^n_vars` rows sits: its own block, or, for one riding a spare slot of `q_keccak`, that
+/// slot's rows of it (as `verifier::layout` places it).
+fn pointer_placement(layout: &Layout, col: usize, n_vars: usize) -> crate::witness::Placement {
+    match keccak_value(col) {
+        Some(KeccakLane::Slot(slot)) => {
+            let lane = layout.shape.mu - crate::pcs::LOG_BATCH;
+            layout.placements[crate::cpu::QKECCAK].rows(slot << n_vars, n_vars, lane)
+        }
+        _ => layout.placements[col],
+    }
+}
+
 /// What the link leaves: the memory claim and the table columns' claims at their row points, the pointer columns'
 /// ring-switched claim, and the Keccak reduction's claim on the permutation's output.
 pub(crate) struct LinkEnd {
@@ -354,6 +456,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
     let rows = layout.rows;
     let local = |t: usize| &columns[sch.base[t]..sch.base[t] + all[t].n_committed_columns()];
     let ch = Challenges::sample(ps, &plans, &taus, &chunks);
+    let weights = SlotWeights::new(&plans, &ch);
     let cycles: usize = rows.iter().sum();
     let log_mem = layout.placements[MEMORY_0].n_vars;
     // The program's columns, the opcode then the operand slots, from the stacked bytecode, whose slot
@@ -417,9 +520,9 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
         let cycles_at: Vec<_> = (0..tables::N_TABLES)
             .map(|t| pointer(t, plans[t].links.state.cycle))
             .collect();
-        let fill = |lens: [usize; 5]| {
+        let fill = |lens: [usize; 7]| {
             let arrays = lens.map(Scatter::new);
-            let [w_plus, spine, cover, w_mem, w_bc] = &arrays;
+            let [w_plus, spine, cover, w_mem, w_bc, v_word, w_fp] = &arrays;
             // Every table's cycles in one pass over the cycle-indexed arrays.
             let cycle_words: Vec<(Col<u64>, &[u32])> = cycles_at.iter().map(|(w, at)| (w.col(), &at[..])).collect();
             let targets = [(w_plus, 1), (spine, 0), (cover, 0)];
@@ -442,18 +545,41 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                         Some(g) => w.mul_base(cols[g][u]),
                     }
                 });
+                // The word reads: `γ_word·μ·scale(u)` at the pointer each reads, under `ω`.
+                let reads = word_reads(plan, &ch.mu[t], ch.gamma_mem[1]);
+                if !reads.is_empty() {
+                    let at: Vec<_> = reads.iter().map(|w| pointer(w.pointer)).collect();
+                    let entries: Vec<(Col<u64>, &[u32], usize)> =
+                        at.iter().map(|(words, at)| (words.col(), &at[..], 0)).collect();
+                    v_word.add_repeated_accesses::<MEMORY_SLOTS>(&chunks, &entries, |a, u| {
+                        let w = &reads[a];
+                        let scale = (w.cols.iter()).fold(w.constant, |acc, &(c, coef)| acc + coef.mul_base(cols[c][u]));
+                        scale * omega[u]
+                    });
+                }
                 let (bc, at) = pointer(plan.links.bytecode.pointer);
                 w_bc.add_repeated_words::<PROGRAM_SLOTS>(&chunks, bc.col(), &at, 0, |u| omega[u]);
+                let fp = cols[plan.links.state.fp];
+                w_fp.add_repeated_words::<PROGRAM_SLOTS>(&chunks, bc.col(), &at, 0, |u| omega[u].mul_base(fp[u]));
             }
             arrays
         };
         // Sized for an honest execution's indices: cycles and their successors, memory cells and bytecode
         // entries. An index past these makes the arrays again at the full `2^W`.
-        let mut arrays = fill([cycles + 1, cycles + 1, cycles + 1, 1 << log_mem, bytecode_size].map(|l| l.min(n)));
+        let lens = [
+            cycles + 1,
+            cycles + 1,
+            cycles + 1,
+            1 << log_mem,
+            bytecode_size,
+            1 << log_mem,
+            bytecode_size,
+        ];
+        let mut arrays = fill(lens.map(|l| l.min(n)));
         if arrays.iter().any(Scatter::overflowed) {
-            arrays = fill([n; 5]);
+            arrays = fill([n; 7]);
         }
-        let [w_plus, spine, cover, w_mem, w_bc] = arrays;
+        let [w_plus, spine, cover, w_mem, w_bc, v_word, w_fp] = arrays;
         let mut spine = spine.into_vec();
         if spine.len() <= cycles {
             spine.resize(cycles + 1, F128::ZERO);
@@ -464,11 +590,17 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
         let _tables = tracing::info_span!("Index tables").entered();
         // The memory and program tables are `g^j` terms past their cells and instructions: each is stored only as
         // far as the array it multiplies reaches, rounded to a power of two. `eq(ζ, ·)` is not stored at all.
-        let [w_plus, cover, w_mem, w_bc] = [w_plus, cover, w_mem, w_bc].map(Scatter::into_vec);
+        let [w_plus, cover, w_mem, w_bc, v_word, w_fp] =
+            [w_plus, cover, w_mem, w_bc, v_word, w_fp].map(Scatter::into_vec);
         let reach = |own: usize, partner: usize| own.max(partner).max(1).next_power_of_two().min(n);
         let (mem_len, bc_len) = (reach(1 << log_mem, w_mem.len()), reach(bytecode_size, w_bc.len()));
         let gm = ch.gamma_mem;
         let mem = &columns[MEMORY_0..=MEMORY_1];
+        // The word table, `lo + y·hi` per cell: the two memory columns' limbs as they are.
+        let words = {
+            let (m0, m1) = (mem[0].window(0, 1 << log_mem), mem[1].window(0, 1 << log_mem));
+            tabulate(1 << log_mem, |j| F128::new(m0[j].0, m1[j].0))
+        };
         // Each task reads its memory cells as one run of each column.
         let cells = |r: std::ops::Range<usize>| {
             let (start, end) = (r.start.min(1 << log_mem), r.end.min(1 << log_mem));
@@ -484,14 +616,36 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                 y.reduce()
             }
         });
+        // The program side's targets: `X_ω` under the rows' weight and `P_fp` under `ω·fp`, each weighing an
+        // instruction's slots by its opcode.
         let a = &ch.alpha_bc;
+        let (x_g, x_one) = (ch.eta_bc * a[1], ch.eta_bc * a[2]);
+        let reads_pc: Vec<bool> = (weights.pc.iter()).map(|w| w.iter().any(|c| !c.is_zero())).collect();
         let x_bc = tabulate_powers(bc_len, |j, g_j| {
-            let mut x = a[1].mul_base_unreduced(g_j);
+            let mut x = x_g.mul_base_unreduced(g_j);
             if j < bytecode_size {
+                let op = program[0][j].0.trailing_zeros() as usize;
+                let w = &weights.omega[op];
                 for (s, column) in program.iter().enumerate() {
-                    x ^= a[3 + s].mul_base_unreduced(column[j]);
+                    x ^= w[3 + s].mul_base_unreduced(column[j]);
                 }
-                return x.reduce() + a[2];
+                let mut x = x.reduce() + x_one;
+                if reads_pc[op] {
+                    let p = &weights.pc[op];
+                    for (s, column) in program.iter().enumerate().skip(1) {
+                        x += p[3 + s].mul_base(g_j * column[j]);
+                    }
+                }
+                return x;
+            }
+            x.reduce()
+        });
+        let p_fp = tabulate(reach(bytecode_size, w_fp.len()).min(bytecode_size), |j| {
+            let op = program[0][j].0.trailing_zeros() as usize;
+            let w = &weights.frame[op];
+            let mut x = F128::ZERO.mul_base_unreduced(F64::ZERO);
+            for (s, column) in program.iter().enumerate().skip(1) {
+                x ^= w[3 + s].mul_base_unreduced(column[j]);
             }
             x.reduce()
         });
@@ -522,7 +676,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             w_bc.into(),
             Array {
                 head: x_bc,
-                tail: powers(a[1]),
+                tail: powers(x_g),
             },
             Array {
                 head: Vec::new(),
@@ -530,6 +684,10 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             },
             vec![F128::ONE].into(),
             vec![payload].into(),
+            v_word.into(),
+            words.into(),
+            w_fp.into(),
+            p_fp.into(),
         ];
         let terms = [
             Term::Product {
@@ -543,7 +701,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                 b: 4,
             },
             Term::Product {
-                coef: ch.eta_bc,
+                coef: F128::ONE,
                 a: 5,
                 b: 6,
             },
@@ -558,6 +716,16 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                 b: 1,
             },
             Term::Single { coef: F128::ONE, a: 9 },
+            Term::Product {
+                coef: ch.eta_mem,
+                a: 10,
+                b: 11,
+            },
+            Term::Product {
+                coef: F128::ONE,
+                a: 12,
+                b: 13,
+            },
         ];
         let _rounds = tracing::info_span!("Index rounds").entered();
         index::prove(width, arrays, &terms, &mut |poly| {
@@ -572,12 +740,15 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
     let r_mem = &r[..log_mem];
     let below_mem = below_power(r, log_mem);
     let mem_values = mle_eval_cols(&columns[MEMORY_0..=MEMORY_1], r_mem);
-    let m1: F128 = (0..2).map(|c| ch.gamma_mem[1 + c] * mem_values[c]).sum::<F128>() * below_mem;
+    // The word table at `r`.
+    let m1 = (mem_values[0] + F128::Y * mem_values[1]) * below_mem;
     let y_mem_r = index_end.values[4];
     let x_bc_r = index_end.values[6];
+    let p_fp_r = index_end.values[13];
+    debug_assert_eq!(index_end.values[11], m1);
     debug_assert_eq!(
         y_mem_r,
-        ch.gamma_mem[0] * index_mle(r) + ch.gamma_mem[3] * below_mem + m1
+        ch.gamma_mem[0] * index_mle(r) + ch.gamma_mem[3] * below_mem + ch.gamma_mem[1] * m1
     );
     #[cfg(test)]
     let m1 = m1 + cheat::MEMORY_TERM.get();
@@ -614,6 +785,25 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             let s = &plan.links.state;
             let mut aux_tail = vec![g_pc.mul_base(pad[s.pc]) + g_fp.mul_base(pad[s.fp])];
             aux_tail.extend(plan.gates.iter().map(|&g| F128::from(pad[g])));
+            // `fp`, the coefficient of the program side's `P_fp`, then each pointer's word reads' column part.
+            let fp_aux = aux.len();
+            aux.push(tabulate(ex, |u| F128::from(cols[s.fp][u])));
+            aux_tail.push(F128::from(pad[s.fp]));
+            let reads = word_reads(plan, &ch.mu[t], F128::ONE);
+            let mut read_aux = Vec::with_capacity(reads.len());
+            for w in &reads {
+                if w.cols.is_empty() {
+                    read_aux.push(None);
+                    continue;
+                }
+                read_aux.push(Some(aux.len()));
+                let at = |row: &dyn Fn(usize) -> F64| {
+                    w.cols.iter().fold(F128::ZERO, |acc, &(c, k)| acc + k.mul_base(row(c)))
+                };
+                aux.push(tabulate(ex, |u| at(&|c| cols[c][u])));
+                aux_tail.push(at(&|c| pad[c]));
+            }
+            let word_coef = ch.eta_mem * ch.gamma_mem[1] * m1;
             let mut row_columns = Vec::with_capacity(plan.pointers.len());
             for (k, &pointer) in plan.pointers.iter().enumerate() {
                 let (omega, act, shifts) = match k {
@@ -628,8 +818,25 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                             weights: vec![(1, F128::ONE)],
                         }],
                     ),
-                    1 => (Coef::constant(ch.eta_bc * x_bc_r), Coef::ZERO, Vec::new()),
-                    _ => plan.access_coefs(pointer, &ch.mu[t], ch.eta_mem * y_mem_r),
+                    1 => (
+                        Coef {
+                            constant: x_bc_r,
+                            aux: Some((fp_aux, p_fp_r)),
+                        },
+                        Coef::ZERO,
+                        Vec::new(),
+                    ),
+                    _ => {
+                        let (mut omega, act, shifts) = plan.access_coefs(pointer, &ch.mu[t], ch.eta_mem * y_mem_r);
+                        if let Some(i) = reads.iter().position(|w| w.pointer == pointer) {
+                            omega.constant += word_coef * reads[i].constant;
+                            if let Some(a) = read_aux[i] {
+                                assert!(omega.aux.is_none(), "a gated pointer reads no word");
+                                omega.aux = Some((a, word_coef));
+                            }
+                        }
+                        (omega, act, shifts)
+                    }
                 };
                 row_columns.push(RowColumn {
                     words: cols[pointer].words(),
@@ -639,7 +846,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                     shifts,
                     cert: ch.eps[q].iter().map(|&e| fresh.cert * e).collect(),
                     q,
-                    piece_log: layout.placements[sch.base[t] + pointer].piece_vars,
+                    piece_log: pointer_placement(layout, sch.base[t] + pointer, taus[t]).piece_vars,
                 });
                 q += 1;
             }
@@ -714,7 +921,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             }
             // A split column (the band layout) is its pieces, each at the low end of the row point. The row side's
             // per-piece bit-slices are the opening's first projection of the piece's lane onto them.
-            let placement = &layout.placements[sch.base[t] + pointer];
+            let placement = &pointer_placement(layout, sch.base[t] + pointer, taus[t]);
             let lane = layout.shape.mu - crate::pcs::LOG_BATCH;
             let weights = primitives::multilinear::eq_table_serial(&point[placement.piece_vars..]);
             for ((offset, &weight), slices) in placement.piece_offsets(lane).zip(&weights).zip(&end.pieces) {
@@ -731,7 +938,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
     ps.add_scalars(&slices);
     let memory = StackClaim::Sum {
         parts: (MEMORY_0..=MEMORY_1)
-            .map(|c| layout.placements[c].sum_part(r_mem.to_vec(), ch.gamma_mem[1 + c - MEMORY_0] * below_mem))
+            .map(|c| layout.placements[c].sum_part(r_mem.to_vec(), [F128::ONE, F128::Y][c - MEMORY_0] * below_mem))
             .collect(),
         value: m1,
     };
