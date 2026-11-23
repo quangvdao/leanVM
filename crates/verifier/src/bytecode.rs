@@ -189,19 +189,34 @@ impl Bytecode {
                 .collect()
         };
         let step = (0..low.len()).fold(K(2), |g, _| g * g);
+        // A block's sums are taken at its positions alone, then weighed by the block once.
         let mut g_block = K(1);
+        let mut local = Split {
+            count: vec![ZERO; ops],
+            slots: vec![[ZERO; 1 << BUS_BITS]; ops],
+            pc: vec![[ZERO; 1 << BUS_BITS]; ops],
+        };
         for (block, &weight) in self.groups.iter().zip(&high_weights) {
             for group in block {
                 let (op, s) = (group.op as usize, group.slot as usize);
                 let sum = E::sum(group.at.iter().map(|&i| low_weights[i as usize]));
                 if s == 3 {
-                    split.count[op] += weight * sum;
+                    local.count[op] += sum;
                     continue;
                 }
-                split.slots[op][s] += weight * (sum * group.word);
+                local.slots[op][s] += sum * group.word;
                 if wanted[op] >> s & 1 == 1 {
-                    let sum = E::sum(group.at.iter().map(|&i| low_pc[i as usize]));
-                    split.pc[op][s] += (weight * g_block) * (sum * group.word);
+                    local.pc[op][s] += E::sum(group.at.iter().map(|&i| low_pc[i as usize])) * group.word;
+                }
+            }
+            let weight_pc = weight * g_block;
+            for op in 0..ops {
+                split.count[op] += weight * std::mem::replace(&mut local.count[op], ZERO);
+                for s in 4..1 << BUS_BITS {
+                    split.slots[op][s] += weight * std::mem::replace(&mut local.slots[op][s], ZERO);
+                    if wanted[op] >> s & 1 == 1 {
+                        split.pc[op][s] += weight_pc * std::mem::replace(&mut local.pc[op][s], ZERO);
+                    }
                 }
             }
             g_block = g_block * step;
