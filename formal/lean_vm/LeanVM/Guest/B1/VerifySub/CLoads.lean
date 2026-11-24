@@ -7,6 +7,8 @@
 module
 
 public import LeanVM.Guest.B1.VerifySub.CSig
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_sub»
 
 /-!
 # The loads' regions
@@ -35,36 +37,81 @@ theorem vs_ringCoefficients_length (f g : List E) (hf : f.length = 8) (hg : g.le
   rw [ringCoefficients_eq hf]
   simp [List.length_flatMap, hg]
 
+/-- The inlined grinds' table reads' pointers: the tables' first word and the windows' heads. -/
+def vsGPtrs (o : ℕ) : List V := .n (o + gcW 15 + 5) :: (List.range (gcW 15)).map fun i ↦ .n (o + gcW 15 + 9 * (i + 1) + 4)
+
+theorem vsSPg_loads : (vsSPg1.all fun a ↦ match a with
+      | .load _ p off => decide (off = winTabAt) && decide (p ∈ vsGPtrs 301) | _ => true) = true ∧
+    (vsSPg2.all fun a ↦ match a with
+      | .load _ p off => decide (off = winTabAt) && decide (p ∈ vsGPtrs 653) | _ => true) = true ∧
+    gcW 13 = gcW 15 := by
+  decide +kernel
+
+/-- **The inlined grinds' table reads land in the window table**: at `g_squares · g^e`,
+`e < 2^11`, offset `winTabAt`. -/
+theorem vs_gloads {rd : Reader} {w : ℕ → E} {args : List E} (D : VsSecData rd w args) {a : Atom}
+    (ha : a ∈ vsSPg1 ∨ a ∈ vsSPg2) {d p : V} {off : ℕ} (he : a = .load d p off) :
+    off = winTabAt ∧ ∃ e < 2 ^ 11, vsσ rd w args p = args.getD 4 0 * gen ^ e := by
+  subst he
+  have hrc := gcRc_of_lowDef (by have := D.hκ; omega) D.hlow
+  have ht : WinTabs rd (vsσ rd w args (.n (val% «verify_sub» "g_squares")) * gen ^ winTabAt) := by
+    rw [vs_param4 (rd := rd) (w := w) D.hl]; exact D.hwt
+  obtain ⟨h1, h2, hW⟩ := vsSPg_loads
+  rcases ha with ha | ha
+  · have hc := List.all_eq_true.mp h1 _ ha
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hc
+    refine ⟨hc.1, ?_⟩
+    have c1 := (vs_ood (rd := rd) (w := w) D.hl D.hws).2.1
+    obtain ⟨p0, pi⟩ := gcInlineO_ptrs_of_good (by decide) (by decide) (by decide) (vsOodGrind_good D.hl)
+      (by decide +kernel) hrc ht (fun j hj ↦ by rw [c1]; exact D.hgw1 j hj)
+    rw [vs_param4 (rd := rd) (w := w) D.hl] at p0 pi
+    simp only [vsGPtrs, List.mem_cons, List.mem_map, List.mem_range] at hc
+    rcases hc.2 with rfl | ⟨i, hi, rfl⟩
+    · exact p0
+    · exact pi i hi
+  · have hc := List.all_eq_true.mp h2 _ ha
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hc
+    refine ⟨hc.1, ?_⟩
+    have c1 := (vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce).2.1
+    obtain ⟨p0, pi⟩ := gcInlineO_ptrs_of_good (by decide) (by decide) (by decide) (vsRingGrind_good D.hl)
+      (by decide +kernel) hrc ht (fun j hj ↦ by rw [c1]; exact D.hgw2 j hj)
+    rw [vs_param4 (rd := rd) (w := w) D.hl] at p0 pi
+    simp only [vsGPtrs, List.mem_cons, List.mem_map, List.mem_range] at hc
+    rcases hc.2 with rfl | ⟨i, hi, rfl⟩
+    · rw [← hW]; exact p0
+    · rw [← hW] at hi ⊢; exact pi i hi
+
 /-- **Every load reads the caller's words or the own buffers.** -/
 theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Digest}
     {c : Child} (S : ChildSegs bytecode seed c) (b sqE outE : ℕ) {Lin : Main.Layout}
     (hexp : ∀ q ∈ vsExpLin sqE, q ∈ Lin) (hout : (outE, DeferredBytecodeClaim.cells c.freshClaim) ∈ Lin)
-    {outs : List (List E × Main.Layout)} (O : VsOuts S (bases b (vsSizes S.d)) sqE outs)
-    {rd : Reader} (hB : Main.MemL rd (bufL b (vsSizes S.d) S.ownW)) :
+    {outs : List (List E × Main.Layout)} (O : VsOuts S (bases b (vsSizes)) sqE outs)
+    {rd : Reader} (hB : Main.MemL rd (bufL b (vsSizes) S.ownW))
+    (D : VsSecData rd (vsW S.gw (bases b (vsSizes)) outs) (vsArgs seed c sqE outE)) :
     ∀ q ∈ vsCPre.filterMap Stmt.loadS, ∃ i,
-      (vsσ rd (vsW (bases b (vsSizes S.d)) outs) (vsArgs seed c sqE outE) q.1).limb 0 *
+      (vsσ rd (vsW S.gw (bases b (vsSizes)) outs) (vsArgs seed c sqE outE) q.1).limb 0 *
           addressOfIndex q.2 = addressOfIndex i ∧
-        (Main.RegionL Lin i ∨ Main.RegionL (bufL b (vsSizes S.d) S.ownW) i) := by
-  set bs := bases b (vsSizes S.d) with hbs
-  set w := vsW bs outs with hw
+        (Main.RegionL Lin i ∨ Main.RegionL (bufL b (vsSizes) S.ownW) i) := by
+  set bs := bases b (vsSizes) with hbs
+  set w := vsW S.gw bs outs with hw
   set σ := vsσ rd w (vsArgs seed c sqE outE) with hσ
   have hl : (vsArgs seed c sqE outE).length = 6 := rfl
   -- the regions
   have hown : ∀ i < 15, ∀ k < (S.ownW.getD i []).length,
-      Main.RegionL Lin (bs.getD i 0 + k) ∨ Main.RegionL (bufL b (vsSizes S.d) S.ownW) (bs.getD i 0 + k) :=
+      Main.RegionL Lin (bs.getD i 0 + k) ∨ Main.RegionL (bufL b (vsSizes) S.ownW) (bs.getD i 0 + k) :=
     fun i hi k hk ↦ Or.inr (subOf_region (S.sub_own b hi) (Nat.le_add_right _ _) (by
       show _ < vb bs i + _; simp only [vb]; omega))
   have hlin : ∀ x xs, (x, xs) ∈ Lin → ∀ k < xs.length,
-      Main.RegionL Lin (x + k) ∨ Main.RegionL (bufL b (vsSizes S.d) S.ownW) (x + k) :=
+      Main.RegionL Lin (x + k) ∨ Main.RegionL (bufL b (vsSizes) S.ownW) (x + k) :=
     fun x xs h k hk ↦ Or.inl ⟨(x, xs), h, by simp, by simp; omega⟩
   have hstr : ∀ k < (vsStreamW c.proof.stream).length,
-      Main.RegionL Lin (bs.getD 1 0 + k) ∨ Main.RegionL (bufL b (vsSizes S.d) S.ownW) (bs.getD 1 0 + k) :=
+      Main.RegionL Lin (bs.getD 1 0 + k) ∨ Main.RegionL (bufL b (vsSizes) S.ownW) (bs.getD 1 0 + k) :=
     hown 1 (by norm_num)
   have pa : ∀ {i a : ℕ}, i < 15 → vsAllocVars.getD i 0 = a → σ (.n a) = ptr (bs.getD i 0) :=
     fun hi ha ↦ by
       rw [hσ, vs_w hl (by rw [← ha]; exact vs_allocVars_w _ (vsAllocVars_idx _ hi).1)]
       exact vsW_a hi ha
-  have pr : ∀ {j k a : ℕ}, j < 16 → k < (vsRetVars.getD j []).length →
+  have pr : ∀ {j k a : ℕ}, j < 14 → k < (vsRetVars.getD j []).length →
       (vsRetVars.getD j []).getD k 0 = a → a ∈ vsWVars → σ (.n a) = (outs.getD j ([], [])).1.getD k 0 :=
     fun hj hk ha hw' ↦ by rw [hσ, vs_w hl hw']; exact vsW_r hj hk ha
   -- the stream's length
@@ -79,19 +126,19 @@ theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Di
   have hSl0 := vs_streamW_length c.proof.stream
   have hSl0' : 8192 ≤ (vsStreamW c.proof.stream).length := hSl0
   -- the pointers
-  have h64 : σ (.n 64) = gen ^ S.rate := by
+  have h64 : σ (.n (val% «verify_sub» "rate_sel~0")) = gen ^ S.rate := by
     rw [pr (j := 0) (k := 0) (a := 64) (by norm_num) (by decide) rfl (by decide), O.o0]; rfl
-  have h72 : σ (.n 72) = gen ^ S.logMem := by
+  have h72 : σ (.n (val% «verify_sub» "g_log_mem")) = gen ^ S.logMem := by
     rw [pr (j := 1) (k := 0) (a := 72) (by norm_num) (by decide) rfl (by decide), O.o1]; rfl
-  have hp4 : σ (.n 4) = ptr sqE := vsC_param hl (by norm_num)
-  have hp5 : σ (.n 5) = ptr outE := vsC_param hl (by norm_num)
+  have hp4 : σ (.n (val% «verify_sub» "g_squares")) = ptr sqE := vsC_param hl (by norm_num)
+  have hp5 : σ (.n (val% «verify_sub» "defer_out")) = ptr outE := vsC_param hl (by norm_num)
   obtain ⟨-, -, -, -, -, -, -, -, h84, h85, h86⟩ :=
     vs_sizesV (rd := rd) (w := w) (args := vsArgs seed c sqE outE) hl S.hr1 S.hlm1
       (by rw [← h64, hσ, vs_w hl (by decide)]) (by rw [← h72, hσ, vs_w hl (by decide)])
   rw [← hσ] at h84 h85 h86
   have hdims : ReadsAt rd (w 71) (vsDimsW S.logMem S.hs) := by
     rw [hw, vsW_a (i := 3) (a := 71) (by norm_num) rfl]; exact (hB _ (vs_own_mem S b (i := 3) (by norm_num)))
-  have hkb : ∀ s < 8, σ (.n (84 + s)) = gen ^ ([0, S.logMem] ++ S.hs).getD s 0 := by
+  have hkb : ∀ s < 8, σ (.n ((val% «verify_sub» "kb[0]") + s)) = gen ^ ([0, S.logMem] ++ S.hs).getD s 0 := by
     intro s hs
     rw [← S.kb_pow hbl hs]
     rcases s with _ | _ | t
@@ -100,14 +147,14 @@ theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Di
     · rw [show 84 + (t + 2) = 86 + t by omega, h86 t (by omega),
         vs_rdAt_of_load (vs_rdg hdims (k := 1 + t) (by simp [vsDimsW, S.hs_length]; omega))]
       simp only [vsDimsW, List.getD_cons_succ, show 1 + t = t + 1 by omega]
-  have h595 : σ (.n 578) = ptr (S.cK bs + S.xsK.length) := by
-    rw [pr (j := 11) (k := 5) (a := 578) (by norm_num) (by decide) rfl (by decide), O.o11, vs_ptr_add]
+  have h595 : σ (.n (val% «verify_sub» "cursor@4")) = ptr (S.cK bs + S.xsK.length) := by
+    rw [pr (j := 10) (k := 5) (a := 630) (by norm_num) (by decide) rfl (by decide), O.o10, vs_ptr_add]
     simp only [capOf, List.cons_append, List.nil_append, List.getD_cons_succ, List.getD_cons_zero]
-  have h582 : σ (.n 565) = ptr (S.cT bs + (13 + (3 * S.nT + 1))) := by
-    rw [pr (j := 10) (k := 9) (a := 565) (by norm_num) (by decide) rfl (by decide), O.o10, vs_ptr_add]
+  have h582 : σ (.n (val% «verify_sub» "col_eval_words")) = ptr (S.cT bs + (13 + (3 * S.nT + 1))) := by
+    rw [pr (j := 9) (k := 9) (a := 617) (by norm_num) (by decide) rfl (by decide), O.o9, vs_ptr_add]
     simp only [Tables.VtHonest.retsH, Fs.squeeze, capOf, List.cons_append, List.nil_append,
       List.getD_cons_succ, List.getD_cons_zero]
-    rw [show ofK (addressOfIndex (S.vtB bs sqE (S.leavesB (outs.take 10))).cur) = ptr (S.cT bs)
+    rw [show ofK (addressOfIndex (S.vtB bs sqE (S.leavesB (outs.take 9))).cur) = ptr (S.cT bs)
       from rfl, mul_assoc, mul_assoc, ← pow_succ', ← pow_add]
     rfl
   have hcl : (DeferredBytecodeClaim.cells c.freshClaim).length = 24 := by
@@ -120,7 +167,7 @@ theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Di
     simp only [ChildSegs.cK, ChildSegs.cT, ChildSegs.cG, vb]; omega
   have own : ∀ {i a : ℕ}, i < 15 → vsAllocVars.getD i 0 = a → ∀ k < (S.ownW.getD i []).length,
       ∃ j, (σ (.n a)).limb 0 * addressOfIndex k = addressOfIndex j ∧
-        (Main.RegionL Lin j ∨ Main.RegionL (bufL b (vsSizes S.d) S.ownW) j) :=
+        (Main.RegionL Lin j ∨ Main.RegionL (bufL b (vsSizes) S.ownW) j) :=
     fun hi ha k hk ↦ vs_regAt (pa hi ha) (hown _ hi k hk)
   -- the loads
   intro q hq
@@ -134,7 +181,7 @@ theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Di
       obtain ⟨l, hl', ha⟩ := List.mem_flatten.1 (vs_side_mem hs rfl)
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hl'
       rcases hl' with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl |
-        rfl | rfl | rfl
+        rfl | rfl | rfl | rfl | rfl
       · obtain ⟨k, hk, he⟩ := List.mem_map.1 ha
         simp only [Atom.load.injEq] at he
         obtain ⟨-, rfl, rfl⟩ := he
@@ -234,6 +281,14 @@ theorem vs_loads {bytecode : List K} (hbl : bytecode.length = 2 ^ 23) {seed : Di
       · simp only [vsSPlast, List.mem_cons, List.not_mem_nil, or_false, Atom.load.injEq] at ha
         obtain ⟨-, rfl, rfl⟩ := ha
         exact vs_regAt hp5 (hlin _ _ hout _ (by omega))
+      all_goals
+        obtain ⟨hoff, e, he, hp⟩ := vs_gloads D (by first | exact Or.inl ha | exact Or.inr ha) rfl
+        subst hoff
+        refine vs_regAt (x := sqE + e) (by rw [hσ, hp, show (vsArgs seed c sqE outE).getD 4 0 = ptr sqE
+          from rfl, vs_ptr_add]) ?_
+        rw [Nat.add_assoc]
+        exact hlin sqE expTabAllWords (hexp _ (by unfold vsExpLin; exact List.mem_singleton_self _)) _
+          (by rw [length_expTabAllWords]; show e + 236 < _; omega)
     | _ => simp [Stmt.loadS] at hq'
   | _ => simp [Stmt.loadS] at hq'
 

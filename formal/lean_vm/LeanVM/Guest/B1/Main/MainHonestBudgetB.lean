@@ -26,7 +26,7 @@ public import LeanVM.Guest.Data.NameStrings
 (G7-cnt's certificates): `SB g` bounds every valid tree of a static callee `g`
 (`TotalLe`), a static loop helper `g`'s run `iterK fs SK g` words per iteration and its phantom
 frame `fs g` once (`TotalLeOn … LoopPre`).
-`mainBsH`: the non-static callees' bounds (`clB`, `hDvB`, `aggB`, `l5B` with `ccB`), `Bmain`:
+`mainBsH`: the non-static callees' bounds (`clB`, `hDvB`, `aggB`, `l5B` with `ccBM`), `Bmain`:
 `main`'s, `mainBH` at those. `main_honest_budgetB`: `main` within `Bmain`, its callees' trees
 `mainPredsH`, each non-static one within its bound (`MainPreds.withTotal`).
 -/
@@ -44,13 +44,13 @@ structure MainStatics (fs : String → ℕ) (SB SK : String → ℕ) : Prop wher
   main : MainStaticsMain fs SB SK
   dv : Da.DvStaticB fs SB SK
   ls : TotalLe coreProgram fs "list_split" (fun _ => SB "list_split")
-  l15 : TotalLeOn coreProgram fs name% «claim_list_digest_loop0» LoopPre
-    (fun a => logG (a.getD 1 0) * iterK fs SK name% «claim_list_digest_loop0» + fs
-        name% «claim_list_digest_loop0»)
-  l16 : TotalLeOn coreProgram fs name% «claim_list_digest_loop1» LoopPre
-    (fun a => logG (a.getD 1 0) * iterK fs SK name% «claim_list_digest_loop1» + fs
-        name% «claim_list_digest_loop1»)
-  cl : ∀ j < 17, TotalLe coreProgram fs B1.Digest.clNames[j]! (fun _ => SB B1.Digest.clNames[j]!)
+  l15 : TotalLeOn coreProgram fs name% «claim_list_chain_loop0» LoopPre
+    (fun a => logG (a.getD 1 0) * iterK fs SK name% «claim_list_chain_loop0» + fs
+        name% «claim_list_chain_loop0»)
+  l16 : TotalLeOn coreProgram fs name% «claim_list_chain_loop1» LoopPre
+    (fun a => logG (a.getD 1 0) * iterK fs SK name% «claim_list_chain_loop1» + fs
+        name% «claim_list_chain_loop1»)
+  cl : TotalLe coreProgram fs "claim_list_tail" (fun _ => SB "claim_list_tail")
   l25 : TotalLeOn coreProgram fs name% «aggregate_claims_loop0» LoopPre
     (fun a => logG (a.getD 1 0) * iterK fs SK name% «aggregate_claims_loop0» + fs
         name% «aggregate_claims_loop0»)
@@ -61,17 +61,16 @@ structure MainStatics (fs : String → ℕ) (SB SK : String → ℕ) : Prop wher
     (fun a => logG (a.getD 1 0) * iterK fs SK name% «aggregate_claims_loop2» + fs
         name% «aggregate_claims_loop2»)
   bs : TotalLe coreProgram fs "batch_sumcheck__L23" (fun _ => SB "batch_sumcheck__L23")
-  gr : TotalLe coreProgram fs "grind_check__L2" (fun _ => SB "grind_check__L2")
 
 /-- **The bounds of `main`'s non-static callees** on the honest run: its claim lists' digests
 (`clB`), `da_verify` (`hDvB`), `aggregate_claims` (`aggB`), the children's loop (`l5B`, each
-child's claim lists' digests within `ccB`, child `c`'s `verify_sub` within `Bv c`). -/
+child's claim lists' digests within `ccBM`, child `c`'s `verify_sub` within `Bv c`). -/
 def mainBsH (fs : String → ℕ) (SB SK : String → ℕ) (Bv : ℕ → ℕ) (s : NodeStatement) (w : NodeWitness) :
     MainBs :=
   ⟨B1.Digest.clB fs SB SK s.claims.xmss.length, B1.Digest.clB fs SB SK s.claims.sphincs.length,
     hDvB fs SB SK w, aggB fs SB SK w.children.length,
-    l5B fs SB (fun c => B1.Digest.ccB fs SB (hKid s w c).ex) (fun c => B1.Digest.ccB fs SB (hKid s w c).es)
-      Bv w⟩
+    l5B fs SB (fun c => B1.Digest.ccBM fs SB (hMonoX s w c) (hKid s w c).ex)
+      (fun c => B1.Digest.ccBM fs SB (hMonoS s w c) (hKid s w c).es) Bv w⟩
 
 /-- **`main`'s words on the honest run** at `fp`: its frame and buffers, `exponent_tables`', every
 other callee's bound (`mBs`, `kidsBoundL` over `mKids`). -/
@@ -92,12 +91,12 @@ theorem mainGoalsTB_honest {SB SK : String → ℕ} {Pvs : ℕ → Tree → Prop
   ⟨mainGoalClXTB fs cert fp seed s w hl hS.ls hS.l15 hS.l16 hS.cl,
     mainGoalClSTB fs cert fp seed s w hl hS.ls hS.l15 hS.l16 hS.cl,
     mainGoalDvTB fs cert fp hr hrf hS.dv,
-    mainGoalAgTB fs fp cert SB SK hS.gr hS.l25 hS.l26 hS.l27 hS.bs hbl hr hl,
+    mainGoalAgTB fs fp cert SB SK hS.l25 hS.l26 hS.l27 hS.bs hbl hr hl,
     mainGoalL5TB fs cert SB hS.main.st hbl hr hl hV (childListGoalsTB_honest cert hl hS.ls)⟩
 
 /-- **`main`'s completeness on the honest run within its words**: for `NodeRelation` within `Limits`
 and a bytecode of `2^23` words, from the signature schemes' completeness (B1-e), the frame runs'
-certificate facts, the static bounds (`MainStatics`, `grind_check__L2`'s among them), and child `c`'s `verify_sub` within `Bv c` by a
+certificate facts, the static bounds (`MainStatics`), and child `c`'s `verify_sub` within `Bv c` by a
 tree satisfying `Pvs c` (B1-d): a size `n ≤ Bmain` and a layout `L` within `[fp, fp + n)`, above
 `main`'s frame, pairwise disjoint, containing `main`'s honest words; on every memory holding `L`
 and the statement's digest at words `0`, `1`, `main` holds at `fp` by its node at its honest

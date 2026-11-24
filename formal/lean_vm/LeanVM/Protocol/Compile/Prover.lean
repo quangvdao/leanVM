@@ -10,16 +10,22 @@
 module
 
 public import Statement.LeanVmVerifier
-public import LeanVM.Facts.Verifier
-public import Statement.Fast.Keccak
-public import Statement.Fast.QuadExt
-public import Statement.Fast.FieldWords
+import LeanVM.Facts.Verifier
+import Statement.Fast.Keccak
+import Statement.Fast.QuadExt
+import Statement.Fast.FieldWords
 public import LeanVM.Protocol.Compile.Prog
+public import Statement.Prover.Run
 public import LeanVM.Protocol.KeccakHash
-public import LeanVM.Parameters.Field
+import LeanVM.Parameters.Field
 public import LeanVM.Protocol.ToArkLib.Merkle
-public import LeanVM.Protocol.WithHash
-public import LeanVM.Protocol.Compile.Refines
+public import LeanVM.Protocol.RunWithHash
+import LeanVM.Protocol.WithHash
+public import CompPoly.Univariate.Basic
+public import VCVio.OracleComp.Constructions.SampleableType.Measure
+public import VCVio.OracleComp.QueryTracking.LoggingOracle.Core
+public import VCVio.OracleComp.QueryTracking.RandomOracle.Simulation
+public import VCVio.OracleComp.QueryTracking.WriterCost
 
 /-!
 # The honest prover and the completeness of the compilation
@@ -29,8 +35,9 @@ The prover is transcribed from leanVM:
 * the Fiat-Shamir sponge is the one `run` checks (`crates/fiat_shamir_prover/src/lib.rs`, `observe`,
   `sample`): a scalar sent is absorbed with tag `1`, a challenge squeezed by a permutation;
 * the proof of work is `grind`: the smallest `u64` nonce `n`, as the scalar with limbs
-  `(n, 0)`, which absorbed as a nonce makes the next challenge's low `bits` bits zero. Here the search is bounded by a `fuel`: nonces
-  `0, …, fuel - 1` (`findNonce`);
+  `(n, 0)`, which absorbed as a nonce makes the next challenge's low `bits` bits zero, and, where
+  the strategy asks it (`outsideK`, `grind_sample`), draws a challenge outside `K`. Here the search
+  is bounded by a `fuel`: nonces `0, …, fuel - 1` (`findNonce`);
 * a commitment is the Merkle tree of `merkle_tree` (`crates/pcs/src/merkle.rs`): the
   `2^height` rows of the word hashed as the little-endian bytes of their `K` words,
   each parent the hash of the 64 bytes of its children, left first
@@ -63,11 +70,10 @@ function of `H` and `F`.
 The proof is a simulation: from a history `h` and sponge `sp`, if the prover's output from
 there is the stream `xs` and the openings `os`, then `run` from the state with sponge `sp`, stream
 `xs ++ restS`, openings `os ++ restO` and the roots of the trees committed in `h` returns `true`
-with exactly `restS` and `restO` left. It is proved once, for a program `P'` refining the one the
-prover follows (`Refines`), wherever the honest transcript passes every check of `P'`
-(`traceOk`: its proofs of work find their nonces, nothing waits where `P'` absorbs, every
-committed word is well shaped, every opening is of a committed word, and `P'` returns `true`):
-`run_proveFrom_trace`, and `runProof_prove_trace` for a whole proof. A winning strategy's
+with exactly `restS` and `restO` left, wherever the honest transcript passes every check of the
+program (`traceOk`: its proofs of work find their nonces, nothing waits where the program absorbs,
+every committed word is well shaped, every opening is of a committed word, and the program
+returns `true`): `run_proveFrom_trace`. A winning strategy's
 transcript passes the checks of the program itself (`traceOk_of_acceptsFrom`), which gives
 `run_proveFrom`. The Merkle step is the generic `MerkleTree.rootOfPath_path`, after `climb_mod`
 reduces the position to its low `height` bits.
@@ -88,6 +94,9 @@ structure Strategy where
   msg : List Ev → E
   /-- The word committed at a `commit` node. -/
   word : List Ev → Word
+  /-- Whether the proof of work at a `grind` node takes only a nonce whose challenge lies outside
+  `K` (`nonceUsable`, `grind_sample`). -/
+  outsideK : List Ev → Bool := fun _ ↦ false
 
 namespace Strategy
 
@@ -163,10 +172,16 @@ permuted, the permutation's third lane; and the sponge after it, its first two l
 challenge (`absorbNonce`, what `run` checks at a `grind` node). -/
 def powStep (sp : Sponge) (n : E) : UInt64 × Sponge := Id.run (absorbNonce (m := Id) F sp n)
 
-/-- The proof-of-work search (`grind`): the smallest `n < fuel` whose proof of work passes
-`powOk`, if any. -/
-def findNonce (bits : ℕ) (sp : Sponge) (fuel : ℕ) : Option E :=
-  ((List.range fuel).find? fun n ↦ powOk bits (powStep F sp (nonceOf n)).1).map nonceOf
+/-- A nonce passes the search: its proof of work passes `powOk`, and its challenge is usable
+(`nonceUsable`). -/
+def nonceOk (bits : ℕ) (outsideK : Bool) (sp : Sponge) (n : E) : Bool :=
+  powOk bits (powStep F sp n).1 &&
+    LeanVM.Prover.nonceUsable outsideK (challengeOf (powStep F sp n).2.state)
+
+/-- The proof-of-work search (`grind`, `grind_sample` with `outsideK`): the smallest `n < fuel`
+whose proof of work passes `powOk` and whose challenge is usable, if any. -/
+def findNonce (bits : ℕ) (outsideK : Bool) (sp : Sponge) (fuel : ℕ) : Option E :=
+  ((List.range fuel).find? fun n ↦ nonceOk F bits outsideK sp (nonceOf n)).map nonceOf
 
 /-- The leaf hash: the hash of the leaf's words as little-endian bytes (`hash_words`). -/
 def leafHash (leaf : List K) : Digest := H (leaf.flatMap K.toBytes)
@@ -203,7 +218,7 @@ def proveFrom (S : Strategy) (fuel : ℕ) {α : Type} :
   | .sample k, sp, h =>
     proveFrom S fuel (k (squeezeI F sp).1) (squeezeI F sp).2
       (h ++ [Ev.sample (squeezeI F sp).1])
-  | .grind bits k, sp, h => match findNonce F bits sp fuel with
+  | .grind bits k, sp, h => match findNonce F bits (S.outsideK h) sp fuel with
     | none => none
     | some n =>
       (proveFrom S fuel k (powStep F sp n).2 (h ++ [Ev.grind bits])).map
@@ -450,11 +465,13 @@ def rootsOf (cs : List (ℕ × ℕ × Word)) : List (Digest × ℕ × ℕ) :=
   cs.map fun c ↦ (treeRoot H c.1 c.2.2, c.1, c.2.1)
 
 /-- The proof-of-work search returns a nonce that passes the check `run` makes. -/
-theorem powOk_of_findNonce {bits : ℕ} {sp : Sponge} {fuel : ℕ} {n : E}
-    (hn : findNonce F bits sp fuel = some n) : powOk bits (powStep F sp n).1 = true := by
+theorem powOk_of_findNonce {bits : ℕ} {o : Bool} {sp : Sponge} {fuel : ℕ} {n : E}
+    (hn : findNonce F bits o sp fuel = some n) : powOk bits (powStep F sp n).1 = true := by
   unfold findNonce at hn
   obtain ⟨m, hm, rfl⟩ := Option.map_eq_some_iff.mp hn
-  exact (List.find?_some hm :)
+  have h := (List.find?_some hm :)
+  simp only [nonceOk, Bool.and_eq_true] at h
+  exact h.1
 
 /-- A program in which every proof of work is followed at once by a challenge keeps the
 property along a history. -/
@@ -487,7 +504,7 @@ def traceOk (S : Strategy) (fuel : ℕ) : VerifierProgram Bool → Sponge → Li
       traceOk S fuel (k (S.msg h)) (absorbI F sp (S.msg h) dsObserve) (h ++ [Ev.read (S.msg h)])
   | .sample k, sp, h =>
       traceOk S fuel (k (squeezeI F sp).1) (squeezeI F sp).2 (h ++ [Ev.sample (squeezeI F sp).1])
-  | .grind b k, sp, h => sp.ground = none ∧ ∃ n, findNonce F b sp fuel = some n ∧
+  | .grind b k, sp, h => sp.ground = none ∧ ∃ n, findNonce F b (S.outsideK h) sp fuel = some n ∧
       traceOk S fuel k (powStep F sp n).2 (h ++ [Ev.grind b])
   | .commit ht w k, sp, h => sp.ground = none ∧ WellShaped w (S.word h) ∧
       traceOk S fuel k
@@ -497,20 +514,19 @@ def traceOk (S : Strategy) (fuel : ℕ) : VerifierProgram Bool → Sponge → Li
   | .query i ps k, sp, h => ∃ rows, answer h i ps = some rows ∧
       traceOk S fuel (k rows) sp (h ++ [Ev.query rows])
 
-/-- **The simulation, for a refining program.** If the honest prover's run along `p` from `h` at
-the sponge `sp` outputs `(xs, os)` and its transcript passes every check of `p'`, a refinement of
-`p`, the compiled verifier of `p'` from sponge `sp` with the roots of `h`'s trees accepts on any
-stream and openings that start with `xs` and `os`, leaving exactly what follows them. -/
-theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram Bool}
-    (hR : Refines p' p) :
+/-- **The simulation, along the transcript.** If the honest prover's run along `p` from `h` at
+the sponge `sp` outputs `(xs, os)` and its transcript passes every check of `p`, the compiled
+verifier of `p` from sponge `sp` with the roots of `h`'s trees accepts on any stream and openings
+that start with `xs` and `os`, leaving exactly what follows them. -/
+theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) (p : VerifierProgram Bool) :
     ∀ (h : List Ev) (sp : Sponge) (xs : List E) (os : List (List Opening)) (restS : List E)
       (restO : List (List Opening)),
-      traceOk H F S fuel p' sp h → (∀ c ∈ commits h, WellShaped c.2.1 c.2.2) →
+      traceOk H F S fuel p sp h → (∀ c ∈ commits h, WellShaped c.2.1 c.2.2) →
       proveFrom H F S fuel p sp h = some (xs, os) →
-      ∃ s', runWithHash (m := Id) H F p' ⟨sp, xs ++ restS, os ++ restO, rootsOf H (commits h)⟩ =
+      ∃ s', runWithHash (m := Id) H F p ⟨sp, xs ++ restS, os ++ restO, rootsOf H (commits h)⟩ =
           some (true, s') ∧ s'.stream = restS ∧ s'.openings = restO := by
-  induction hR with
-  | fail p =>
+  induction p with
+  | fail =>
     intro h sp xs os restS restO ht
     exact absurd ht id
   | ret b =>
@@ -519,7 +535,7 @@ theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram 
     simp only [proveFrom, Option.some.injEq, Prod.mk.injEq] at hp
     obtain ⟨rfl, rfl⟩ := hp
     exact ⟨_, by rw [ht]; rfl, rfl, rfl⟩
-  | @read k k' _ ih =>
+  | read k ih =>
     intro h sp xs os restS restO ht hws hp
     obtain ⟨hg0, ht⟩ := ht
     simp only [proveFrom] at hp
@@ -533,7 +549,7 @@ theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram 
     rw [← hrun]
     simp [runWithHash, commits_append, commits, hg0]
     rfl
-  | @sample k k' _ ih =>
+  | sample k ih =>
     intro h sp xs os restS restO ht hws hp
     simp only [proveFrom] at hp
     have hws' : ∀ c ∈ commits (h ++ [Ev.sample (squeezeI F sp).1]), WellShaped c.2.1 c.2.2 := by
@@ -543,7 +559,7 @@ theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram 
     rw [← hrun]
     simp [runWithHash, commits_append, commits]
     rfl
-  | @grind b k k' _ ih =>
+  | grind b k ih =>
     intro h sp xs os restS restO ht hws hp
     obtain ⟨hg0, n, hn, ht⟩ := ht
     simp only [proveFrom, hn] at hp
@@ -561,7 +577,7 @@ theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram 
     show (if powOk b (powStep F sp n).1 = true then _ else pure none) = _
     simp only [hpow, ↓reduceIte]
     rfl
-  | @commit ht w k k' _ ih =>
+  | commit ht w k ih =>
     intro h sp xs os restS restO htr hws hp
     obtain ⟨hg0, hw, htr⟩ := htr
     simp only [proveFrom] at hp
@@ -582,7 +598,7 @@ theorem run_proveFrom_trace (S : Strategy) (fuel : ℕ) {p' p : VerifierProgram 
     simp only [runWithHash, List.cons_append, hg0]
     rw [digestOfScalars_digestScalars, hroots]
     rfl
-  | @query i ps k k' _ ih =>
+  | query i ps k ih =>
     intro h sp xs os restS restO htr hws hp
     obtain ⟨rows, hans, htr⟩ := htr
     simp only [proveFrom] at hp
@@ -682,8 +698,8 @@ theorem traceOk_of_acceptsFrom (S : Strategy) (fuel : ℕ) :
 /-- **The simulation.** If the strategy wins from `h`, the words committed in `h` are well
 shaped, and the honest prover's output from `h` at sponge `sp` is `(xs, os)`, then the compiled
 verifier, from sponge `sp` with the roots of `h`'s trees, accepts on any stream and openings that
-start with `xs` and `os`, leaving exactly what follows them: `run_proveFrom_trace` at the program
-itself. -/
+start with `xs` and `os`, leaving exactly what follows them: `run_proveFrom_trace`, the transcript
+passing the program's checks (`traceOk_of_acceptsFrom`). -/
 theorem run_proveFrom (S : Strategy) (fuel : ℕ) (p : VerifierProgram Bool) (h : List Ev)
     (sp : Sponge) (xs : List E) (os : List (List Opening)) (restS : List E)
     (restO : List (List Opening)) (hacc : S.AcceptsFrom p h)
@@ -691,26 +707,8 @@ theorem run_proveFrom (S : Strategy) (fuel : ℕ) (p : VerifierProgram Bool) (h 
     (hg : sp.ground = none ∨ ∃ k, p = .sample k) (hp : proveFrom H F S fuel p sp h = some (xs, os)) :
     ∃ s', runWithHash (m := Id) H F p ⟨sp, xs ++ restS, os ++ restO, rootsOf H (commits h)⟩ =
         some (true, s') ∧ s'.stream = restS ∧ s'.openings = restO :=
-  run_proveFrom_trace H F S fuel (Refines.refl p) h sp xs os restS restO
+  run_proveFrom_trace H F S fuel p h sp xs os restS restO
     (traceOk_of_acceptsFrom H F S fuel p h sp xs os hacc hP hg hp) hws hp
-
-/-- **The compiled verifier of a refining program accepts the honest proof** wherever the honest
-transcript passes its checks. -/
-theorem runProof_prove_trace (S : Strategy) (fuel : ℕ) {P' P : VerifierProgram Bool}
-    (hR : Refines P' P) (seed : KeccakState) {π : Proof}
-    (ht : traceOk H F S fuel P' ⟨seed, [], none⟩ [])
-    (hπ : prove H F P S seed fuel = some π) :
-    runProofWithHash (m := Id) H F P' seed π = true := by
-  obtain ⟨t, htt, rfl⟩ := Option.map_eq_some_iff.mp hπ
-  obtain ⟨s', hrun, hs1, hs2⟩ :=
-    run_proveFrom_trace H F S fuel hR [] ⟨seed, [], none⟩ t.1 t.2 [] [] ht (by simp [commits]) htt
-  simp only [List.append_nil] at hrun
-  simp only [runProofWithHash, bind]
-  show (match runWithHash (m := Id) H F P' ⟨⟨seed, [], none⟩, t.1, t.2, rootsOf H (commits [])⟩ with
-    | some (true, s) => _ | _ => _) = true
-  rw [hrun]
-  simp [hs1, hs2]
-  rfl
 
 end Simulation
 
@@ -743,9 +741,9 @@ theorem runProof_prove (H : Bytes → Digest) (F : KeccakState → KeccakState) 
 /-! ## When the prover produces a proof -/
 
 /-- The proof-of-work search fails exactly when no nonce below `fuel` passes. -/
-theorem findNonce_eq_none_iff (F : KeccakState → KeccakState) (bits : ℕ) (sp : Sponge) (fuel : ℕ) :
-    findNonce F bits sp fuel = none ↔
-      ∀ n < fuel, powOk bits (powStep F sp (nonceOf n)).1 = false := by
+theorem findNonce_eq_none_iff (F : KeccakState → KeccakState) (bits : ℕ) (o : Bool) (sp : Sponge)
+    (fuel : ℕ) :
+    findNonce F bits o sp fuel = none ↔ ∀ n < fuel, nonceOk F bits o sp (nonceOf n) = false := by
   unfold findNonce
   simp [List.find?_eq_none]
 
@@ -754,7 +752,7 @@ program is at `p`, if the search succeeds at every `grind` node the program can 
 sponge, the prover produces a proof. -/
 theorem proveFrom_ne_none (H : Bytes → Digest) (F : KeccakState → KeccakState) (S : Strategy) (fuel : ℕ)
     {P : VerifierProgram Bool}
-    (hg : ∀ h bits k sp, P.after h = some (.grind bits k) → findNonce F bits sp fuel ≠ none) :
+    (hg : ∀ h bits k sp o, P.after h = some (.grind bits k) → findNonce F bits o sp fuel ≠ none) :
     ∀ (p : VerifierProgram Bool) (h : List Ev) (sp : Sponge), P.after h = some p →
       proveFrom H F S fuel p sp h ≠ none := by
   intro p
@@ -774,7 +772,7 @@ theorem proveFrom_ne_none (H : Bytes → Digest) (F : KeccakState → KeccakStat
     simp only [proveFrom]
     split
     · rename_i hn
-      exact absurd hn (hg h b k sp ha)
+      exact absurd hn (hg h b k sp _ ha)
     · simp only [ne_eq, Option.map_eq_none_iff]
       exact ih _ _ (by rw [VerifierProgram.after_append_single _ ha]; simp [VerifierProgram.after])
   | commit ht w k ih =>
@@ -793,7 +791,7 @@ theorem proveFrom_ne_none (H : Bytes → Digest) (F : KeccakState → KeccakStat
 `grind` node of the program, at every sponge. -/
 theorem prove_ne_none (H : Bytes → Digest) (F : KeccakState → KeccakState) (P : VerifierProgram Bool) (S : Strategy)
     (seed : KeccakState) (fuel : ℕ)
-    (hg : ∀ h bits k sp, P.after h = some (.grind bits k) → findNonce F bits sp fuel ≠ none) :
+    (hg : ∀ h bits k sp o, P.after h = some (.grind bits k) → findNonce F bits o sp fuel ≠ none) :
     prove H F P S seed fuel ≠ none := by
   simp only [prove, ne_eq, Option.map_eq_none_iff]
   exact proveFrom_ne_none H F S fuel hg P [] ⟨seed, [], none⟩ (VerifierProgram.after.eq_1 P)
@@ -806,7 +804,7 @@ theorem exists_prove_runProof (H : Bytes → Digest) (F : KeccakState → Keccak
     (S : Strategy) (seed : KeccakState) (fuel : ℕ) (hP : GrindThenSample P)
     (hc : ∀ chal, runI P S chal = some true)
     (hs : ∀ chal, shapedI P S chal)
-    (hg : ∀ h bits k sp, P.after h = some (.grind bits k) → findNonce F bits sp fuel ≠ none) :
+    (hg : ∀ h bits k sp o, P.after h = some (.grind bits k) → findNonce F bits o sp fuel ≠ none) :
     ∃ π, prove H F P S seed fuel = some π ∧ runProofWithHash (m := Id) H F P seed π = true := by
   obtain ⟨π, hπ⟩ := Option.ne_none_iff_exists'.mp (prove_ne_none H F P S seed fuel hg)
   exact ⟨π, hπ, runProof_prove H F P S seed fuel hP hc hs hπ⟩

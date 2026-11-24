@@ -41,12 +41,6 @@ pub(crate) struct LInstr {
 
 #[derive(Clone, Debug)]
 pub(crate) enum LOp {
-    /// A copy into the next loop frame, outside this frame's own allocation.
-    MulNextFrame {
-        a: Off,
-        b: Off,
-        c: Off,
-    },
     Set {
         o: Off,
         k: KVal,
@@ -60,6 +54,18 @@ pub(crate) enum LOp {
         a: Off,
         b: Off,
         c: Off,
+    },
+    /// `x·b = c`, `c` already written: the `MUL` back-solves the unwritten `x`.
+    Solve {
+        x: Off,
+        b: Off,
+        c: Off,
+    },
+    /// `dst = src·one`, a copy: `one` is a cell the lowering set to 1 on every path to here.
+    Copy {
+        src: Off,
+        one: Off,
+        dst: Off,
     },
     Deref {
         o1: Off,
@@ -101,21 +107,20 @@ pub(crate) enum LOp {
 pub(crate) enum Hint {
     /// Index the next frame address without allocating it again.
     NextFrameAddress,
-    /// Reserve the loop run, including the final untaken call's argument frame, of
-    /// which only the first `tail` cells (return target, arguments, frame pointer)
-    /// are ever written.
+    /// Reserve the loop run, the final untaken call's frame included.
     AllocLoopFrames {
         ptr: Off,
         callee: String,
         count: LoopCount,
+        /// The final, untaken call's frame: only its first `tail` cells (return target, arguments, frame pointer)
+        /// are ever written.
         tail: u32,
     },
     /// `m[fp·g^ptr] = g^{fresh base}`: a fresh, disjoint frame for `callee`.
     AllocFrame { ptr: Off, callee: String },
-    /// `AllocFrame` sized to the **largest** of several callees, a shared frame
-    /// for a dispatched call (all `callees` share the arg/return layout; only
-    /// their local count, hence frame size, differs). See `FnLower::lower_dispatched_call`.
-    AllocFrameMax { ptr: Off, callees: Vec<String> },
+    /// `AllocFrame` for a dispatched call: the frame of `callees[k]`, where
+    /// `m[fp·g^sel] = g^k` selects the arm (`FnLower::lower_dispatched_call`).
+    AllocArm { ptr: Off, sel: Off, callees: Vec<String> },
     /// `m[fp·g^ptr] = g^{fresh base}`: a fresh, disjoint heap region of `size`
     /// cells (a `HeapBuf(size)`), addressed by g-power offsets from the pointer.
     AllocBuffer { ptr: Off, size: u32 },
@@ -131,6 +136,21 @@ pub(crate) struct Lowered {
     pub(crate) name: String,
     pub(crate) code: Vec<LInstr>,
     pub(crate) frame_size: u32,
+    /// The cells below this one keep their offsets: the return target, the caller's frame, the arguments, the
+    /// return area and, in a loop frame, its own frame pointer. Callers address them.
+    pub(crate) keep: u32,
+    /// The return area: the callee alone writes it, and every return writes all of it.
+    pub(crate) rets: std::ops::Range<u32>,
+    /// The frame keeps its layout and its copies (an `addr()` names its cells by offset).
+    pub(crate) fixed: bool,
+}
+
+impl Lowered {
+    /// Whether the caller writes cell `x` before the call: the return target, its frame, the arguments and a loop
+    /// frame's own pointer, every kept cell outside the return area.
+    pub(crate) fn caller_writes(&self, x: Off) -> bool {
+        x < self.keep && !self.rets.contains(&x)
+    }
 }
 
 /// The jump tables every `match` dispatches through: one cell per arm, holding the

@@ -7,18 +7,28 @@
 
 module
 
-public import LeanVM.Protocol.Verifier.WhirTarget
-public import LeanVM.Protocol.Verifier.Claims
-public import LeanVM.Protocol.LeanVM
-public import Statement.LeanVm
-public import Common.Transfer
-public import LeanVM.Facts.Verifier
-public import Statement.Fast.Keccak
-public import Statement.Fast.QuadExt
-public import Statement.Fast.FieldWords
-public import Common.Prob
+import LeanVM.Protocol.Verifier.WhirTarget
+import LeanVM.Protocol.Verifier.Claims
+import LeanVM.Protocol.LeanVM
+import Statement.LeanVm
+import Common.Transfer
+import LeanVM.Facts.Verifier
+import Statement.Fast.Keccak
+import Statement.Fast.QuadExt
+import Statement.Fast.FieldWords
+import Common.Prob
 public import LeanVM.Protocol.WithHash
-public import Common.ByteArray
+import Common.ByteArray
+public import LeanVM.Protocol.EndToEnd.Complete.Rom
+import LeanVM.Protocol.LeanIsa.Complete
+public import ArkLib.Data.CodingTheory.HiddenDerivative.Parameters.Johnson.FiniteBounds
+public import ArkLib.Data.Polynomial.FrobeniusContraction
+public import ArkLib.Data.Polynomial.ResultantDegree
+public import ArkLib.Data.Polynomial.UniversalHenselNumerator
+public import ArkLib.ToMathlib.RingTheory.Nullstellensatz.AgreementIncidence
+public import Mathlib.Algebra.MvPolynomial.NoZeroDivisors
+public import Mathlib.Tactic
+public import VCVio.ProgramLogic.Relational.SimulateQ.UntilBad
 
 @[expose] public section
 
@@ -518,20 +528,20 @@ theorem allQ_leafDigestsM (height : ℕ) {word : Word} (hw : RowsLE word) :
     AllQueriesSatisfy (leafDigestsWithHash callKeccak256 height word) Short :=
   allQ_arrayMapM _ _ fun i _ ↦ allQ_queryH₀ (row_length hw i)
 
-theorem allQ_searchM (bits : ℕ) (sp : Sponge) :
-    ∀ (count n : ℕ), AllQueriesSatisfy (searchM callKeccakF1600 bits sp n count) Short
+theorem allQ_searchM (bits : ℕ) (o : Bool) (sp : Sponge) :
+    ∀ (count n : ℕ), AllQueriesSatisfy (searchM callKeccakF1600 bits o sp n count) Short
   | 0, _ => allQ_pure _
   | count + 1, n => by
     simp only [searchM]
     refine allQueriesSatisfy_bind (allQ_absorbNonce _ _) fun r ↦ ?_
     split
     · exact allQ_pure _
-    · exact allQ_searchM bits sp count (n + 1)
+    · exact allQ_searchM bits o sp count (n + 1)
 
-theorem allQ_findNonceM (bits : ℕ) (sp : Sponge) (fuel : ℕ) :
-    AllQueriesSatisfy (findNonceM callKeccakF1600 bits sp fuel) Short := by
+theorem allQ_findNonceM (bits : ℕ) (o : Bool) (sp : Sponge) (fuel : ℕ) :
+    AllQueriesSatisfy (findNonceM callKeccakF1600 bits o sp fuel) Short := by
   unfold findNonceM
-  exact allQ_searchM _ _ _ _
+  exact allQ_searchM _ _ _ _ _
 
 /-- **Locality**: the words a strategy commits along the run from `h` depend on the challenges
 only at the histories extending `h`. -/
@@ -636,7 +646,7 @@ theorem allQ_proveFromM (S : Strategy) (fuel : ℕ) {α : Type} :
         (histOK_append_of_nil _ rfl hh) (treesOK_append_of_nil _ rfl hT)
   | .grind bits k, sp, h, cs, hP, hG, hh, hT => by
     simp only [proveFromM]
-    refine allQueriesSatisfy_bind (allQ_findNonceM _ _ _) fun o ↦ ?_
+    refine allQueriesSatisfy_bind (allQ_findNonceM _ _ _ _) fun o ↦ ?_
     split
     · exact allQ_pure _
     · exact allQueriesSatisfy_bind (allQ_absorbNonce _ _) fun r ↦

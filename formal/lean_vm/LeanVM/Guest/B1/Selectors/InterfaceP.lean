@@ -9,9 +9,9 @@
 module
 
 public import LeanVM.Guest.B1.Tables.Base
-public import LeanVM.Guest.GuestConst
+import LeanVM.Guest.GuestConst
 -- Private: `guest_const%` inserts literals, so importers need not see the guest's source.
-import LeanVM.Guest.Data.Source
+import LeanVM.Guest.Data.Consts
 
 /-!
 # The selectors (TRIAGE G #44-50, #68, #69): the interface
@@ -126,10 +126,23 @@ def sel_partial_nibble_SpecP (P : Program) : Prop :=
   ∀ n < 4, ∀ rd args rets,
     P.Rel rd (lName "sel_partial_nibble" n) args rets → SelPartialOut n rd args rets
 
-/-- The converse, for completeness: every outcome is a relation's. -/
+/-- The zeros the tables of a nibble of `w` coordinates are padded with: its eq levels to `8w` cells
+at `eq_out`, its `g`-power table to `4w` at `g_out` (so the tables of `n` coordinates fill `8n` and
+`4n` cells). -/
+def NibPads (rd : Reader) (eqo go : E) (w : ℕ) : Prop :=
+  (∀ e, 2 ^ (w + 1) - 2 ≤ e → e < 8 * w → LoadHolds rd eqo e 0) ∧
+    ∀ u, 2 ^ w ≤ u → u < 4 * w → LoadHolds rd go u 0
+
+/-- `sel_partial_nibble__L{w}`'s padding in memory, at its `eq_out` and `g_out`. -/
+def SelPartialPads (w : ℕ) (rd : Reader) : List E → Prop
+  | eqo :: go :: _ => NibPads rd eqo go w
+  | _ => True
+
+/-- The converse, for completeness: every outcome, its padding in memory, is a relation's. -/
 def sel_partial_nibble_complete_SpecP (P : Program) : Prop :=
   ∀ n < 4, ∀ rd args rets,
-    SelPartialOut n rd args rets → P.Rel rd (lName "sel_partial_nibble" n) args rets
+    SelPartialOut n rd args rets → SelPartialPads n rd args →
+      P.Rel rd (lName "sel_partial_nibble" n) args rets
 
 /-- The nibble tables of a run of `n` coordinates `zs` (complements `zs1`, shares `gs`): nibble
 `j`'s eq levels at `eq_tab·g^(32j)` and its `g`-power table at `g_tab·g^(16j)`
@@ -152,13 +165,19 @@ def SharedSelOut (rd : Reader) : List E → List E → Prop
 def shared_selector_tables_SpecP (P : Program) : Prop :=
   ∀ rd args rets, P.Rel rd "shared_selector_tables" args rets → SharedSelOut rd args rets
 
+/-- The padding of the nibble tables of a run of `n` coordinates `zs` (`NibPads`, nibble `j` at
+`eq_tab·g^(32j)` and `g_tab·g^(16j)`). -/
+def RunPads (rd : Reader) (eqt gt : E) (n : ℕ) (zs : List E) : Prop :=
+  ∀ j < (n + 3) / 4, NibPads rd (eqt * gen ^ (32 * j)) (gt * gen ^ (16 * j)) (nib zs j).length
+
 /-- The converse, for completeness: `n < 64` coordinates, complements and shares at `zeta_hi`,
-`zeta1_hi`, `gsq_hi`, with their nibble tables at `eq_tab`, `g_tab`, give the relation. -/
+`zeta1_hi`, `gsq_hi`, with their nibble tables at `eq_tab`, `g_tab` and their padding, give the
+relation. -/
 def shared_selector_tables_complete_SpecP (P : Program) : Prop :=
   ∀ (rd : Reader) (eqt gt z z1 gsq : E) (n : ℕ) (zs zs1 gs : List E), n < 64 →
     zs.length = n → zs1.length = n → gs.length = n →
     TbReadsAt rd z zs → TbReadsAt rd z1 zs1 → TbReadsAt rd gsq gs →
-    RunTables rd eqt gt n zs zs1 gs →
+    RunTables rd eqt gt n zs zs1 gs → RunPads rd eqt gt n zs →
     P.Rel rd "shared_selector_tables" [eqt, gt, z, z1, gsq, gen ^ n] []
 
 /-! ## The bus blocks' selectors -/
@@ -235,12 +254,16 @@ abbrev selNibbles : ℕ := guest_const% SEL_NIBBLES
 def selEqEntry (p p1 : List E) (j w u : ℕ) : E :=
   ∏ t ∈ Finset.Ico (3 - w) 4, if u.testBit t then p.getD (4 * j + t) 0 else p1.getD (4 * j + t) 0
 
+/-- Where a nibble's level-`w` eq table starts (`SEL_EQ_OFF`): levels `0 .. 2` interleaved in one
+`16`-cell row, each in the others' gaps, level `3` the next row. -/
+def selEqOff (w : ℕ) : ℕ := [4, 2, 1, 16].getD w 0
+
 /-- The opening point's eq tables (`selector_tables`): nibble `j`'s level-`w` table,
-over its top `w + 1` coordinates, at `sel_eq·g^(64j + 16w)` (`SEL_EQ_STRIDE = 64`), strided: its
-entries `u < 16` that are multiples of `2^(3 - w)`. -/
+over its top `w + 1` coordinates, at `sel_eq·g^(32j + selEqOff w)` (`SEL_EQ_STRIDE = 32`),
+strided: its entries `u < 16` that are multiples of `2^(3 - w)`. -/
 def EqTabsAt (rd : Reader) (se : E) (p p1 : List E) : Prop :=
   ∀ j < selNibbles, ∀ w < 4, ∀ u < 16, 2 ^ (3 - w) ∣ u →
-    LoadHolds rd se (64 * j + 16 * w + u) (selEqEntry p p1 j w u)
+    LoadHolds rd se (32 * j + selEqOff w + u) (selEqEntry p p1 j w u)
 
 /-- The opening selector's nibble shares (`exponent_tables`; `check_opening_terminal`
 reads them at `g_squares·g^SIZE_BITS`): `g^(u·16^j)` at `sel_g·g^(16j + u)`. -/

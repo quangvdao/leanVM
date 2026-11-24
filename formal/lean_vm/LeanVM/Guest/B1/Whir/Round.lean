@@ -18,12 +18,10 @@ One fold round of CWYZ26's affine combiner (`foldRound`, `Statement/LeanVmVerifi
 four scalars `u0, w, c0, c1`, a grind and `α`, then `β`; `α` stored for the point and, with
 `β`, for the queries' row folds, and the claim folded at `α`.
 
-* `roundBody`: its core IR (`opening_round_body`, `RoundSound.lean`, by kernel evaluation);
-* `MeaningOpeningRound`: what a call establishes, over the carried sponge (`rdS2`, `rdG2`,
-  `Fs.squeeze`);
-* `opening_round_soundP` (`RoundSound.lean`): the core IR gives the meaning in every program
-  that finds it, under `grind_check_SpecP P 7`, on a memory image whose `tabs` holds the bit
-  windows (`RoundFind.lean` states it at `coreProgram`);
+* `MeaningOpeningRound`: what a round establishes, over the carried sponge (`rdS2`, `rdG2`,
+  `Fs.squeeze`), on its words as the guest's function took them before it was inlined;
+* `osRoundCore_mean` (`RoundSound.lean`): the round inline in `open_stacked` gives the meaning,
+  on a memory image whose `tabs` holds the bit windows;
 * `opening_round_run`: the meaning runs `foldRound st` for every `st` with that claim.
 -/
 
@@ -33,27 +31,6 @@ open LeanVM.Parameters LeanVM.Semantics LeanVM.Guest.Core LeanVM.Guest.Value Lea
 open LeanVM.Protocol LeanVM.Protocol.KeccakHash LeanVM.Protocol.Compile LeanVM.Protocol.Verifier
 
 @[expose] public section
-
-/-! ## The template -/
-
-/-- `opening_round`'s body: the capacity copied, the four scalars `u0, w, c0, c1`
-and their permutation, the grind's nonce and permutation, `α`, the squeeze of `β`, the stores,
-the claim. -/
-def roundBody : List Stmt :=
-  ((List.range 5).map fun i ↦ .atom (.copy (.n (10 + i)) (.n i))) ++
-  fsNextT (.n 5) 0 15 ++ fsNextT (.n 5) 1 18 ++ fsNextT (.n 5) 2 21 ++ fsNextT (.n 5) 3 24 ++
-  [keccakA (permIns 4 [.n 16, .n 17, .n 19, .n 20, .n 22, .n 23, .n 25, .n 26] 44 (osRun 10 5))
-    (osRun 27 13)] ++
-  fsNonceT (.n 5) 4 40 ++ padRunT 43 ++
-  [keccakA (permIns 1 [.n 41, .n 42] 44 (osRun 35 5)) (osRun 48 13),
-    .call "grind_check__L7" [.n 49, .n 7] []] ++
-  [keccakA (permIns 0 [] 44 (osRun 56 5)) (osRun 61 13)] ++
-  [osLd 48 8 0, osLd 48 9 0, osLd 61 9 1,
-    osMul 74 61 21, osAdd 75 15 74, osAdd 76 15 6, osMul 77 48 18, osAdd 78 76 77,
-    osAdd 79 21 24, osMul 80 61 79, osAdd 81 78 80, osMul 82 48 81, osAdd 83 75 82] ++
-  ((List.range 5).map fun i ↦ osCp (84 + i) (69 + i)) ++
-  [osCst 89 (word 32 0), osMul 90 5 89, osCp 91 90, osCp 92 83,
-    .ret [.n 84, .n 85, .n 86, .n 87, .n 88, .n 91, .n 92]]
 
 /-! ## The meaning -/
 
@@ -89,18 +66,10 @@ def MeaningOpeningRound (rd : Reader) : List E → List E → Prop
 
 variable {rd : Reader} {σ : Val}
 
-theorem grindCheckName_seven : grindCheckName 7 = "grind_check__L7" := rfl
-
 /-- Four scalars absorbed from an empty queue: all four waiting. -/
 theorem absorbAll_four (cap : List E) (a b c d : E) (t : ℕ) :
     (⟨cap, []⟩ : Fs).absorbAll [a, b, c, d] t = ⟨cap, [(a, t), (b, t), (c, t), (d, t)]⟩ := by
   simp [Fs.absorbAll, Fs.absorb, rateScalars]
-
-/-- An output cell of a permutation. -/
-theorem outCell {σ : Val} {k : ℕ} {f : Fin 13 → E} (h : cells13 ((osRun k 13).map σ) = f)
-    (i : Fin 13) : σ (.n (k + i.val)) = f i := by
-  have := outs_eq h i (by simp [osRun])
-  simpa [osRun] using this
 
 /-! ## The run -/
 

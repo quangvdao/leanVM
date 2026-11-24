@@ -8,9 +8,9 @@
 module
 
 public import LeanVM.Guest.B1.Tables.Base
-public import LeanVM.Guest.GuestConst
+import LeanVM.Guest.GuestConst
 -- Private: `guest_const%` inserts literals, so importers need not see the guest's source.
-import LeanVM.Guest.Data.Source
+import LeanVM.Guest.Data.Consts
 
 /-!
 # `certify_placement` (TRIAGE G #67): the interface

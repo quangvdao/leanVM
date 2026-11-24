@@ -1423,9 +1423,13 @@ theorem selBound_sound (hB : BookHolds L fp B) :
 
 /-- Memory read through frame cells is bounded: for each `(o, c, n)`, a word read at `fp[o]·g^c`
 is `g^e` with `e < n` (`Cut.knownIf`; what `MemPre` and `MemKnown` give, `memIf_of_pre`,
-`memIf_of_known`). -/
+`memIf_of_known`), or, at `c = memTwice c1 c2` (`c ≥ 2^32`), a word read at `q·g^c2` for a word
+`q` read at `fp[o]·g^c1`. -/
 def MemIf (L : MemoryImage κ) (fp : K) (mem : List (ℕ × ℕ × ℕ)) : Prop :=
-  ∀ m ∈ mem, ∀ v, Core.LoadHolds L.read (wd L fp m.1) m.2.1 v → ∃ e < m.2.2, v = ofK (addressOfIndex e)
+  ∀ m ∈ mem, ∀ q v,
+    (if m.2.1 < 2 ^ 32 then q = wd L fp m.1 else Core.LoadHolds L.read (wd L fp m.1) (m.2.1 % 2 ^ 32) q) →
+    Core.LoadHolds L.read q (if m.2.1 < 2 ^ 32 then m.2.1 else m.2.1 / 2 ^ 32 - 1) v →
+      ∃ e < m.2.2, v = ofK (addressOfIndex e)
 
 theorem MemIf.append {l₁ l₂ : List (ℕ × ℕ × ℕ)} (h₁ : MemIf L fp l₁) (h₂ : MemIf L fp l₂) :
     MemIf L fp (l₁ ++ l₂) := by
@@ -1434,8 +1438,42 @@ theorem MemIf.append {l₁ l₂ : List (ℕ × ℕ × ℕ)} (h₁ : MemIf L fp l
   · exact h₁ m hm
   · exact h₂ m hm
 
-theorem memIf_of_pre {mem : List (ℕ × ℕ × ℕ)} (h : MemPre L fp mem) : MemIf L fp mem := by
-  intro m hm v hv
+/-- A bound read once (`memSmall`): a word read at `fp[o]·g^c` is `g^e`, `e < n`. -/
+theorem MemIf.once {mem : List (ℕ × ℕ × ℕ)} (h : MemIf L fp mem) {m : ℕ × ℕ × ℕ} (hm : m ∈ mem)
+    (hs : m.2.1 < 2 ^ 32) {v : E} (hv : Core.LoadHolds L.read (wd L fp m.1) m.2.1 v) :
+    ∃ e < m.2.2, v = ofK (addressOfIndex e) :=
+  h m hm _ v (by rw [ite_eq_left hs]) (by rw [ite_eq_left hs]; exact hv)
+
+/-- The bounds read once (`memSmall`) of a list hold as `MemIf`, given each one's. -/
+theorem MemIf.of_small {mem : List (ℕ × ℕ × ℕ)} (h : ∀ m ∈ mem, m.2.1 < 2 ^ 32 → ∀ v,
+    Core.LoadHolds L.read (wd L fp m.1) m.2.1 v → ∃ e < m.2.2, v = ofK (addressOfIndex e)) :
+    MemIf L fp (mem.filter memSmall) := by
+  intro m hm q v hq hv
+  obtain ⟨hm, hs⟩ := List.mem_filter.mp hm
+  have hs : m.2.1 < 2 ^ 32 := by simpa [memSmall] using hs
+  rw [ite_eq_left hs] at hq hv
+  subst hq
+  exact h m hm hs v hv
+
+/-- A bound read twice (`memTwice c1 c2`): a word read at `q·g^c2`, `q` read at `fp[o]·g^c1`, is
+`g^e`, `e < n`. -/
+theorem MemIf.twice {mem : List (ℕ × ℕ × ℕ)} (h : MemIf L fp mem) {o c1 c2 n : ℕ}
+    (hm : (o, memTwice c1 c2, n) ∈ mem) (hc : c1 < 2 ^ 32) {q v : E}
+    (hq : Core.LoadHolds L.read (wd L fp o) c1 q) (hv : Core.LoadHolds L.read q c2 v) :
+    ∃ e < n, v = ofK (addressOfIndex e) := by
+  have hb : ¬ memTwice c1 c2 < 2 ^ 32 := by unfold memTwice; omega
+  have e1 : memTwice c1 c2 % 2 ^ 32 = c1 := by
+    unfold memTwice; rw [Nat.mul_add_mod, Nat.mod_eq_of_lt hc]
+  have e2 : memTwice c1 c2 / 2 ^ 32 - 1 = c2 := by
+    unfold memTwice
+    rw [Nat.add_comm, Nat.add_mul_div_left _ _ (by positivity), Nat.div_eq_of_lt hc]
+    omega
+  exact h _ hm q v (by rw [ite_eq_right hb, e1]; exact hq)
+    (by rw [ite_eq_right hb, e2]; exact hv)
+
+/-- The memory bounds of the semantic precondition read once (`memSmall`) hold as `MemIf`. -/
+theorem memIf_of_pre {mem : List (ℕ × ℕ × ℕ)} (h : MemPre L fp mem) : MemIf L fp (mem.filter memSmall) := by
+  refine MemIf.of_small fun m hm _ v hv ↦ ?_
   obtain ⟨p, hp, -, e, he, hr⟩ := h m hm
   rw [wd_of hp] at hv
   exact ⟨e, he, Option.some.inj (hv.2.symm.trans hr)⟩
@@ -1454,15 +1492,35 @@ theorem boundBase_sound {mem : List (ℕ × ℕ × ℕ)} (hm : MemIf L fp mem) (
       obtain ⟨e, e', he, hx, -⟩ := hh
       exact ⟨e, by omega, hx⟩
     · rename_i pc o1 o2 o3
-      simp only [Bool.and_eq_true, beq_iff_eq] at hp
-      obtain ⟨rfl, hp⟩ := hp
-      obtain ⟨m, hmm, hq⟩ := List.any_eq_true.mp hp
-      simp only [Bool.and_eq_true, beq_iff_eq, Nat.ble_eq] at hq
-      obtain ⟨⟨rfl, ho2⟩, hle⟩ := hq
-      obtain ⟨p, v3, h1, hK, h3, h2⟩ := hh
-      simp only [derefSource] at h2
-      obtain ⟨e, he, hv⟩ := hm m hmm v3 ⟨by rw [wd_of h1]; exact hK, by rw [wd_of h1, ho2]; exact h2⟩
-      exact ⟨e, by omega, by rw [h3, hv]⟩
+      simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hp
+      obtain ⟨rfl, hp | hp⟩ := hp
+      · obtain ⟨m, hmm, hq⟩ := List.any_eq_true.mp hp
+        simp only [Bool.and_eq_true, beq_iff_eq, Nat.ble_eq, Nat.blt_eq] at hq
+        obtain ⟨⟨⟨rfl, ho2⟩, hs⟩, hle⟩ := hq
+        obtain ⟨p, v3, h1, hK, h3, h2⟩ := hh
+        simp only [derefSource] at h2
+        obtain ⟨e, he, hv⟩ := hm.once hmm (by omega)
+          ⟨by rw [wd_of h1]; exact hK, by rw [wd_of h1, ho2]; exact h2⟩
+        exact ⟨e, by omega, by rw [h3, hv]⟩
+      · obtain ⟨b, hb', hp⟩ := List.any_eq_true.mp hp
+        have hh' := hB o1 b hb'
+        split at hp
+        · rename_i pc' p0 c1 o1'
+          simp only [Bool.and_eq_true, beq_iff_eq, Nat.blt_eq] at hp
+          obtain ⟨⟨rfl, hc1⟩, hp2⟩ := hp
+          obtain ⟨m, hmm, hq⟩ := List.any_eq_true.mp hp2
+          simp only [Bool.and_eq_true, beq_iff_eq, Nat.ble_eq] at hq
+          obtain ⟨⟨h01, h02⟩, hle⟩ := hq
+          obtain ⟨p, v3, h1, hK, h3, h2⟩ := hh
+          obtain ⟨p', v1, h1', hK', h3', h2'⟩ := hh'
+          simp only [derefSource] at h2 h2'
+          obtain rfl := Option.some.inj (h1.symm.trans h3')
+          have hmm' : (p0, memTwice c1 o2, m.2.2) ∈ mem := by
+            rw [← h01, ← h02]; exact hmm
+          obtain ⟨e, he, hv⟩ := hm.twice hmm' hc1 ⟨by rw [wd_of h1']; exact hK', by rw [wd_of h1']; exact h2'⟩
+            ⟨hK, h2⟩
+          exact ⟨e, by omega, by rw [h3, hv]⟩
+        · simp at hp
     · simp at hp
   · obtain ⟨p, hp, hq⟩ := List.any_eq_true.mp h
     simp only [Bool.and_eq_true, beq_iff_eq, Nat.ble_eq] at hq
@@ -1493,13 +1551,126 @@ theorem boundScaled_sound {F : Exec.Facts} (hF : F.pows.Ok) {ψ : Trie Sym} (hψ
     exact ⟨e + k, by omega, ofK_gpow_mul _ _⟩
   · exact absurd h Bool.false_ne_true
 
+/-! ### Words read from a table of constants -/
+
+theorem getF_node_left {α : Type} (v : Option α) (l r : Trie α) (o : ℕ) :
+    getF (.node v l r) (2 * o + 1) = getF l o := by
+  rw [getF_eq, getF_eq, Trie.get_node, ite_eq_right (by omega : 2 * o + 1 ≠ 0),
+    ite_eq_left (by omega : (2 * o + 1) % 2 = 1), show (2 * o + 1) / 2 = o by omega]
+
+theorem getF_node_right {α : Type} (v : Option α) (l r : Trie α) (o : ℕ) :
+    getF (.node v l r) (2 * o + 2) = getF r o := by
+  rw [getF_eq, getF_eq, Trie.get_node, ite_eq_right (by omega : 2 * o + 2 ≠ 0),
+    ite_eq_right (by omega : (2 * o + 2) % 2 ≠ 1), show (2 * o + 2) / 2 - 1 = o by omega]
+
+theorem bookAny_sound {p : Exec.Atom → Bool} :
+    ∀ {B : Book}, bookAny p B = true → ∃ o, ∃ a ∈ look B o, p a = true
+  | .nil, h => absurd h Bool.false_ne_true
+  | .node v l r, h => by
+    have h' : (∃ l0, v = some l0 ∧ l0.any p = true) ∨ bookAny p l = true ∨ bookAny p r = true := by
+      cases v with
+      | none =>
+        have h'' : (false || bookAny p l || bookAny p r) = true := h
+        simp only [Bool.or_eq_true, Bool.false_eq_true, false_or] at h''
+        exact Or.inr h''
+      | some l0 =>
+        have h'' : (l0.any p || bookAny p l || bookAny p r) = true := h
+        simp only [Bool.or_eq_true] at h''
+        rcases h'' with (h'' | h'') | h''
+        exacts [Or.inl ⟨l0, rfl, h''⟩, Or.inr (Or.inl h''), Or.inr (Or.inr h'')]
+    rcases h' with ⟨l0, rfl, hv⟩ | hl | hr
+    · obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp hv
+      exact ⟨0, a, ha, hp⟩
+    · obtain ⟨o, a, ha, hp⟩ := bookAny_sound hl
+      refine ⟨2 * o + 1, a, ?_, hp⟩
+      simpa only [look, getF_node_left] using ha
+    · obtain ⟨o, a, ha, hp⟩ := bookAny_sound hr
+      refine ⟨2 * o + 2, a, ?_, hp⟩
+      simpa only [look, getF_node_right] using ha
+
+theorem slotOk_sound {F : Exec.Facts} (hF : F.pows.Ok) (hB : BookHolds L fp B) {ψ : Trie Sym}
+    (hψ : EnvHolds L fp ψ) {w n i : ℕ} (h : slotOk F ψ B w n i = true) :
+    ∃ pw, L.read (fp * addressOfIndex w) = some pw ∧ IsInK pw ∧
+      ∃ e < n, L.read (pw.limb 0 * addressOfIndex i) = some (ofK (addressOfIndex e)) := by
+  obtain ⟨o, a, ha, hp⟩ := bookAny_sound h
+  have hh := hB o a ha
+  split at hp
+  · rename_i pc o1 o2 o3
+    simp only [Bool.and_eq_true, beq_iff_eq] at hp
+    obtain ⟨⟨rfl, rfl⟩, hp⟩ := hp
+    revert hp
+    cases hg : gpAt F B ψ o3 with
+    | none => exact fun hp ↦ absurd hp Bool.false_ne_true
+    | some e =>
+      intro hp
+      obtain ⟨p, v3, h1, hK, h3, h2⟩ := hh
+      simp only [derefSource] at h2
+      refine ⟨p, h1, hK, e, Nat.blt_eq.mp hp, ?_⟩
+      rw [h2, Option.some.inj (h3.symm.trans (gpAt_sound hF hB hψ hg))]
+  · simp at hp
+
+theorem tabAt_sound {F : Exec.Facts} (hF : F.pows.Ok) (hB : BookHolds L fp B) {ψ : Trie Sym}
+    (hψ : EnvHolds L fp ψ) {w x o n : ℕ} (h : tabAt F ψ B w x o n = true) :
+    ∃ d pw, L.read (fp * addressOfIndex x) = some (ofK (addressOfIndex d)) ∧
+      L.read (fp * addressOfIndex w) = some pw ∧ IsInK pw ∧
+      ∃ e < n, L.read (pw.limb 0 * addressOfIndex (d + o)) = some (ofK (addressOfIndex e)) := by
+  obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp h
+  have hh := hB x a ha
+  split at hp
+  · rename_i x' y k
+    simp only [Bool.and_eq_true, beq_iff_eq, List.all_eq_true, List.mem_range] at hp
+    obtain ⟨rfl, hall⟩ := hp
+    obtain ⟨d, d', hk, hx, -⟩ := hh
+    obtain ⟨pw, hw, hK, e, he, hr⟩ := slotOk_sound hF hB hψ (hall d (by omega))
+    exact ⟨d, pw, hx, hw, hK, e, he, hr⟩
+  · simp at hp
+
+/-- **A word read from a table of constants** is one of them. -/
+theorem tabRead_sound {F : Exec.Facts} (hF : F.pows.Ok) (hB : BookHolds L fp B) {ψ : Trie Sym}
+    (hψ : EnvHolds L fp ψ) {c n : ℕ} (h : tabRead F ψ B c n = true) :
+    ∃ e < n, L.read (fp * addressOfIndex c) = some (ofK (addressOfIndex e)) := by
+  obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp h
+  have hh := hB c a ha
+  split at hp
+  · rename_i pc p o c'
+    simp only [Bool.and_eq_true, beq_iff_eq] at hp
+    obtain ⟨rfl, hl⟩ := hp
+    obtain ⟨q, vc, hq, -, hc, hr⟩ := hh
+    simp only [derefSource] at hr
+    obtain ⟨b, hb, hm⟩ := List.any_eq_true.mp hl
+    have hh' := hB p b hb
+    split at hm
+    · rename_i pc' w x p'
+      simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hm
+      obtain ⟨rfl, hor⟩ := hm
+      obtain ⟨vw, vx, hw, hx, hpm⟩ := hh'
+      have hqe : q = vw * vx := Option.some.inj (hq.symm.trans hpm)
+      have key : ∀ {t y : ℕ} {vt vy : E}, L.read (fp * addressOfIndex t) = some vt →
+          L.read (fp * addressOfIndex y) = some vy → q = vt * vy → tabAt F ψ B t y o n = true →
+          ∃ e < n, vc = ofK (addressOfIndex e) := by
+        intro t y vt vy ht hy hq' hta
+        obtain ⟨d, pw, hyd, hpw, hK, e, he, hre⟩ := tabAt_sound hF hB hψ hta
+        obtain rfl := Option.some.inj (ht.symm.trans hpw)
+        obtain rfl := Option.some.inj (hy.symm.trans hyd)
+        obtain ⟨a0, rfl⟩ := (isInK_iff _).mp hK
+        refine ⟨e, he, Option.some.inj (hr.symm.trans ?_)⟩
+        rw [hq', ← ofK_mul, limb_ofK0, mul_assoc, ← hre, limb_ofK0, addressOfIndex, addressOfIndex,
+          addressOfIndex, pow_add]
+      rcases hor with ht | ht
+      · obtain ⟨e, he, rfl⟩ := key hw hx hqe ht
+        exact ⟨e, he, hc⟩
+      · obtain ⟨e, he, rfl⟩ := key hx hw (hqe.trans (mul_comm _ _)) ht
+        exact ⟨e, he, hc⟩
+    · simp at hm
+  · simp at hp
+
 theorem boundOk0_sound {F : Exec.Facts} (hF : F.pows.Ok) {ψ : Trie Sym} (hψ : EnvHolds L fp ψ)
     {mem : List (ℕ × ℕ × ℕ)} (hm : MemIf L fp mem) (hB : BookHolds L fp B)
     {bnd : List (ℕ × ℕ)} (hb : BndHolds L fp bnd) {c n : ℕ}
     (h : boundOk0 F ψ mem B bnd c n = true) :
     ∃ e < n, L.read (fp * addressOfIndex c) = some (ofK (addressOfIndex e)) := by
   simp only [boundOk0, Bool.or_eq_true] at h
-  rcases h with (h | h) | h
+  rcases h with ((h | h) | h) | h
   · exact boundBase_sound hm hB hb h
   · revert h
     cases hk : gpAt F B ψ c with
@@ -1520,6 +1691,7 @@ theorem boundOk0_sound {F : Exec.Facts} (hF : F.pows.Ok) {ψ : Trie Sym} (hψ : 
       · obtain ⟨e, he, hr⟩ := boundScaled_sound hF hψ hm hB hb hp hy hx
         exact ⟨e, he, by rw [hc, mul_comm, hr]⟩
     · simp at hp
+  · exact tabRead_sound hF hB hψ h
 
 theorem boundOk_sound {F : Exec.Facts} (hF : F.pows.Ok) {ψ : Trie Sym} (hψ : EnvHolds L fp ψ)
     {mem : List (ℕ × ℕ × ℕ)} (hm : MemIf L fp mem) (hB : BookHolds L fp B)
@@ -1547,10 +1719,11 @@ theorem boundOk_sound {F : Exec.Facts} (hF : F.pows.Ok) {ψ : Trie Sym} (hψ : E
 def MemKnown (L : MemoryImage κ) (fp : K) (known : List (ℕ × ℕ × ℕ)) : Prop :=
   ∀ k ∈ known, ∃ e < k.2.2, Core.LoadHolds L.read (wd L fp k.1) k.2.1 (ofK (addressOfIndex e))
 
-theorem memIf_of_known {known : List (ℕ × ℕ × ℕ)} (h : MemKnown L fp known) : MemIf L fp known := by
-  intro m hm v hv
-  obtain ⟨e, he, hl⟩ := h m hm
-  exact ⟨e, he, Option.some.inj (hv.2.symm.trans hl.2)⟩
+theorem memIf_of_known {known : List (ℕ × ℕ × ℕ)} (h : MemKnown L fp known) :
+    MemIf L fp (known.filter memSmall) :=
+  MemIf.of_small fun m hm _ v hv ↦ by
+    obtain ⟨e, he, hl⟩ := h m hm
+    exact ⟨e, he, Option.some.inj (hv.2.symm.trans hl.2)⟩
 
 theorem memOk_sound (hB : BookHolds L fp B) {known : List (ℕ × ℕ × ℕ)} (hk : MemKnown L fp known)
     {args : List ℕ} {mem : List (ℕ × ℕ × ℕ)} (h : memOk known args mem = true) {q : ℕ}
@@ -1805,11 +1978,44 @@ theorem storesOk_at (hB : BookHolds L fp B) {q o : ℕ} {cs : List ℕ} (h : sto
   obtain rfl := Option.some.inj (hq'.symm.trans hq)
   exact ⟨v, h1, h2⟩
 
-theorem tailArgsOk_sound {S : ℕ} : ∀ {o : ℕ} {cs : List ℕ}, tailArgsOk B S o cs = true →
-    ∀ i (hi : i < cs.length), sameOk B (S + (o + i)) cs[i] = true
+/-- **A next frame's cell holds what is said**: one cell, a copy, or a store through its pointer. -/
+theorem nextHolds_read (hB : BookHolds L fp B) {ψ : Trie Sym} (he : EnvHolds L fp ψ) {S o c : ℕ}
+    (h : nextHolds B ψ S o c = true) :
+    L.read (fp * addressOfIndex (S + o)) = L.read (fp * addressOfIndex c) := by
+  unfold nextHolds at h
+  rcases Bool.or_eq_true _ _ |>.mp h with h | h
+  · exact sameOk_read hB h
+  · unfold storedNext at h
+    obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp h
+    have hh := hB c a ha
+    split at hp
+    · rename_i pc q o' c'
+      simp only [Bool.and_eq_true, beq_iff_eq] at hp
+      obtain ⟨⟨ho, hc⟩, hp⟩ := hp
+      subst ho hc
+      split at hp
+      · rename_i e hq
+        obtain rfl := beq_iff_eq.mp hp
+        obtain ⟨p, v3, h1, -, h3, h2⟩ := hh
+        rw [he q _ hq] at h1
+        obtain rfl := Option.some.inj h1
+        rw [h3, show fp * addressOfIndex (e + o') = (Sym.val fp (.fpg e)).limb 0 * addressOfIndex o' by
+          simp only [Sym.val, limb_ofK0]
+          rw [mul_assoc, addressOfIndex, addressOfIndex, addressOfIndex, ← pow_add]]
+        exact h2
+      · cases hp
+    · cases hp
+
+theorem nextHolds_wd (hB : BookHolds L fp B) {ψ : Trie Sym} (he : EnvHolds L fp ψ) {S o c : ℕ}
+    (h : nextHolds B ψ S o c = true) : wd L fp (S + o) = wd L fp c := by
+  unfold wd
+  rw [nextHolds_read hB he h]
+
+theorem tailArgsOk_sound {ψ : Trie Sym} {S : ℕ} : ∀ {o : ℕ} {cs : List ℕ}, tailArgsOk B ψ S o cs = true →
+    ∀ i (hi : i < cs.length), nextHolds B ψ S (o + i) cs[i] = true
   | _, [], _, _, hi => absurd hi (Nat.not_lt_zero _)
   | o, c :: cs, h, i, hi => by
-    simp only [tailArgsOk, Bool.and_eq_true, nextHolds] at h
+    simp only [tailArgsOk, Bool.and_eq_true] at h
     cases i with
     | zero => simpa using h.1
     | succ i =>
@@ -2503,12 +2709,12 @@ theorem walk_callIf (W : WalkEnv Prog cert A L fp f X Kb) (c : Core.V) (f' : Str
           obtain ⟨⟨h2, hlt⟩, hbd⟩ := this
           obtain ⟨e, he, hr⟩ := boundOk_sound W.hyp.ctx.pows (hpsi ▸ hp.psi) W.mem hB' (hbnd ▸ hp.bnd) hbd
           refine ⟨e, he, ?_⟩
-          have hs := sameOk_read hB' (tailArgsOk_sound hargs (p.1 - 2) hlt)
+          have hs := nextHolds_read hB' hxenv (tailArgsOk_sound hargs (p.1 - 2) hlt)
           rw [nth_eq hlt] at hr
           rw [show 2 + (p.1 - 2) = p.1 by omega, hr] at hs
           rw [mul_assoc, addressOfIndex, addressOfIndex, ← pow_add, ← addressOfIndex]
           exact hs
-        · have := sameOk_sound hB' (tailArgsOk_sound hargs i hi)
+        · have := nextHolds_wd hB' hxenv (tailArgsOk_sound hargs i hi)
           rw [← this]
           unfold wd
           rw [mul_assoc, addressOfIndex, addressOfIndex, ← pow_add]
@@ -2518,8 +2724,8 @@ theorem walk_callIf (W : WalkEnv Prog cert A L fp f X Kb) (c : Core.V) (f' : Str
         rw [mul_assoc, addressOfIndex, addressOfIndex, ← pow_add, ← addressOfIndex]
         simpa [Sym.val, gpow_zero'] using h2
       have hret : retRegs L (fp * addressOfIndex S) = retRegs L fp := by
-        have e0 := sameOk_read hB' hr0
-        have e1 := sameOk_read hB' hr1
+        have e0 := nextHolds_read hB' hxenv hr0
+        have e1 := nextHolds_read hB' hxenv hr1
         unfold retRegs
         rw [mul_assoc, mul_assoc, addressOfIndex, addressOfIndex, ← pow_add, ← pow_add, ←
             addressOfIndex, ← addressOfIndex, e0, e1]
@@ -2534,7 +2740,7 @@ theorem walk_callIf (W : WalkEnv Prog cert A L fp f X Kb) (c : Core.V) (f' : Str
         apply List.ext_getElem (by simp [frameWords, cellsOf_length] at hna ⊢; omega)
         intro i h1' h2'
         simp only [List.getElem_map, frameWords, List.getElem_range]
-        have := sameOk_sound hB' (tailArgsOk_sound hargs i (by simpa using h1'))
+        have := nextHolds_wd hB' hxenv (tailArgsOk_sound hargs i (by simpa using h1'))
         rw [← this]
         unfold wd
         rw [mul_assoc, addressOfIndex, addressOfIndex, ← pow_add]

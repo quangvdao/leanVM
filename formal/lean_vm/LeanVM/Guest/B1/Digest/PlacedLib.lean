@@ -93,33 +93,28 @@ theorem list_split_completeAt (fs : String → ℕ) (cert : String → V → ℕ
         exact absurd hA List.not_mem_nil)
       (list_split_complete' rd hl _ _ ⟨a, ha, b, hb, c, hc, rfl, rfl⟩)
 
-/-! ## The events of a branch with a dispatch -/
+/-! ## The events of a body with a dispatch -/
 
-section Es5
+section Es3
 
-variable (σ : Val) (A B C D : List Ev) (c : V) (g : String) (a r : List V)
+variable (σ : Val) (B C : List Ev) (g : String) (a r : List V)
 
-theorem es5_allocs : allocs σ (A ++ .inK c :: ((B ++ .call g a r :: C) ++ D)) =
-    allocs σ A ++ (allocs σ B ++ (allocs σ C ++ allocs σ D)) := by
-  simp [allocs, List.filterMap_append, List.filterMap_cons, List.append_assoc, Ev.alloc?]
+theorem es3_allocs : allocs σ (B ++ .call g a r :: C) = allocs σ B ++ allocs σ C := by
+  simp [allocs, List.filterMap_append, List.filterMap_cons, Ev.alloc?]
 
-theorem es5_allocDsts : allocDsts (A ++ .inK c :: ((B ++ .call g a r :: C) ++ D)) =
-    allocDsts A ++ (allocDsts B ++ (allocDsts C ++ allocDsts D)) := by
-  simp [allocDsts, List.filterMap_append, List.filterMap_cons, List.append_assoc, Ev.allocDst?]
+theorem es3_allocDsts : allocDsts (B ++ .call g a r :: C) = allocDsts B ++ allocDsts C := by
+  simp [allocDsts, List.filterMap_append, List.filterMap_cons, Ev.allocDst?]
 
-theorem es5_addrs : addrs (A ++ .inK c :: ((B ++ .call g a r :: C) ++ D)) =
-    addrs A ++ (addrs B ++ (addrs C ++ addrs D)) := by
-  simp [addrs, List.filterMap_append, List.filterMap_cons, List.append_assoc, Ev.addr?]
+theorem es3_addrs : addrs (B ++ .call g a r :: C) = addrs B ++ addrs C := by
+  simp [addrs, List.filterMap_append, List.filterMap_cons, Ev.addr?]
 
-theorem es5_loads : loadAddrs σ (A ++ .inK c :: ((B ++ .call g a r :: C) ++ D)) =
-    loadAddrs σ A ++ (loadAddrs σ B ++ (loadAddrs σ C ++ loadAddrs σ D)) := by
-  simp [loadAddrs, List.filterMap_append, List.filterMap_cons, List.append_assoc, Ev.loadAddr?]
+theorem es3_loads : loadAddrs σ (B ++ .call g a r :: C) = loadAddrs σ B ++ loadAddrs σ C := by
+  simp [loadAddrs, List.filterMap_append, List.filterMap_cons, Ev.loadAddr?]
 
-theorem es5_calls : calls (A ++ .inK c :: ((B ++ .call g a r :: C) ++ D)) =
-    calls A ++ (calls B ++ (⟨g, a, r, true⟩ :: (calls C ++ calls D))) := by
-  simp [calls, List.filterMap_append, List.filterMap_cons, List.append_assoc, Ev.call?]
+theorem es3_calls : calls (B ++ .call g a r :: C) = calls B ++ ⟨g, a, r, true⟩ :: calls C := by
+  simp [calls, List.filterMap_append, Ev.call?]
 
-end Es5
+end Es3
 
 end
 end LeanVM.Guest.B1.Digest

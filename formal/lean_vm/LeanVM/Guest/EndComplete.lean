@@ -16,7 +16,7 @@ public import LeanVM.Guest.AcceptableChild
 # Completeness, the `honest` piece
 
 `MainComplete cert cnt b` is what the completeness of `main` (B1) gives for `NodeRelation` within the
-limits, the caps agreeing and no zero challenge where the guest divides: a consistent layout `L`
+limits and the caps agreeing: a consistent layout `L`
 in `[2, N)`, `N ≤ 2^30` words within the budget's words, on every memory holding which and the statement's digest at words `0`, `1` `main` holds by
 a tree placed at `0` (`RelAtIn`'s tree, as `honest_of_relAtIn` takes it) within the budget's
 instruction counts. The counts are bounded on that tree, the one completeness builds, not on every
@@ -39,7 +39,7 @@ variable (fs : String → ℕ) (H : Inst → ℕ → E × E) (C : Inst → List 
   (cert : String → V → ℕ) (cnt : Tree → Opcode → ℕ) (b : Budget)
 
 /-- **`main`'s completeness within the budget** (B1, `main` last): for `NodeRelation` within the
-limits, the caps and no zero challenge, the budget's size within `2^30`, a consistent layout of
+limits, the caps agreeing, the budget's size within `2^30`, a consistent layout of
 `N` words, `N` within the budget, on every memory of `2^logMem N` words holding which with the
 statement's digest as its header `main` holds by a tree placed at `0`, of `N` words, loading from
 its own data or its header, within the budget's instruction counts. -/
@@ -50,8 +50,8 @@ def MainComplete : Prop :=
       ∀ rd, LowDef (logMem N) rd → MemL rd L → rd 1 = some (hdrOf (statementDigest seed s)).1 →
         rd g = some (hdrOf (statementDigest seed s)).2 →
           ∃ t : Tree, t.name = "main" ∧ t.Valid coreProgram rd [] [] ∧ t.BufsOk coreProgram ∧
-            t.Placed coreProgram fs cert 0 ∧ t.total fs = N ∧
-            t.LoadsIn coreProgram fs cert (fun i => i < 2) 0 ∧
+            t.Placed coreProgram fs cert (0, t.block fs coreProgram.loop) ∧ t.total fs = N ∧
+            t.LoadsIn coreProgram fs cert (fun i => i < 2) (0, t.block fs coreProgram.loop) ∧
             ∀ op, cnt t op ≤ (b.instrs op).eval (work s w)
 
 /-- **The certificate's facts for every tree of `main`** (the checker). -/
@@ -60,7 +60,7 @@ def KFactsAll : Prop :=
 
 /-- **The instruction counts do not see the temporaries' values.** -/
 def CntRetemp : Prop :=
-  ∀ (ν : ℕ → String → Val → V → E) (t : Tree), cnt (t.retemp coreProgram fs ν 0) = cnt t
+  ∀ (ν : ℕ → String → Val → V → E) (t : Tree), cnt (t.retemp coreProgram fs ν (0, t.block fs coreProgram.loop)) = cnt t
 
 /-- **What completeness within the budget `b` rests on, in its owners' forms.** -/
 structure CompleteParts : Prop where

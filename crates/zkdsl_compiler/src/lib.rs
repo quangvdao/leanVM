@@ -37,6 +37,7 @@ mod ast;
 mod field;
 mod ir;
 mod lower;
+mod opt;
 mod parser;
 pub use ast::*;
 pub(crate) use ir::*;
@@ -47,6 +48,13 @@ pub use parser::{f128_literal, parse, parse_const, parse_with_constants, parse_w
 /// Compile an [`Ast`] to a provable [`CompiledProgram`]. Panics on a malformed program
 /// (unbound variable, missing `main`, address overflow).
 pub fn compile(ast: &Ast) -> CompiledProgram {
+    let (mut lowered, mut tables) = lower_all(ast);
+    opt::optimize(&mut lowered, &mut tables);
+    assemble(lowered, tables)
+}
+
+/// Lower every function, `main` first.
+fn lower_all(ast: &Ast) -> (Vec<Lowered>, JumpTables) {
     // Lower main first (it follows the table writes at pc 0), then the rest, expanding loop helpers.
     let mut queue: Vec<Func> = Vec::new();
     let main = ast
@@ -70,10 +78,8 @@ pub fn compile(ast: &Ast) -> CompiledProgram {
         .iter()
         .map(|(name, values)| (name.as_str(), values.as_slice()))
         .collect();
-    let dbg_lower = std::env::var("DBG_LOWER").is_ok();
 
     let mut loop_bounds = HashMap::new();
-    let mut loop_ctr = 0usize;
     let mut lowered: Vec<Lowered> = Vec::new();
     let mut tables = JumpTables::default();
     let mut i = 0;
@@ -90,13 +96,17 @@ pub fn compile(ast: &Ast) -> CompiledProgram {
         lowered.push(lower_func(
             &f,
             &mut queue,
-            &mut loop_ctr,
             &defs,
             &const_arrays,
             &mut loop_bounds,
             &mut tables,
         ));
     }
+    (lowered, tables)
+}
+
+/// Lay out the lowered functions and the jump tables, and resolve them to a [`CompiledProgram`].
+fn assemble(mut lowered: Vec<Lowered>, tables: JumpTables) -> CompiledProgram {
     // The tables sit past `main`'s own cells. At pc 0, in `main`'s frame (`fp = g^0`),
     // one `SET` per slot writes them, then falls through into `main`.
     let tables_base = lowered[0].frame_size;
@@ -116,10 +126,13 @@ pub fn compile(ast: &Ast) -> CompiledProgram {
                 name: "__jump_tables".into(),
                 code,
                 frame_size,
+                keep: frame_size,
+                rets: 0..0,
+                fixed: true,
             },
         );
     }
-    if dbg_lower {
+    if std::env::var("DBG_LOWER").is_ok() {
         for low in &lowered {
             eprintln!("== fn {} (frame {}) ==", low.name, pretty_integer(low.frame_size));
             for (i, ins) in low.code.iter().enumerate() {
@@ -172,8 +185,9 @@ pub fn compile(ast: &Ast) -> CompiledProgram {
                             match count {
                                 LoopCount::Constant(n) => RHint::Alloc {
                                     ptr,
-                                    size: size
-                                        .checked_mul(u32::try_from(n - 1).expect("loop range too large"))
+                                    size: u32::try_from(n - 1)
+                                        .ok()
+                                        .and_then(|n| size.checked_mul(n))
                                         .and_then(|frames| frames.checked_add(tail))
                                         .expect("loop frames overflow"),
                                 },
@@ -190,9 +204,10 @@ pub fn compile(ast: &Ast) -> CompiledProgram {
                             ptr,
                             size: frame_size[&callee],
                         },
-                        Hint::AllocFrameMax { ptr, callees } => RHint::Alloc {
+                        Hint::AllocArm { ptr, sel, callees } => RHint::AllocArm {
                             ptr,
-                            size: callees.iter().map(|c| frame_size[c]).max().unwrap(),
+                            sel,
+                            sizes: callees.iter().map(|c| frame_size[c]).collect(),
                         },
                         Hint::AllocBuffer { ptr, size } => RHint::Alloc { ptr, size },
                         Hint::AllocBufferDyn { ptr, size } => RHint::AllocDyn { ptr, size },
@@ -300,17 +315,14 @@ fn resolve(op: &LOp, entry: &HashMap<String, u32>, sentinel: u32, pc0: u32, fram
         }
     };
     match op {
-        LOp::MulNextFrame { a, b, c } => Op::Mul {
-            a: *a,
-            b: *b,
-            c: frame_size.checked_add(*c).expect("frame offset overflow"),
-        },
         LOp::Set { o, k: kv } => Op::Set {
             o: *o,
             k: resolve_kval(kv),
         },
         LOp::Xor { a, b, c } => Op::Xor { a: *a, b: *b, c: *c },
-        LOp::Mul { a, b, c } => Op::Mul { a: *a, b: *b, c: *c },
+        LOp::Mul { a, b, c } | LOp::Copy { src: a, one: b, dst: c } => Op::Mul { a: *a, b: *b, c: *c },
+        // The known operand first: a range check's `MUL K = x·y` is the shape its proof reads.
+        LOp::Solve { x, b, c } => Op::Mul { a: *b, b: *x, c: *c },
         LOp::Deref { o1, o2, o3, mode } => Op::Deref {
             o1: *o1,
             o2: *o2,

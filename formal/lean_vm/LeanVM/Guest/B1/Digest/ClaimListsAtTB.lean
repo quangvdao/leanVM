@@ -17,8 +17,9 @@ public import LeanVM.Guest.B1.Digest.ClaimListAtTB
 `ccB fs SB n`: `child_claim_list_digest`'s words on `n = 136a + 17b + c` claims: its frame; when
 `n ≠ 0`, `list_split`'s static bound `SB "list_split"` (a hypothesis, `TotalLe`) and
 `child_claim_list_any`'s `anyB fs n` (its frame, its chain buffer `13 (a + b + 1)`,
-`child_claim_list_any_loop0` within `a + 1` frames, `child_claim_list_any_loop1` within `b + 1`,
-`child_claim_list_last__L{c}` a leaf within its frame; a loop's frame alone when not entered).
+`child_claim_list_any_loop0` within `a` frames and its tail, `child_claim_list_any_loop1` within
+`b` and its tail, `child_claim_list_last__L{c}` a leaf within its frame; a loop's tail alone when
+not entered).
 `child_claim_list_digest_completeAtTB`: the placed completeness by a tree of honest shape within
 `ccB fs SB n`.
 -/
@@ -82,7 +83,7 @@ theorem child_claim_list_digest_completeAtTB (fs : String → ℕ) (cert : Strin
   have hok : KidsDTB fs cert κ (ccKids Lin eP rg L n base (keccak256 (cellsBytes cells))) (ccTs n)
       [SB "list_split", anyB fs n] :=
     ⟨fun _ => list_split_nB fs cert hκ hn hLS,
-      fun _ => child_claim_list_any_completeAtTB fs cert hn hl hL33 hLκ hrec hR2 hR3, trivial⟩
+      fun _ => child_claim_list_any_completeAtTB fs cert hκ hn hl hL33 hLκ hrec hR2 hR3, trivial⟩
   obtain ⟨N, Lown, rets, Lout, hN, ⟨rfl, rfl⟩, hW, hD, hr⟩ :=
     cc_nonempty fs cert (by omega) hn fp (kidsAt_of_kidsDTB hok _)
   refine ⟨_, Lown, _, [], ?_, ⟨rfl, rfl⟩, hW, hD, hr⟩
