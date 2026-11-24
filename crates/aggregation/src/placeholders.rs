@@ -580,19 +580,31 @@ fn stack_placeholders(ph: &mut Placeholders) {
     ph.set("STK_MIN_LOG", verifier::layout::MIN_STACKED_LOG);
 }
 
-/// The stacked bytecode's claim, the batch's seed, and the statement's layout.
+/// The deferred claim on the split program, the batch's seed, and the statement's layout.
 fn bytecode_placeholders(ph: &mut Placeholders, kbc: usize) {
+    use super::split::{KIND_ADDR, KIND_BC, KIND_WORD, SPLIT_LOG, split_terms};
     ph.set("BYTECODE_LOG", kbc);
-    // The defer region is the stacked bytecode claim's point (row, then slot) and its value.
-    let defer_size = kbc + BUS_BITS + 1;
+    let (columns, terms) = split_terms();
+    // A fresh claim is the link point's instruction coordinates and the split columns' values there; a carried one,
+    // the point (instructions, then columns) and its value.
+    let defer_size = kbc + columns.len();
     ph.set("DEFER_SIZE", defer_size);
-    ph.set("BYTECODE_VARS", kbc + BUS_BITS);
+    ph.set("N_SPLIT", columns.len());
+    ph.set("SPLIT_LOG", SPLIT_LOG);
+    ph.set("BYTECODE_VARS", kbc + SPLIT_LOG);
+    ph.set("N_SPLIT_TERMS", terms.len());
+    ph.list("PW_COL", terms.iter().map(|t| t.column));
+    ph.list("PW_FRAME", terms.iter().map(|t| usize::from(t.frame)));
+    ph.list("PW_KIND", terms.iter().map(|t| t.kind));
+    ph.list("PW_ARG", terms.iter().map(|t| t.arg));
+    ph.list("PW_COEF", terms.iter().map(|t| from_scalar(t.coef)));
+    assert_eq!([KIND_BC, KIND_ADDR, KIND_WORD], [0, 1, 2], "the guest's term kinds");
     let agg_seed = FiatShamirState::<F128>::from_label(RECURSION_AGG_LABEL).capacity_cells();
     for (c, cell) in agg_seed.iter().enumerate() {
         ph.set(&format!("AGG_SEED_{c}"), cell);
     }
     // A child's words: its statement's two, its fresh claim, and its carried claim's cells.
-    let child_words = 2 + 2 * defer_size;
+    let child_words = 2 + defer_size + kbc + SPLIT_LOG + 1;
     ph.set(
         "AGG_CHILD_PAD",
         child_words.next_multiple_of(RATE_SCALARS) - child_words,
@@ -783,16 +795,11 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
         p
     };
     let (mut next0, mut next1, mut pc, mut fp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut op_start, mut op_form) = (Vec::new(), Vec::new());
-    let (mut acc_start, mut acc_addr, mut acc_v0, mut acc_v1, mut acc_gate, mut acc_shift, mut acc_ptr) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
+    let (mut op_start, mut op_form, mut op_slot) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut acc_start, mut acc_addr, mut acc_value, mut acc_gate, mut acc_shift, mut acc_ptr) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // The word reads: the pointer whose word they weigh, their access, and their scale.
+    let (mut wr_ptr, mut wr_acc, mut wr_scale) = (Vec::new(), Vec::new(), Vec::new());
     let (mut ptr_start, mut ptr_block) = (Vec::new(), Vec::new());
     for (t, table) in tables.iter().enumerate() {
         assert_eq!(table.opcode, t);
@@ -805,38 +812,56 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
         next0.push(form(t, &state.next[0]));
         next1.push(form(t, &state.next[1]));
         op_start.push(op_form.len());
-        for operand in &bc.operands {
+        for (slots, operand) in &bc.operands {
             let f = form(t, operand);
             op_form.push(f);
+            op_slot.push(slots[0]);
         }
         let pointers = links.pointers();
         ptr_start.push(ptr_block.len());
         acc_start.push(acc_addr.len());
         for access in &links.memory {
+            for read in &access.reads {
+                if let verifier::layout::Read::Word { pointer, scale } = read {
+                    wr_ptr.push(ptr_start[t] + pointers.iter().position(|p| p == pointer).unwrap());
+                    wr_acc.push(acc_addr.len());
+                    wr_scale.push(form(t, scale));
+                }
+            }
             acc_addr.push(form(t, &access.address));
-            acc_v0.push(form(t, &access.values[0]));
-            acc_v1.push(form(t, &access.values[1]));
+            acc_value.push(form(t, &access.value));
             acc_gate.push(access.gate.map_or(NO_POS, |g| pos(t, g)));
             acc_shift.push(access.shift);
             let k = pointers.iter().position(|&p| p == access.pointer).unwrap();
             assert!(k >= 2, "an access reads its own pointer");
             acc_ptr.push(ptr_start[t] + k);
         }
+        // A pointer column on a q_keccak slot is `N_STK_BLOCKS + slot`, as a sent one is.
         for &p in &pointers {
-            ptr_block.push(block_of(GLOBAL_COLUMN_BASES[t] + p).expect("a pointer column has a block"));
+            let column = GLOBAL_COLUMN_BASES[t] + p;
+            ptr_block.push(match qkeccak_slot(column) {
+                Some(s) => blocks.len() + s,
+                None => block_of(column).expect("a pointer column has a block or a slot"),
+            });
         }
+        assert!(
+            ptr_block[ptr_start[t]] < blocks.len(),
+            "a table's first pointer column has a block"
+        );
         assert_eq!(table.n_constraints() > 0, t == OP_JUMP, "only JUMP has identities");
     }
     op_start.push(op_form.len());
     acc_start.push(acc_addr.len());
     ptr_start.push(ptr_block.len());
     let n_pointers = ptr_block.len();
-    // The guest weighs a table's pointer columns with one product table, so their blocks share one height.
+    // The guest weighs a table's pointer columns on blocks with one product table, so their blocks share one height.
     let blocks = verifier::layout::stack_blocks();
     for w in ptr_start.windows(2) {
         let size = |b: usize| (super::stripe::source_index(blocks[b].source), blocks[b].adj);
         assert!(
-            ptr_block[w[0]..w[1]].iter().all(|&b| size(b) == size(ptr_block[w[0]])),
+            ptr_block[w[0]..w[1]]
+                .iter()
+                .all(|&b| b >= blocks.len() || size(b) == size(ptr_block[w[0]])),
             "a table's pointer blocks share one height"
         );
     }
@@ -912,10 +937,14 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
     ph.list("STATE_NEXT1", next1);
     ph.list("BC_OP_START", op_start);
     ph.list("BC_OP_FORM", op_form);
+    ph.list("BC_OP_SLOT", op_slot);
     ph.list("ACC_START", acc_start);
     ph.list("ACC_ADDR", acc_addr);
-    ph.list("ACC_V0", acc_v0);
-    ph.list("ACC_V1", acc_v1);
+    ph.list("ACC_VALUE", acc_value);
+    ph.set("N_WORD_READS", wr_ptr.len());
+    ph.list("WR_PTR", wr_ptr);
+    ph.list("WR_ACC", wr_acc);
+    ph.list("WR_SCALE", wr_scale);
     ph.list("ACC_GATE", acc_gate);
     ph.list("ACC_SHIFT", acc_shift);
     ph.set("N_ACCESSES", acc_ptr.len());

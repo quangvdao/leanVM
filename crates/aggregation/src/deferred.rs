@@ -1,22 +1,20 @@
-//! The deferred claim on the stacked bytecode and the sumcheck that batches it.
+//! The deferred claim on the split program and the sumcheck that batches it.
 
 use super::cells::count;
-use super::guest::unified_guest;
 use super::hints::SubHints;
+use super::split::{SPLIT_LOG, split_live, split_table, split_values};
 use fiat_shamir_prover::{FiatShamirState, RATE_SCALARS, Sequential, grinding_bits};
 use isa::Prover;
 use lean_vm_core::cpu::{from_scalar, to_scalar};
 use primitives::field::F128;
-use verifier::bus_layout::BUS_BITS;
 // `eq` tables on the calling thread: the batch runs under either prover, some of it in its pool's tasks.
 use primitives::multilinear::{eq_table_serial as eq_table, interp};
 use std::ops::Range;
 
 pub(super) const RECURSION_AGG_LABEL: &[u8] = b"leanvm/recursion-aggregation/v1";
 
-/// The claim on the stacked bytecode that a node defers rather than evaluating
-/// in-circuit: one point and value (`doc/leanvm/main.tex` §Deferred evaluation
-/// claims).
+/// The claim on the split program ([`split_table`]) that a node defers rather than evaluating in-circuit: one point
+/// and value (`doc/leanvm/main.tex` §Deferred evaluation claims).
 ///
 /// Only the point is transmitted; the value is derived from it on receipt, so a
 /// prover that lies about a value changes the statement its proof has to satisfy
@@ -36,27 +34,27 @@ impl DeferredBytecodeClaim {
 
     /// The claim at `bytecode_point`, its value read off the point's [`bytecode_sums`].
     pub(super) fn from_sums(bytecode_point: Vec<F128>, sums: &[F128]) -> Self {
-        let bytecode_value = bytecode_value(sums, &bytecode_point);
+        let bytecode_value = bytecode_value_of(sums, &bytecode_point);
         Self {
             bytecode_point,
             bytecode_value,
         }
     }
 
-    /// The claim at `bytecode_point`, a point of [`bytecode_vars`] coordinates, evaluated by the `verifier` crate,
-    /// scalar and single threaded: what a received aggregate is checked with.
+    /// The claim at `bytecode_point`, a point of [`bytecode_vars`] coordinates (the instructions', then the split
+    /// columns'), evaluated by the `verifier` crate, scalar and single threaded: what a received aggregate is checked
+    /// with.
     pub(super) fn recompute(bytecode_point: Vec<F128>) -> Self {
-        // Every leaf defers the all-zeros point, where the bytecode polynomial is just its table's first entry: a
-        // leaf is the aggregate people verify most, and the general path is a pass over the whole table.
+        // Every leaf defers the all-zeros point, where the table is just its first entry: a leaf is the aggregate
+        // people verify most, and the general path is a pass over the program.
         let bytecode_value = if bytecode_point.iter().all(|x| *x == F128::ZERO) {
-            F128::new(unified_guest().stacked_bytecode()[0], 0)
+            F128::new(split_table()[0], 0)
         } else {
-            let scalars: Vec<_> = bytecode_point.iter().map(to_scalar).collect();
-            from_scalar(
-                unified_guest()
-                    .bytecode()
-                    .evaluate(&scalars)
-                    .expect("a point of bytecode_vars() coordinates"),
+            let (row, column) = bytecode_point.split_at(bytecode_vars() - SPLIT_LOG);
+            let scalars: Vec<_> = row.iter().map(to_scalar).collect();
+            fold_columns(
+                column,
+                &split_values(&scalars).into_iter().map(from_scalar).collect::<Vec<_>>(),
             )
         };
         Self {
@@ -73,37 +71,58 @@ impl DeferredBytecodeClaim {
     }
 }
 
-/// The rows of [`BLOCK`] entries of the stacked bytecode that hold its populated slots: every other row is
-/// structurally zero.
+/// The claim a child's verification raises: the split columns' values at its link point's instruction coordinates.
+#[derive(Clone, Debug)]
+pub(super) struct FreshClaim {
+    pub(super) point: Vec<F128>,
+    pub(super) values: Vec<F128>,
+}
+
+impl FreshClaim {
+    /// The split columns at `point`, a point over the instructions.
+    pub(super) fn at(point: Vec<F128>) -> Self {
+        let scalars: Vec<_> = point.iter().map(to_scalar).collect();
+        let values = split_values(&scalars).into_iter().map(from_scalar).collect();
+        Self { point, values }
+    }
+
+    /// The cells the batch absorbs: the point, then the values.
+    fn cells(&self) -> Vec<F128> {
+        [&self.point[..], &self.values[..]].concat()
+    }
+}
+
+/// `Σ_j eq(column, j)·values[j]`: the split columns' values folded at the column point.
+fn fold_columns(column: &[F128], values: &[F128]) -> F128 {
+    eq_table(column).iter().zip(values).map(|(&e, &v)| e * v).sum()
+}
+
+/// The rows of [`BLOCK`] entries of the split table that hold its live columns: every other row is zero.
 fn bytecode_rows() -> Range<usize> {
     static ROWS: std::sync::OnceLock<Range<usize>> = std::sync::OnceLock::new();
     ROWS.get_or_init(|| {
-        let rows = unified_guest().stacked_bytecode().as_chunks::<BLOCK>().0;
-        let per_slot = rows.len() >> BUS_BITS;
+        let rows = split_table().len() / BLOCK;
+        let per_column = rows >> SPLIT_LOG;
         assert!(
-            per_slot.is_multiple_of(8),
-            "a slot is whole groups of rows, as `Prover::combine_rows` may require"
+            per_column.is_multiple_of(8),
+            "a column is whole groups of rows, as `Prover::combine_rows` may require"
         );
-        let live = |s: &usize| rows[s * per_slot..(s + 1) * per_slot].iter().flatten().any(|&v| v != 0);
-        let slots = || 0..1 << BUS_BITS;
-        let start = slots().find(live).expect("the bytecode is not all zero");
-        let end = slots().rfind(live).expect("the bytecode is not all zero") + 1;
-        start * per_slot..end * per_slot
+        0..split_live() * per_column
     })
     .clone()
 }
 
-/// Low row variables of the stacked bytecode, which the batch binds first.
+/// Low row variables of the split table, which the batch binds first.
 const BLOCK_VARS: usize = 10;
 const BLOCK: usize = 1 << BLOCK_VARS;
 
-/// Per claim point, the stacked bytecode with the point's weight on all but the low `BLOCK_VARS` variables summed
+/// Per claim point, the split table with the point's weight on all but the low `BLOCK_VARS` variables summed
 /// out: `G(low) = Σ_r eq(point[BLOCK_VARS..], r) · row_r[low]`, over rows `r` of `BLOCK` entries. The weight
 /// `eq(point, ·)` is a product of a factor on the low variables and one on the rest, so the batch's low rounds run
-/// on these, and a point's value is read off its own ([`bytecode_value`]).
+/// on these, and a point's value is read off its own (`bytecode_value_of`).
 pub(super) fn bytecode_sums<P: Prover>(points: &[Vec<F128>]) -> Vec<Vec<F128>> {
     let _span = tracing::info_span!("Bytecode sums").entered();
-    let (table, live) = (unified_guest().stacked_bytecode(), bytecode_rows());
+    let (table, live) = (split_table(), bytecode_rows());
     points
         .iter()
         .map(|point| {
@@ -121,8 +140,8 @@ pub(super) fn bytecode_sums<P: Prover>(points: &[Vec<F128>]) -> Vec<Vec<F128>> {
         .collect()
 }
 
-/// The stacked bytecode at `point`, from its [`bytecode_sums`].
-pub(super) fn bytecode_value(sums: &[F128], point: &[F128]) -> F128 {
+/// The split table at `point`, from its [`bytecode_sums`].
+fn bytecode_value_of(sums: &[F128], point: &[F128]) -> F128 {
     eq_table(&point[..BLOCK_VARS])
         .iter()
         .zip(sums)
@@ -130,10 +149,9 @@ pub(super) fn bytecode_value(sums: &[F128], point: &[F128]) -> F128 {
         .sum()
 }
 
-/// Variables of a bytecode claim's point: the log row count plus the stacking
-/// selectors.
+/// Variables of a deferred claim's point: the instructions', then the split columns'.
 pub(super) fn bytecode_vars() -> usize {
-    unified_guest().stacked_bytecode().len().trailing_zeros() as usize
+    split_table().len().trailing_zeros() as usize
 }
 
 fn fold_lsb(table: &mut Vec<F128>, challenge: F128) {
@@ -154,8 +172,9 @@ fn round_msg(u: &[F128], m: &[F128]) -> (F128, F128) {
     })
 }
 
-/// The grind before the batching challenge, whose powers weigh at most `2 MAX_RECURSIONS` claims.
-pub(super) const BATCH_LAM_GRIND_BITS: u32 = grinding_bits(2 * super::MAX_RECURSIONS as u128 - 1);
+/// The grind before the batching challenges: the powers of `lam` weigh at most `2 MAX_RECURSIONS` claims, and
+/// each fresh claim's values are folded at the `SPLIT_LOG` column challenges.
+pub(super) const BATCH_LAM_GRIND_BITS: u32 = grinding_bits((2 * super::MAX_RECURSIONS - 1 + SPLIT_LOG) as u128);
 
 /// One round of a batching sumcheck, in the transcript order the guest mirrors
 /// word for word: observe `(g1, g_inf)`, grind for the round's degree two, squeeze the fold challenge, record
@@ -181,17 +200,18 @@ fn absorb_round(
     challenge
 }
 
-/// Mirror the guest's `aggregate_claims` transcript and prove the batching
-/// sumcheck over the stacked bytecode.
+/// Mirror the guest's `aggregate_claims` transcript and prove the batching sumcheck over the split table.
 ///
-/// Each child brings its public input and two claims, the fresh one its verification raised and the one it deferred:
-/// `claims` holds them child by child in that order, and `sums` their [`bytecode_sums`]. A child's fresh claim is
+/// Each child brings its public input and two claims, the fresh one its verification raised and the one it deferred;
+/// `carried_sums` are the carried ones' [`bytecode_sums`]. After the batch absorbs them all, `lam` and the column
+/// challenges turn each fresh claim into one at its point and the column challenges. A child's fresh claim is
 /// batched with its carried one at every child count, one included. Returns the guest hints and the single claim they
 /// reduce to.
 pub(super) fn aggregate_deferred_claims<P: Prover>(
     public_inputs: &[[F128; 2]],
-    claims: &[DeferredBytecodeClaim],
-    mut sums: Vec<Vec<F128>>,
+    fresh: &[FreshClaim],
+    carried: &[DeferredBytecodeClaim],
+    carried_sums: Vec<Vec<F128>>,
 ) -> (SubHints, DeferredBytecodeClaim) {
     let kbcv = bytecode_vars();
 
@@ -205,11 +225,12 @@ pub(super) fn aggregate_deferred_claims<P: Prover>(
     };
     transcript.observe(count(public_inputs.len()));
     pad(&mut transcript, 1);
-    for (public_input, pair) in public_inputs.iter().zip(claims.chunks(2)) {
+    for ((public_input, fresh), carried) in public_inputs.iter().zip(fresh).zip(carried) {
         let words: Vec<F128> = public_input
             .iter()
             .copied()
-            .chain(pair.iter().flat_map(|claim| claim.cells()))
+            .chain(fresh.cells())
+            .chain(carried.cells())
             .collect();
         for &value in &words {
             transcript.observe(value);
@@ -222,11 +243,32 @@ pub(super) fn aggregate_deferred_claims<P: Prover>(
     // are short, so they search on the calling thread, under either prover.
     let nonce = transcript.grind::<Sequential>(BATCH_LAM_GRIND_BITS);
     let lam = transcript.sample();
+    let column: Vec<F128> = (0..SPLIT_LOG).map(|_| transcript.sample()).collect();
+    let fresh_points: Vec<Vec<F128>> = fresh.iter().map(|f| [&f.point[..], &column[..]].concat()).collect();
+    let fresh_sums = bytecode_sums::<P>(&fresh_points);
+    let mut claims = Vec::with_capacity(2 * fresh.len());
+    let mut sums = Vec::with_capacity(2 * fresh.len());
+    for ((((point, f), fs), c), cs) in fresh_points
+        .into_iter()
+        .zip(fresh)
+        .zip(fresh_sums)
+        .zip(carried)
+        .zip(carried_sums)
+    {
+        let bytecode_value = fold_columns(&column, &f.values);
+        debug_assert_eq!(bytecode_value, bytecode_value_of(&fs, &point));
+        claims.push(DeferredBytecodeClaim {
+            bytecode_point: point,
+            bytecode_value,
+        });
+        sums.push(fs);
+        claims.push(c.clone());
+        sums.push(cs);
+    }
     let powers: Vec<F128> = std::iter::successors(Some(F128::ONE), |&power| Some(power * lam))
         .take(claims.len())
         .collect();
-    // The running claim: the claims' values weighed by their powers.
-    let mut claim: F128 = powers.iter().zip(claims).map(|(&g, c)| g * c.bytecode_value).sum();
+    let mut claim: F128 = powers.iter().zip(&claims).map(|(&g, c)| g * c.bytecode_value).sum();
     let mut messages: Vec<F128> = nonce.map(|nonce| F128::new(nonce, 0)).into_iter().collect();
     let mut challenges = Vec::new();
     // The low rounds, on each claim's sums against its `eq` on the low rows, scaled by its power of `lam`.
@@ -255,7 +297,7 @@ pub(super) fn aggregate_deferred_claims<P: Prover>(
     }
     // The rest: every row against the low challenges, zero outside the populated ones, and each claim's `eq` on
     // the rows, scaled by what its low rows left.
-    let (table, live) = (unified_guest().stacked_bytecode(), bytecode_rows());
+    let (table, live) = (split_table(), bytecode_rows());
     let mut rows = vec![F128::ZERO; table.len() / BLOCK];
     let low_eq: Vec<_> = eq_table(&challenges).iter().map(to_scalar).collect();
     let dots = P::dot_rows(&table[live.start * BLOCK..live.end * BLOCK], &low_eq);

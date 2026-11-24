@@ -1,7 +1,7 @@
 use super::cells::{count, pack_16_bytes};
-use super::deferred::{DeferredBytecodeClaim, bytecode_sums, bytecode_value, bytecode_vars};
+use super::deferred::{DeferredBytecodeClaim, bytecode_sums, bytecode_vars};
 use super::error::AggregateError;
-use super::guest::{GUEST_SOURCE, compile_guest, unified_guest};
+use super::guest::{GUEST_SOURCE, compile_guest};
 use super::hints::{FORGE, Forgery, Hints};
 use super::placeholders::placeholder_map;
 use super::proof::{AggregateProof, decode, encode};
@@ -279,7 +279,7 @@ fn forged_link_hints_are_rejected() {
         up("table_logs", 1),
         up("link_shape", 0),
         up("link_shape", 1),
-        Box::new(|hints: &mut Hints| hints.entry_mut("bc_value", 0)[0] += F128::ONE),
+        Box::new(|hints: &mut Hints| hints.entry_mut("split_values", 0)[0] += F128::ONE),
     ];
     for forgery in forgeries {
         assert_forgery_rejected(forgery, std::slice::from_ref(&child), vec![], vec![], &[]);
@@ -896,10 +896,10 @@ fn aggregate_three_levels() {
     assert!(received.verify(&root.0), "the receiver's claims verify");
 }
 
-/// A claim's value, read off its sums or recomputed, is the bytecode's evaluation, at a random point and at a leaf's,
-/// where both take a fast path.
+/// A claim's value read off its sums, the split table's path, is the one recomputed by `Bytecode::split`, at a random
+/// point and at a leaf's, where both take a fast path.
 #[test]
-fn bytecode_values_are_the_bytecode_evaluation() {
+fn deferred_values_agree_on_the_table_and_the_split() {
     let mut rng = StdRng::seed_from_u64(11);
     let limbs = (0..bytecode_vars()).map(|_| rand::Rng::random::<(u64, u64)>(&mut rng));
     let points = [
@@ -908,10 +908,11 @@ fn bytecode_values_are_the_bytecode_evaluation() {
     ];
     StableProver::init();
     for (sums, point) in bytecode_sums::<StableProver>(&points).iter().zip(&points) {
-        let scalars: Vec<_> = point.iter().map(to_scalar).collect();
-        let value = from_scalar(unified_guest().bytecode().evaluate(&scalars).unwrap());
-        assert_eq!(bytecode_value(sums, point), value);
-        assert_eq!(DeferredBytecodeClaim::recompute(point.clone()).bytecode_value, value);
+        let value = DeferredBytecodeClaim::recompute(point.clone()).bytecode_value;
+        assert_eq!(
+            DeferredBytecodeClaim::from_sums(point.clone(), sums).bytecode_value,
+            value
+        );
     }
 }
 

@@ -27,7 +27,7 @@
 //! size, and here the inner bytecode is this one. Its digest does not need a
 //! fixed point, riding the statement instead of the code.
 //!
-//! One fixed polynomial, the stacked bytecode, is too
+//! One fixed polynomial, the program split by opcode, is too
 //! big to evaluate in-circuit, so each node exports one deferred claim on it
 //! and batches its children's carried claims with the fresh ones its
 //! verifications raise (`doc/leanvm/main.tex` §Deferred evaluation claims). Only
@@ -49,6 +49,7 @@ mod placeholders;
 mod proof;
 #[cfg(any(test, feature = "signers-cache"))]
 pub mod signers_cache;
+mod split;
 mod statement;
 mod stripe;
 #[cfg(test)]

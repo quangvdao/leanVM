@@ -69,7 +69,7 @@ PAIR_SLOTS = 2  # a two-field chain
 PEND_SLOTS = 13
 
 INDEX_MLE_FACTORS = INDEX_MLE_FACTORS_PLACEHOLDER  # 1 + g^(2^i)
-# The bytecode's columns, stacked along LOG2_BYTECODE_COLS selector bits into one multilinear.
+# An instruction's 16 slots, indexed by LOG2_BYTECODE_COLS bits: the link weighs slot s by eq(alpha, s).
 LOG2_BYTECODE_COLS = LOG2_BYTECODE_COLS_PLACEHOLDER
 
 # --------------------------------------------------------------- the six tables
@@ -222,14 +222,19 @@ STATE_NEXT0 = STATE_NEXT0_PLACEHOLDER
 STATE_NEXT1 = STATE_NEXT1_PLACEHOLDER
 BC_OP_START = BC_OP_START_PLACEHOLDER
 BC_OP_FORM = BC_OP_FORM_PLACEHOLDER
+BC_OP_SLOT = BC_OP_SLOT_PLACEHOLDER  # an operand equation's first slot, whose challenge weighs it
 ACC_START = ACC_START_PLACEHOLDER
 ACC_ADDR = ACC_ADDR_PLACEHOLDER
-ACC_V0 = ACC_V0_PLACEHOLDER
-ACC_V1 = ACC_V1_PLACEHOLDER
+ACC_VALUE = ACC_VALUE_PLACEHOLDER
 ACC_GATE = ACC_GATE_PLACEHOLDER
 ACC_SHIFT = ACC_SHIFT_PLACEHOLDER
 N_ACCESSES = N_ACCESSES_PLACEHOLDER
 ACC_PTR = ACC_PTR_PLACEHOLDER
+# The word reads: the word at pointer WR_PTR, under access WR_ACC's mu, scaled by form WR_SCALE.
+N_WORD_READS = N_WORD_READS_PLACEHOLDER
+WR_PTR = WR_PTR_PLACEHOLDER
+WR_ACC = WR_ACC_PLACEHOLDER
+WR_SCALE = WR_SCALE_PLACEHOLDER
 PTR_START = PTR_START_PLACEHOLDER
 PTR_BLOCK = PTR_BLOCK_PLACEHOLDER
 N_POINTERS = N_POINTERS_PLACEHOLDER
@@ -282,15 +287,26 @@ LIG_MIN_SHIFT_INV = LIG_MIN_SHIFT_INV_PLACEHOLDER
 QKECCAK_VARS_CAP = QKECCAK_VARS_CAP_PLACEHOLDER
 
 # ------------------------------------------------------ statements and deferral
-# A node defers one claim on the stacked bytecode. DEFER_SIZE is the region one
-# sub-proof's verification exports (the claim's point, then its value);
-# DEFER_STMT_* index the batched claim a node's OWN statement carries, laid out the
-# same way. The Fiat-Shamir seed rides the public input rather than being baked,
+# A node defers one claim on the program split by opcode (the link's columns, N_SPLIT
+# of them padded to 2^SPLIT_LOG). DEFER_SIZE is the region one sub-proof's verification
+# exports: the link point's BYTECODE_LOG instruction coordinates, then the split columns'
+# values there. DEFER_STMT_* index the batched claim a node's OWN statement carries: its
+# point (instructions, then columns), then its value. The Fiat-Shamir seed rides the public input rather than being baked,
 # so one compiled guest verifies proofs of any inner program.
 BYTECODE_LOG = BYTECODE_LOG_PLACEHOLDER  # log rows of the bytecode blocks
 DEFER_SIZE = DEFER_SIZE_PLACEHOLDER
-BYTECODE_VARS = BYTECODE_VARS_PLACEHOLDER  # = BYTECODE_LOG + LOG2_BYTECODE_COLS
-FRESH_BC_VALUE = BYTECODE_VARS
+BYTECODE_VARS = BYTECODE_VARS_PLACEHOLDER  # = BYTECODE_LOG + SPLIT_LOG
+N_SPLIT = N_SPLIT_PLACEHOLDER
+SPLIT_LOG = SPLIT_LOG_PLACEHOLDER
+# The program side (verifier::link::slot_weights): term i adds PW_COEF * factor * split
+# column PW_COL to X_omega, or to P_fp when PW_FRAME. The factor is eta_bc * slot[PW_ARG]
+# (kind 0), eta_mem * gm0 * mu[PW_ARG] (kind 1) or eta_mem * gm1 * mu[PW_ARG] (kind 2).
+N_SPLIT_TERMS = N_SPLIT_TERMS_PLACEHOLDER
+PW_COL = PW_COL_PLACEHOLDER
+PW_FRAME = PW_FRAME_PLACEHOLDER
+PW_KIND = PW_KIND_PLACEHOLDER
+PW_ARG = PW_ARG_PLACEHOLDER
+PW_COEF = PW_COEF_PLACEHOLDER
 N_ROW_LOGS = MAX_PTR_WIDTH + 1  # a table's log height is at most the pointer width
 ROW_BITS = N_ROW_LOGS + 1  # a row count's bits, a table's stride in the row-bit buffer
 LINK_W_ARMS = MAX_PTR_WIDTH + 1 - BYTECODE_LOG  # the pointer widths from BYTECODE_LOG
@@ -2999,6 +3015,13 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     # columns on as many lanes as its first share that column's row, Frobenius being
     # additive; any other column takes its own.
     ring_rows(rchi, chi, point1, c_table, g_n)
+    # A q_keccak slot's bits, for the sent columns and the pointer columns on slots.
+    eq_prefix_chain(chain_chi, 1, chi, point1, g_n)
+    done = match(log(v2), range(0, 6), lambda w: slot_point(tpt, point, h5_g, lane_g, w))
+    eqtree(tpt, tq, QKECCAK_SLOT_LOG)
+    # A pointer column on a slot is q_keccak at (chi[..h5], slot): its rows' product,
+    # then the slot's bits, Boolean, so one eq factor for every Frobenius power.
+    row_h5 = rchi * h5_g ** BASE_FIELD_BITS
     w_link = 0
     for t in unroll(0, N_TABLES):
         if const(PTR_START[t + 1] != PTR_START[t]):
@@ -3011,18 +3034,23 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
             done = match(log(v0), range(0, 6), lambda v: ring_tail_row(trow, row0, a0, lane1, v))
             for q in unroll(PTR_START[t], PTR_START[t + 1]):
                 b = PTR_BLOCK[q]
-                v_g = spread[GEN ** b]
-                if v_g == v0:
-                    pmask[GEN ** q] = sel_v[GEN ** b]
-                    pext[GEN ** q] = 0
-                else:
+                if const(b // N_STK_BLOCKS != 0):
                     pmask[GEN ** q] = 0
-                    p_g = piece_log[GEN ** b]
-                    row = rchi * p_g ** BASE_FIELD_BITS
-                    a_q = chi * p_g
-                    scale = eq_q[GEN ** (EQ_Q_AT + q)]
-                    wq = match(log(v_g), range(0, 6), lambda v: ring_tail(row, a_q, lane1, scale, v))
-                    pext[GEN ** q] = wq * sel_v[GEN ** b]
+                    w_slot = ring_tail(row_h5, chi, point1, eq_q[GEN ** (EQ_Q_AT + q)], 0)
+                    pext[GEN ** q] = w_slot * tq[GEN ** (2 ** QKECCAK_SLOT_LOG - 2 + b - N_STK_BLOCKS)] * sel2
+                else:
+                    v_g = spread[GEN ** b]
+                    if v_g == v0:
+                        pmask[GEN ** q] = sel_v[GEN ** b]
+                        pext[GEN ** q] = 0
+                    else:
+                        pmask[GEN ** q] = 0
+                        p_g = piece_log[GEN ** b]
+                        row = rchi * p_g ** BASE_FIELD_BITS
+                        a_q = chi * p_g
+                        scale = eq_q[GEN ** (EQ_Q_AT + q)]
+                        wq = match(log(v_g), range(0, 6), lambda v: ring_tail(row, a_q, lane1, scale, v))
+                        pext[GEN ** q] = wq * sel_v[GEN ** b]
                 w_link = w_link + pext[GEN ** q]
             scl = eq_q * GEN ** (EQ_Q_AT + PTR_START[t])
             msk = pmask * GEN ** PTR_START[t]
@@ -3047,9 +3075,6 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
 
     # The sent columns, each at its table's row point: on its own block, or a slot of
     # q_keccak, whose bits sit at h5 and on q_keccak's lane coordinates.
-    eq_prefix_chain(chain_chi, 1, chi, point1, g_n)
-    done = match(log(v2), range(0, 6), lambda w: slot_point(tpt, point, h5_g, lane_g, w))
-    eqtree(tpt, tq, QKECCAK_SLOT_LOG)
     slot_eq = chain_chi[h5_g] * sel2
     for j in unroll(0, LINK_N_SENT):
         if const(SENT_TARGET[j] != LINK_NO_POS):
@@ -3111,7 +3136,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     r_pt = HeapBuf(MAX_PTR_WIDTH)
     pre = HeapBuf(MAX_PTR_WIDTH + 1)
     vals3 = HeapBuf(3)
-    bcv = HeapBuf(1)
+    splitv = HeapBuf(N_SPLIT)
     chi = HeapBuf(MAX_PTR_WIDTH)
     q_point = HeapBuf(LINK_Q_VARS)
     eq_q = HeapBuf(2 ** (LINK_Q_VARS + 1) - 2)
@@ -3245,9 +3270,9 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
     sp, gs0 = squeeze(sp, no_rate, 0)
     sp, gs1 = squeeze(sp, no_rate, 0)
+    # On the address, the word and the presence; a word lo + Y hi takes gm1 Y on its high limb.
     sp, gm0 = squeeze(sp, no_rate, 0)
     sp, gm1 = squeeze(sp, no_rate, 0)
-    sp, gm2 = squeeze(sp, no_rate, 0)
     sp, gm3 = squeeze(sp, no_rate, 0)
     mu = StackBuf(N_ACCESSES)
     for a in unroll(0, N_ACCESSES):
@@ -3283,11 +3308,28 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     eq0_r = pre[g_w]
     below_mem = eq0_r / pre[g_log_mem]
     below_bc = eq0_r / pre[GEN ** BYTECODE_LOG]
-    # The program at (r[..kbc], alpha): advice, the claim this proof defers.
-    hint_witness(bcv[0:1], "bc_value")
-    bc_value = bcv[GEN ** 0]
-    y_mem = gm0 * idx + gm3 * below_mem + m1
-    x_bc = slot[GEN ** 1] * idx + below_bc * (slot[GEN ** 2] + bc_value)
+    # The split program at r[..kbc]: advice, the claim this proof raises. The program side
+    # weighs it into X_omega (on the rows' weight) and P_fp (on omega fp).
+    hint_witness(splitv[0:N_SPLIT], "split_values")
+    em_g0 = eta_mem * gm0
+    em_g1 = eta_mem * gm1
+    program = 0
+    frame_program = 0
+    for i in unroll(0, N_SPLIT_TERMS):
+        if const(PW_KIND[i] == 0):
+            pw_f = eta_bc * slot[GEN ** PW_ARG[i]]
+        elif const(PW_KIND[i] == 1):
+            pw_f = em_g0 * mu[PW_ARG[i]]
+        else:
+            pw_f = em_g1 * mu[PW_ARG[i]]
+        pw_t = PW_COEF[i] * pw_f * splitv[GEN ** PW_COL[i]]
+        if const(PW_FRAME[i] == 0):
+            program = program + pw_t
+        else:
+            frame_program = frame_program + pw_t
+    y_mem = gm0 * idx + gm3 * below_mem + gm1 * m1
+    x_bc = eta_bc * slot[GEN ** 1] * idx + below_bc * (eta_bc * slot[GEN ** 2] + program)
+    p_fp = below_bc * frame_program
     s_fin = gs0 * GEN ** (2 ** BYTECODE_LOG - 1) + gs1
     claim = claim + w_plus * spine + eta_start * eq0_r * spine + plus * w_plus + spine_coef * (spine + eqc * s_fin)
 
@@ -3317,7 +3359,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
         nxt = gs0 * link_form(sent, STATE_NEXT0[t]) + gs1 * link_form(sent, STATE_NEXT1[t])
         r_bc = slot[GEN ** 1] * sent[GEN ** STATE_PC[t]] + slot[GEN ** 2] + slot[GEN ** 3] * GEN ** t
         for i in unroll(0, BC_OP_START[t + 1] - BC_OP_START[t]):
-            r_bc = r_bc + slot[GEN ** (4 + i)] * link_form(sent, BC_OP_FORM[BC_OP_START[t] + i])
+            r_bc = r_bc + slot[GEN ** BC_OP_SLOT[BC_OP_START[t] + i]] * link_form(sent, BC_OP_FORM[BC_OP_START[t] + i])
         memory = 0
         for a in unroll(ACC_START[t], ACC_START[t + 1]):
             if const(ACC_GATE[a] == LINK_NO_POS):
@@ -3325,7 +3367,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             else:
                 gm_a = mu[a] * sent[GEN ** ACC_GATE[a]]
             acc_gm[a] = gm_a
-            access = gm0 * link_form(sent, ACC_ADDR[a]) + gm3 + gm1 * link_form(sent, ACC_V0[a]) + gm2 * link_form(sent, ACC_V1[a])
+            access = gm0 * link_form(sent, ACC_ADDR[a]) + gm3 + gm1 * link_form(sent, ACC_VALUE[a])
             memory = memory + gm_a * access
         table_base = omega * eq0_r * (nxt + eta_mem * memory + eta_bc * r_bc)
         if const(t == LINK_JUMP_TABLE):
@@ -3343,8 +3385,12 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
                 coef = coef + e * act * (eta_cover * eqzr + spine_coef * s_gamma)
                 plus_part = plus_part + eo * plus
             elif const(q == PTR_START[t] + 1):
-                coef = coef + eo * eta_bc * x_bc
+                coef = coef + eo * (x_bc + sent[GEN ** STATE_FP[t]] * p_fp)
     ey = eta_mem * y_mem
+    # The word reads weigh word(r) = m1 at their pointer.
+    wm = em_g1 * m1
+    for w in unroll(0, N_WORD_READS):
+        coef = coef + fq[WR_PTR[w]] * mu[WR_ACC[w]] * link_form(sent, WR_SCALE[w]) * wm
     for a in unroll(0, N_ACCESSES):
         if const(ACC_SHIFT[a] == 0):
             coef = coef + fq[ACC_PTR[a]] * acc_gm[a] * ey
@@ -3413,14 +3459,13 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # consumed prefix, whose every word is transcript-bound; the unused suffix
     # is outside the recursively verified proof and intentionally unconstrained.
 
-    check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, lam, gm1 * below_mem, gm2 * below_mem, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z)
+    check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, lam, below_mem, Y_TOWER * below_mem, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z)
 
-    # ---- export this sub-proof's deferred claim: the program at (r[..kbc], alpha) ----
+    # ---- export this sub-proof's claim: the split program at r[..kbc] ----
     for k in unroll(0, BYTECODE_LOG):
         defer_out[GEN ** k] = r_pt[GEN ** k]
-    for k in unroll(0, LOG2_BYTECODE_COLS):
-        defer_out[GEN ** (BYTECODE_LOG + k)] = alpha[GEN ** k]
-    defer_out[GEN ** FRESH_BC_VALUE] = bc_value
+    for j in unroll(0, N_SPLIT):
+        defer_out[GEN ** (BYTECODE_LOG + j)] = splitv[GEN ** j]
     return
 
 
@@ -4605,7 +4650,7 @@ def main():
 
 
 def aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_stmt, tabs):
-    # Every child contributes two claims on the stacked bytecode: the one IT
+    # Every child contributes two claims on the split program: the one IT
     # deferred (carried in its statement) and the fresh one raised by verifying its
     # proof. A fresh transcript binds all of them, samples the batching
     # coefficient, and one sumcheck reduces the lot to one claim, which is what the
@@ -4676,6 +4721,22 @@ def aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_s
         grind_check(st[1], tabs, BATCH_LAM_GRIND_BITS)
     lam = st[0]
     lam_sq = lam * lam
+    # The column challenges fold each fresh claim's values into one at (r, col).
+    col = HeapBuf(SPLIT_LOG)
+    no_rate = StackBuf(8)
+    for k in unroll(0, SPLIT_LOG):
+        st, col_k = squeeze(st, no_rate, 0)
+        col[GEN ** k] = col_k
+    eq_col_tree = HeapBuf(2 ** (SPLIT_LOG + 1) - 2)
+    eqtree(col, eq_col_tree, SPLIT_LOG)
+    eq_col = eq_col_tree * GEN ** (2 ** SPLIT_LOG - 2)
+    fresh_val = HeapBuf(n_children_g)
+    for xc in mul_range(1, n_children_g):
+        fresh = fresh_row[xc]
+        fv = 0
+        for j in unroll(0, N_SPLIT):
+            fv = fv + eq_col[GEN ** j] * fresh[GEN ** (BYTECODE_LOG + j)]
+        fresh_val[xc] = fv
     bc_chain = HeapBuf((n_children_g * GEN) ** PAIR_SLOTS)
     bc_chain[GEN ** 0] = 1
     bc_chain[GEN ** 1] = 0
@@ -4686,7 +4747,7 @@ def aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_s
         carried = carried_row[xc]
         nxt = row * GEN ** PAIR_SLOTS
         nxt[GEN ** 0] = lam_pow * lam_sq
-        nxt[GEN ** 1] = row[GEN ** 1] + lam_pow * (fresh[GEN ** FRESH_BC_VALUE] + lam * carried[GEN ** DEFER_STMT_BC_VALUE])
+        nxt[GEN ** 1] = row[GEN ** 1] + lam_pow * (fresh_val[xc] + lam * carried[GEN ** DEFER_STMT_BC_VALUE])
     bc_end = bc_chain * n_children_g ** PAIR_SLOTS
     bc_running = bc_end[GEN ** 1]
     bc_point = HeapBuf(BYTECODE_VARS)
@@ -4694,6 +4755,12 @@ def aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_s
     bc_point1 = HeapBuf(BYTECODE_VARS)  # 1 + bc_point, so an eq factor is one XOR
     for k in unroll(0, BYTECODE_VARS):
         bc_point1[GEN ** k] = 1 + bc_point[GEN ** k]
+    # A fresh claim's point is (r, col): its column factor is common to every child.
+    for k in unroll(0, SPLIT_LOG):
+        if const(k == 0):
+            eq_cols = col[GEN ** k] + bc_point1[GEN ** (BYTECODE_LOG + k)]
+        else:
+            eq_cols *= col[GEN ** k] + bc_point1[GEN ** (BYTECODE_LOG + k)]
     bc_wsum = HeapBuf(n_children_g * GEN)
     bc_wsum[GEN ** 0] = 0
     for xc in mul_range(1, n_children_g):
@@ -4704,11 +4771,13 @@ def aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_s
             if const(k == 0):
                 eq_fresh = fresh[GEN ** k] + rk1
                 eq_carried = carried[GEN ** k] + rk1
-            else:
+            elif const(k // BYTECODE_LOG == 0):
                 eq_fresh *= fresh[GEN ** k] + rk1
                 eq_carried *= carried[GEN ** k] + rk1
+            else:
+                eq_carried *= carried[GEN ** k] + rk1
         row = bc_chain * xc ** PAIR_SLOTS
-        bc_wsum[xc * GEN] = bc_wsum[xc] + row[GEN ** 0] * (eq_fresh + lam * eq_carried)
+        bc_wsum[xc * GEN] = bc_wsum[xc] + row[GEN ** 0] * (eq_fresh * eq_cols + lam * eq_carried)
     assert bc_running == bytecode_star * bc_wsum[n_children_g]
 
     for k in unroll(0, BYTECODE_VARS):

@@ -48,13 +48,14 @@ pub(super) fn merkle_cap_depth(queries: usize, depth: usize) -> usize {
 
 /// The guest's witness for verifying one child (`guests/lean_ethereum.py`): the proof stream, the shape the guest
 /// certifies against the announced sizes (each table's log height, the tallest, the pointer width), the stack's
-/// placement, the program's value where the link reads it (`bc_value`, the claim the child defers) and the opening's
+/// placement, the split program's columns where the link reads them (`split_values`, the claim the child raises) and
+/// the opening's
 /// Merkle paths. Nothing here says the child verifies: the guest's run does.
 pub(super) fn gen_verify(
     kbc: usize,
     proof: &verifier::Proof,
     summary: &verifier::Summary,
-    bc_value: F128,
+    split_values: &[F128],
 ) -> Result<SubHints, AggregateError> {
     // The guest's buffers have fixed capacities, so its constants do not depend on a child's shape. A child that
     // verifies fits them.
@@ -98,7 +99,7 @@ pub(super) fn gen_verify(
         ),
     ];
     hints.extend(stack_hints(&kappas));
-    hints.push(("bc_value", vec![bc_value]));
+    hints.push(("split_values", split_values.to_vec()));
     let (config, _, depth) =
         whir_levels(stack_log(&kappas), summary.log_inv_rate).ok_or(AggregateError::InvalidChild)?;
     hints.extend(merkle_hints(config.queries, &depth, proof));
