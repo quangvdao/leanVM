@@ -712,7 +712,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
             for (s, &v) in slices.iter_mut().zip(&end.slices) {
                 *s += eq_q[q] * v;
             }
-            // A split column (the band layout) is its pieces, each at the low end of the row point. The row side's
+            // A split column is its pieces, each at the low end of the row point. The row side's
             // per-piece bit-slices are the opening's first projection of the piece's lane onto them.
             let placement = &layout.placements[sch.base[t] + pointer];
             let lane = layout.shape.mu - crate::pcs::LOG_BATCH;

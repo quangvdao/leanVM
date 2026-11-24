@@ -12,7 +12,7 @@ use primitives::field::{F64, F128};
 /// evaluation claims settle there (the KECCAK columns `q_keccak` carries), or they are not
 /// committed at all and something else proves them (the KECCAK output lanes).
 ///
-/// A column of the stripe or band layout can be split ([`verifier::stack_offsets`]): its
+/// A column smaller than its lane group is split ([`verifier::stack_offsets`]): its
 /// rows `j·2^piece_vars..` then sit at `offset + j·2^lane`, a lane down per piece. The ring
 /// switch reads it piece by piece, and a point claim at one striped stack point
 /// ([`Placement::claim`]).
@@ -188,10 +188,10 @@ impl<'a, T: Copy> Col<'a, T> {
         self.len.min(1 << self.piece)
     }
 
-    /// The pieces, in row order: one run of [`Self::piece_len`] rows each.
+    /// The pieces, in row order: one run of [`Self::piece_len`] rows each, the last cut at [`Self::len`].
     pub fn pieces(&self) -> impl ExactSizeIterator<Item = &'a [T]> + use<'a, T> {
-        let (words, piece, lane) = (self.words, self.piece_len(), self.lane);
-        (0..self.len.div_ceil(piece.max(1))).map(move |j| &words[j << lane..][..piece])
+        let (words, piece, lane, len) = (self.words, self.piece_len(), self.lane, self.len);
+        (0..len.div_ceil(piece.max(1))).map(move |j| &words[j << lane..][..piece.min(len - j * piece)])
     }
 
     /// Rows `start..end` as runs of words, each with its first row.
@@ -447,11 +447,8 @@ pub(crate) fn stack_offsets(kappas: &[Option<usize>]) -> (Vec<usize>, usize) {
 
 /// Per-column placements and the stack's [`StackShape`] from the columns' log-sizes
 /// alone, by [`verifier::stack_offsets`]. A `None` kappa marks a virtual (uncommitted)
-/// column. The `ring` columns (the pointers and q_keccak), which the opening reads
-/// through ring weights, are cut across the first lanes with every other column that
-/// fits there, or else go in a band at the start of the lanes. Depends only on lengths and which
-/// columns are pointers, and the verifier runs the same function, so it reconstructs
-/// the same layout.
+/// column. Depends only on lengths, and the verifier runs the same function, so it
+/// reconstructs the same layout.
 pub fn placements_of(kappas: &[Option<usize>], ring: &[bool]) -> (Vec<Placement>, StackShape) {
     let committed: Vec<usize> = (0..kappas.len()).filter(|&i| kappas[i].is_some()).collect();
     let sizes: Vec<usize> = committed.iter().map(|&i| kappas[i].unwrap()).collect();
@@ -467,10 +464,8 @@ pub fn placements_of(kappas: &[Option<usize>], ring: &[bool]) -> (Vec<Placement>
             piece_vars: spot.piece,
         };
     }
-    let placed: usize = sizes.iter().map(|&k| 1usize << k).sum();
-    // The columns fit in the fewest whole lanes (the stripe and band layouts keep to them too), and
-    // the lanes past those are never committed at all.
-    let n_lanes = placed.div_ceil(1 << (mu - crate::pcs::LOG_BATCH)).max(1);
+    // The lanes past the filled ones are never committed at all.
+    let n_lanes = verifier::stack_lanes(&sizes, mu, crate::pcs::LOG_BATCH) as usize;
     (placements, StackShape { mu, n_lanes })
 }
 
@@ -577,7 +572,11 @@ mod tests {
             vec![Some(3), Some(2)],
         ];
         for kappas in cases {
-            let placed: usize = kappas.iter().flatten().map(|k| 1usize << k).sum();
+            let placed: usize = kappas
+                .iter()
+                .flatten()
+                .map(|&k| 1usize << k.max(verifier::MAX_STRIPE_WIDTH))
+                .sum();
             let (placements, shape) = placements_of(&kappas, &vec![false; kappas.len()]);
             let lane_block = 1usize << (shape.mu - crate::pcs::LOG_BATCH);
 
@@ -594,16 +593,20 @@ mod tests {
             assert!(shape.committed_len() <= 1usize << shape.mu);
             // And every column really does live inside those lanes.
             for p in placements.iter().filter(|p| !p.is_virtual()) {
-                assert!(p.offset + (1usize << p.n_vars) <= shape.committed_len());
+                let lane = shape.mu - crate::pcs::LOG_BATCH;
+                assert!(
+                    p.piece_offsets(lane)
+                        .all(|o| o + (1usize << p.piece_vars) <= shape.committed_len())
+                );
             }
         }
     }
 
-    /// The opening reads every ring column (here the pointers) at one point, so the stripe layout must cut each into
-    /// one piece per lane of the first lanes, all at one in-lane offset. The windows of [`split_stack`] must then still
-    /// cover every committed word once, the pieces holding the column's rows in order.
+    /// The layout cuts every column smaller than its lane group into one piece per lane of an aligned run of lanes,
+    /// all at one in-lane offset. The windows of [`split_stack`] must then still cover every committed word once, the
+    /// pieces holding the column's rows in order.
     #[test]
-    fn ring_columns_are_striped_and_the_stack_holds_them() {
+    fn columns_are_striped_and_the_stack_holds_them() {
         // Pointer columns of several sizes among other columns, a virtual one included.
         let mut columns = vec![(Some(15), true); 2];
         columns.extend([(Some(13), true); 2]);
@@ -613,14 +616,25 @@ mod tests {
         let (kappas, pointer): (Vec<Option<usize>>, Vec<bool>) = columns.into_iter().unzip();
         let (placements, shape) = placements_of(&kappas, &pointer);
         let lane = shape.mu - crate::pcs::LOG_BATCH;
-        let width = (shape.n_lanes.ilog2() as usize).min(verifier::MAX_STRIPE_WIDTH);
-        for i in (0..kappas.len()).filter(|&i| pointer[i] && kappas[i].is_some()) {
+        for i in (0..kappas.len()).filter(|&i| kappas[i].is_some()) {
             let p = placements[i];
-            assert_eq!(p.n_vars - p.piece_vars, width, "column {i} has a piece per stripe lane");
-            for (j, offset) in p.piece_offsets(lane).enumerate() {
-                assert_eq!(offset, (j << lane) + p.offset, "column {i}'s piece {j} is in lane {j}");
+            let spread = p.n_vars - p.piece_vars;
+            if p.n_vars >= 12 {
+                // These fill the first 32 lanes, a lane group of the widest stripe.
+                assert_eq!(
+                    spread,
+                    verifier::MAX_STRIPE_WIDTH,
+                    "column {i} has a piece per lane of its group"
+                );
             }
-            assert!(p.offset < 1 << lane, "column {i} starts in lane 0");
+            assert_eq!(
+                (p.offset >> lane) % (1 << spread),
+                0,
+                "column {i}'s lanes are an aligned run"
+            );
+            for (j, offset) in p.piece_offsets(lane).enumerate() {
+                assert_eq!(offset, (j << lane) + p.offset, "column {i}'s piece {j} is a lane down");
+            }
         }
 
         // Write column i's row u as i·2^32 + u + 1 through the windows, and read it back.

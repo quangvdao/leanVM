@@ -389,7 +389,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
             for (c, &epsilon) in certs.iter_mut().zip(&eps[q]) {
                 *c += e * omega * cert * epsilon;
             }
-            // A split column (the band layout) is its pieces, each at the low end of the row point.
+            // A split column is its pieces, each at the low end of the row point.
             let placement = layout.placements[GLOBAL_COLUMN_BASES[t] + pointer].expect("a pointer column is committed");
             for (piece, weight) in placement.pieces(layout.stack_log - INITIAL_FOLDING_FACTOR, &point) {
                 pieces.push(RingPiece {

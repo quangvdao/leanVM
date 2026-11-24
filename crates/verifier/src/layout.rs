@@ -564,7 +564,7 @@ fn stacked_blocks(columns: usize) -> Vec<usize> {
 }
 
 /// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
-/// The pointer columns and q_keccak are [`stack_offsets`]'s ring blocks, the opening reading them through ring weights.
+/// The pointer columns and q_keccak are [`stack_offsets`]'s ring blocks.
 fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
     let blocks = stacked_blocks(kappas.len());
     let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();

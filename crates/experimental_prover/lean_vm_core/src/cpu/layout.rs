@@ -447,7 +447,7 @@ pub(crate) fn build(program: &Program, exec: &Execution, l: Layout, keccak_block
         // `fill_table` asserts each table wrote all of its windows.
         .map(|i| (i, unsafe { primitives::uninit_vec::<F64>(steps) }))
         .collect();
-    // A split column (a pointer, q_keccak, memory or any other column the stripe layout cuts across lanes) is
+    // A split column (any column smaller than its lane group) is
     // written piece by piece, straight into the stack.
     let lane = l.shape.mu - crate::pcs::LOG_BATCH;
     let mut windows = witness::split_stack(&mut q, &l.placements, lane);
