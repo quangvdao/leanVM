@@ -119,12 +119,8 @@ pub fn open(
     assert!(ring.points.len() + point_claims.len() <= MAX_STACKED_CLAIMS);
     // One grind covers the map's challenges and lambda: one verifier message.
     ps.grind(BATCH_GRINDING_BITS);
-    let drawn = ps.sample_packed(ring_switch::MAP_CHALLENGES + 1);
-    let phi = ring_switch::coordinate_weights(drawn[..ring_switch::MAP_CHALLENGES].try_into().unwrap());
-    let lambdas = powers(
-        drawn[ring_switch::MAP_CHALLENGES],
-        ring.points.len() + point_claims.len(),
-    );
+    let phi = ring_switch::coordinate_weights(&std::array::from_fn(|_| ps.sample()));
+    let lambdas = powers(ps.sample(), ring.points.len() + point_claims.len());
     let (ring_lambdas, point_lambdas) = lambdas.split_at(ring.points.len());
     let rings: Vec<RingWeight> = ring
         .points

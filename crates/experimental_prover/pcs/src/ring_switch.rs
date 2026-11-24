@@ -64,6 +64,7 @@
 use primitives::bit_fold::{BLOCK, BitFold};
 use primitives::field::xor_into8;
 use primitives::field::{F64, F128, mul4};
+use primitives::transcript::ProverState;
 
 use super::pack::PACKING_WIDTH;
 use super::tensor_algebra::{DEGREE_E, transpose_s_hat};
@@ -144,6 +145,12 @@ fn apply_map(value: F128, challenges: &[F128; MAP_CHALLENGES]) -> F128 {
         }
     }
     phi
+}
+
+/// Sample the map's challenges, `f_0..f_7` then `g_0..g_7`, after every ring-switch message has
+/// been bound.
+pub(crate) fn sample_map_challenges(ch: &mut ProverState) -> [F128; MAP_CHALLENGES] {
+    std::array::from_fn(|_| ch.sample())
 }
 
 // ---------------------------------------------------------------------------

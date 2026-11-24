@@ -3138,6 +3138,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     slot = HeapBuf(30)
     r_pt = HeapBuf(MAX_PTR_WIDTH)
     pre = HeapBuf(MAX_PTR_WIDTH + 1)
+    vals3 = HeapBuf(3)
     splitv = HeapBuf(N_SPLIT)
     chi = HeapBuf(MAX_PTR_WIDTH)
     q_point = HeapBuf(LINK_Q_VARS)
@@ -3299,18 +3300,16 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     lt = match(log(g_w * INV_GEN ** BYTECODE_LOG), range(0, LINK_W_ARMS), lambda k: lt_cycles(zeta, cbits, k + BYTECODE_LOG))
     claim = eta_cover * lt + eta_start * (gs0 + gs1)
     fs0, fs1, fs2, fs3, fs4, cursor, claim = link_rounds(fs0, fs1, fs2, fs3, fs4, cursor, claim, r_pt, g_w, tabs, 1, 0)
-    # The values at r, then the five fresh coefficients from the one permutation taking them.
+    plus, pw_unused, fs0, fs1, fs2, fs3, fs4, cursor = opening_message(fs0, fs1, fs2, fs3, fs4, cursor, vals3, 3, 0)
+    w_plus = vals3[GEN ** 0]
+    spine = vals3[GEN ** 1]
+    m1 = vals3[GEN ** 2]
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
-    rate = StackBuf(8)
-    w_plus, cursor = fs_next(rate, 0, cursor)
-    spine, cursor = fs_next(rate, 1, cursor)
-    m1, cursor = fs_next(rate, 2, cursor)
-    sp = fs_perm(sp, rate, 3)
-    plus = sp[0]
-    spine_coef = sp[1]
-    cert = sp[2]
-    jump_0 = sp[3]
-    jump_1 = sp[4]
+    no_rate = StackBuf(8)
+    sp, spine_coef = squeeze(sp, no_rate, 0)
+    sp, cert = squeeze(sp, no_rate, 0)
+    sp, jump_0 = squeeze(sp, no_rate, 0)
+    sp, jump_1 = squeeze(sp, no_rate, 0)
     idx, eqc, eqzr = match(log(g_w * INV_GEN ** BYTECODE_LOG), range(0, LINK_W_ARMS), lambda k: index_side(r_pt, zeta, cbits, pre, k + BYTECODE_LOG))
     eq0_r = pre[g_w]
     below_mem = eq0_r / pre[g_log_mem]
@@ -3425,22 +3424,14 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
 
     # ---- stacked opening: ring switch, then the claims' batch ----
-    # One grind covers the map's challenges, rho and the batching challenge lam, one
-    # packed draw: the grind's permutation gives seven, every cell but the proof of
-    # work's, then two of the capacity alone eight and three.
+    # One grind covers the map's challenges, rho and the batching challenge lam, drawn next.
     rate = StackBuf(8)
     ch = StackBuf(2 * RING_MAP_WIDTH)  # f_0 .. f_7, then g_0 .. g_7
     sp, map_first, cursor = fs_grind_squeeze(sp, rate, 0, cursor, tabs, BATCH_GRIND_BITS)
     ch[0] = map_first
-    for i in unroll(1, 7):
-        ch[i] = sp[i + 1]
-    sp = fs_perm(sp, rate, 0)
-    for i in unroll(0, 8):
-        ch[7 + i] = sp[i]
-    sp = fs_perm(sp, rate, 0)
-    ch[15] = sp[0]
-    rho = sp[1]
-    lam = sp[2]
+    for i in unroll(1, 2 * RING_MAP_WIDTH):
+        sp, map_challenge = squeeze(sp, rate, 0)
+        ch[i] = map_challenge
     map_challenges = HeapBuf(2 * RING_MAP_WIDTH)
     for i in unroll(0, 2 * RING_MAP_WIDTH):
         map_challenges[GEN ** i] = ch[i]
@@ -3456,6 +3447,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # The two ring claims as one, the pointer columns' as rho times theirs: rho scales
     # inside the map, so their slices take it, and their map is v -> Phi(rho v), the
     # Frobenius sum with c_k rho^(2^k).
+    sp, rho = squeeze(sp, rate, 0)
     c_link = HeapBuf(BASE_FIELD_BITS)
     rho_k = rho
     for k in unroll(0, BASE_FIELD_BITS):
@@ -3466,6 +3458,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     link_slices = sent * GEN ** LINK_N_SENT
     for i in unroll(0, BASE_FIELD_BITS):
         merged[GEN ** i] = kslices[GEN ** i] + rho * link_slices[GEN ** i]
+    sp, lam = squeeze(sp, rate, 0)
     target = ring_switch_target(merged, map_challenges)
     lam_pow = lam
     target = target + lam_pow * m1

@@ -57,8 +57,6 @@ impl Search for Sequential {
 
 /// The rate's lanes, four per scalar.
 const RATE_LANES: usize = 4 * RATE_SCALARS;
-/// The rate as challenges, two lanes to a cell.
-const RATE_CELLS: usize = RATE_LANES / 2;
 
 // Domain tags, the fourth lane of an absorbed scalar (the third is zero). Nonzero, so a scalar never reads as the
 // zeroed rate past the last one, and distinct, so a grinding nonce never reads as a sent scalar.
@@ -74,9 +72,8 @@ pub struct FiatShamirState<F> {
     /// `n_pending` scalars absorbed since, then zeros.
     state: [u64; STATE_LANES],
     n_pending: usize,
-    /// A grind's permutation's rate but the proof of work's cell: its first is the next [`Self::sample`], all seven
-    /// the next [`Self::sample_packed`].
-    ground: Option<[F; RATE_CELLS - 1]>,
+    /// The challenge a grind's permutation drew, which the next [`Self::sample`] returns.
+    ground: Option<F>,
 }
 
 impl<F: Scalar> FiatShamirState<F> {
@@ -102,18 +99,13 @@ impl<F: Scalar> FiatShamirState<F> {
         Self::new(Digest(keccak256::hash(label)).words(), [0; 4])
     }
 
-    /// Permute, taking the waiting scalars, and return the output's rate, two lanes to a cell.
-    fn permute(&mut self) -> [F; RATE_CELLS] {
-        keccak256::keccak_f(&mut self.state);
-        let cells = std::array::from_fn(|i| F::from_limbs([self.state[2 * i], self.state[2 * i + 1]]));
-        self.state[..RATE_LANES].fill(0);
-        self.n_pending = 0;
-        cells
-    }
-
     /// Permute, taking the waiting scalars, and return the output's first two lanes.
     fn duplex(&mut self) -> F {
-        self.permute()[0]
+        keccak256::keccak_f(&mut self.state);
+        let out = F::from_limbs([self.state[0], self.state[1]]);
+        self.state[..RATE_LANES].fill(0);
+        self.n_pending = 0;
+        out
     }
 
     fn absorb(&mut self, x: F, tag: u64) {
@@ -151,7 +143,7 @@ impl<F: Scalar> FiatShamirState<F> {
     /// public; soundness comes from each challenge being a random-oracle image of
     /// the entire prior transcript.
     pub fn sample(&mut self) -> F {
-        self.ground.take().map_or_else(|| self.duplex(), |cells| cells[0])
+        self.ground.take().unwrap_or_else(|| self.duplex())
     }
 
     /// Squeeze `n` challenges, in order.
@@ -160,18 +152,16 @@ impl<F: Scalar> FiatShamirState<F> {
     }
 
     /// Squeeze `n` challenges eight to a permutation: each takes whatever waits, and its output's rate, two lanes to
-    /// a challenge, gives the next eight. Right after a grind, its permutation gives the first seven: every cell but
-    /// the second, which holds the proof of work.
+    /// a challenge, gives the next eight. A grind's challenge is drawn first, by [`Self::sample`].
     pub fn sample_packed(&mut self, n: usize) -> Vec<F> {
+        assert!(self.ground.is_none(), "a grind is followed by a challenge");
         let mut out = Vec::with_capacity(n);
-        if n > 0
-            && let Some(cells) = self.ground.take()
-        {
-            out.extend(cells.into_iter().take(n));
-        }
         while out.len() < n {
-            let take = (n - out.len()).min(RATE_CELLS);
-            out.extend_from_slice(&self.permute()[..take]);
+            keccak256::keccak_f(&mut self.state);
+            let take = (n - out.len()).min(RATE_LANES / 2);
+            out.extend((0..take).map(|i| F::from_limbs([self.state[2 * i], self.state[2 * i + 1]])));
+            self.state[..RATE_LANES].fill(0);
+            self.n_pending = 0;
         }
         out
     }
@@ -219,8 +209,7 @@ impl<F: Scalar> FiatShamirState<F> {
         };
         let nonce = nonce.expect("a nonce exists");
         self.absorb(F::from_limbs([nonce, 0]), DS_POW_NONCE);
-        let cells = self.permute();
-        self.ground = Some(std::array::from_fn(|i| cells[if i == 0 { 0 } else { i + 1 }]));
+        self.ground = Some(self.duplex());
         Some(nonce)
     }
 }

@@ -140,19 +140,18 @@ type StackClaim<'a> = (Box<dyn Fn(&[E]) -> E + 'a>, E);
 /// Discharge every claim on the committed stack in one opening: the same powers of one challenge
 /// batch the values into the target, and the weights into the basis WHIR evaluates at its terminal point.
 ///
-/// The challenge is the ring switch's last, one verifier message with its map challenges under their one grind
-/// (`BATCH_GRINDING_BITS`).
+/// The challenge is drawn right after the ring switch's map challenges, one verifier message under their one grind
+/// (`BATCH_GRINDING_BITS`), so it takes no grind of its own.
 fn verify_stacked_opening(
     transcript: &mut Transcript,
     root: Digest,
     stack_log: usize,
     log_inv_rate: usize,
     claims: &[StackClaim],
-    batching: E,
 ) -> Result<(), VerifierError> {
     let values: Vec<E> = claims.iter().map(|(_, value)| *value).collect();
     require(claims.len() <= MAX_STACKED_CLAIMS, VerifierError::StackedClaims)?;
-    let scales = powers(batching, claims.len());
+    let scales = powers(transcript.sample(), claims.len());
     let evaluate_basis = |point: &[E]| {
         let weights: Vec<E> = claims.iter().map(|(weight, _)| weight(point)).collect();
         dot(&scales, &weights)
@@ -264,19 +263,18 @@ pub fn verify_keccak_batch(
         point,
         scale: ONE,
     };
-    let (ring, batching) = ring_switch(
+    let mut claims: Vec<StackClaim> = vec![ring_switch(
         vec![RingClaim {
             pieces: vec![piece],
             slices,
         }],
         &mut transcript,
-    )?;
-    let mut claims: Vec<StackClaim> = vec![ring];
+    )?];
     if let Some((point, word)) = openings.outputs {
         claims.push((Box::new(move |x| eq_eval(&point, x)), word));
     }
     claims.push(ood);
-    verify_stacked_opening(&mut transcript, root, stack_log, log_inv_rate, &claims, batching)?;
+    verify_stacked_opening(&mut transcript, root, stack_log, log_inv_rate, &claims)?;
     transcript.finish()?;
     Ok(())
 }
@@ -377,8 +375,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
             .collect(),
         slices,
     };
-    let (ring, batching) = ring_switch(vec![keccak_ring, link.ring], &mut transcript)?;
-    let mut stack_claims: Vec<StackClaim<'static>> = vec![ring];
+    let mut stack_claims: Vec<StackClaim<'static>> = vec![ring_switch(vec![keccak_ring, link.ring], &mut transcript)?];
     let (memory_point, memory_scales, memory_value) = link.memory;
     let memory_points: Vec<(Vec<E>, E)> = [MEMORY_0, MEMORY_1]
         .into_iter()
@@ -400,7 +397,6 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         layout.stack_log,
         log_inverse_rate as usize,
         &stack_claims,
-        batching,
     )?;
     transcript.finish()?;
     Ok(Summary {
