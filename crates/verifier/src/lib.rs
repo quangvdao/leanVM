@@ -41,7 +41,7 @@ pub use wire::{MAX_HEIGHT, MAX_LEAF_WORDS, MAX_PHASES, MAX_QUERIES};
 // What the provers and the aggregation's guest constants and witness read of the protocol.
 pub use bus_layout::{N_BUS_TREES, bus_grinding_bits};
 pub use hash::Digest;
-pub use link::{Chunks, MAX_WIDTH as MAX_POINTER_WIDTH, pc_slots};
+pub use link::{Chunks, MAX_WIDTH as MAX_POINTER_WIDTH, packed_challenges, pc_slots};
 pub use multilinear::{MAX_STRIPE_WIDTH, Placement, Spot, stack_lanes, stack_offsets};
 pub use whir::{Subspace, WhirConfig, derive_config, subspace_roots};
 

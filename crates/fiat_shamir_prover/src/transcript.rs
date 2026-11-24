@@ -49,6 +49,11 @@ impl<F: Scalar, S: Search> ProverState<F, S> {
         self.fs.sample_vec(n)
     }
 
+    /// `n` challenges, eight to a permutation ([`FiatShamirState::sample_packed`]).
+    pub fn sample_packed(&mut self, n: usize) -> Vec<F> {
+        self.fs.sample_packed(n)
+    }
+
     /// Hand the next opening phase's Merkle data to the verifier. Not absorbed:
     /// its binding is the Merkle structure itself.
     pub fn hint_merkle(&mut self, paths: Vec<MerklePath>) {

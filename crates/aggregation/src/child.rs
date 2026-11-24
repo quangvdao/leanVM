@@ -88,13 +88,15 @@ pub(super) fn gen_verify(
     let mut hints: SubHints = vec![
         ("stream", stream),
         ("table_logs", heights.iter().map(|&h| count(h)).collect()),
-        // The tallest table's log height, the pointer width, and whether the width is the cycles' bit length.
+        // The tallest table's log height, the pointer width, whether the width is the cycles' bit length, and how
+        // many permutations draw the link's packed challenges.
         (
             "link_shape",
             vec![
                 count(n_rows),
                 count(width),
                 if width == bits { F128::ONE } else { F128::ZERO },
+                count(verifier::packed_challenges(&verifier::layout::tables(), n_rows, width).div_ceil(8)),
             ],
         ),
     ];

@@ -310,6 +310,15 @@ pub fn pointer_width(log_memory: usize, log_bytecode: usize, cycles: u64) -> usi
 }
 
 /// Verify the links of the execution `layout` announces, from right after the commitment.
+/// How many challenges the link draws eight to a permutation, after `θ_0`: `θ`'s rest, `γ`, `μ`, `α`, `η` and `ε`,
+/// then `τ` over the tallest table's `n_rows` row variables, `ζ` over the pointer width and `ν` over its chunks.
+pub fn packed_challenges(tables: &[Table], n_rows: usize, width: usize) -> usize {
+    let n_accesses: usize = tables.iter().map(|t| t.links.memory.len()).sum();
+    let n_pointers: usize = tables.iter().map(|t| t.links.pointers().len()).sum();
+    let d = Chunks::new(width).map_or(0, |c| c.d());
+    (N_TABLES - 1) + 5 + n_accesses + BUS_BITS + 4 + n_pointers + n_rows + width + d
+}
+
 pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkEnd, VerifierError> {
     let tables = &layout.tables;
     let heights = &layout.table_log_heights;
@@ -325,24 +334,28 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     // row side (`m` the tallest table's row variables), and the `width + 1` of the index side.
     let n_rows = heights.iter().copied().max().unwrap_or(0);
     transcript.grind_check(grinding_bits((n_rows + 3 + BUS_BITS).max(width + 1) as u128))?;
-    let theta = transcript.samples(N_TABLES);
-    let tau = transcript.samples(n_rows);
-    let gamma_state = transcript.samples(2);
+    // The grind's permutation draws `θ_0`; the rest come eight to a permutation, the ones whose count is fixed
+    // first.
+    let mut theta = vec![transcript.sample()];
+    let mut drawn = transcript
+        .samples_packed(packed_challenges(tables, n_rows, width))
+        .into_iter();
+    let mut take = |n: usize| -> Vec<E> { drawn.by_ref().take(n).collect() };
+    theta.extend(take(N_TABLES - 1));
+    let gamma_state = take(2);
     // On the address, the word and the presence coordinate; a word `lo + y·hi` takes `γ_word·y` on its high limb.
     let gamma_mem = {
-        let g = transcript.samples(3);
+        let g = take(3);
         [g[0], g[1], g[1] * Y, g[2]]
     };
-    let mu: Vec<Vec<E>> = tables
-        .iter()
-        .map(|t| transcript.samples(t.links.memory.len()))
-        .collect();
-    let alpha = transcript.samples(BUS_BITS);
-    let zeta = transcript.samples(width);
-    let [eta_start, eta_cover, eta_mem, eta_bc] = [0; 4].map(|_| transcript.sample());
+    let mu: Vec<Vec<E>> = tables.iter().map(|t| take(t.links.memory.len())).collect();
+    let alpha = take(BUS_BITS);
+    let [eta_start, eta_cover, eta_mem, eta_bc]: [E; 4] = take(4).try_into().unwrap();
     // The mirror certificates' coefficients: pointer column `q`'s chunk `c` takes `ε_q·ν_c`.
-    let eps = transcript.samples(n_pointers);
-    let nu = transcript.samples(d);
+    let eps = take(n_pointers);
+    let tau = take(n_rows);
+    let zeta = take(width);
+    let nu = take(d);
     let slot = eq_kernel(&alpha);
     let s_init = gamma_state[0] + gamma_state[1];
     let s_fin = gamma_state[0] * gpow((1 << layout.log_bytecode) - 1) + gamma_state[1];
