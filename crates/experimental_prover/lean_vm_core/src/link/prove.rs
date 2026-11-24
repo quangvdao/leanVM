@@ -176,26 +176,18 @@ impl Challenges {
         let m = taus.iter().copied().max().unwrap_or(0);
         let degree = (m + 3 + crate::leaf::N_BYTECODE_SELECTORS).max(chunks.width + 1);
         ps.grind(fiat_shamir::grinding_bits(degree as u128));
-        // The grind's permutation draws `θ_0`; the rest come eight to a permutation, the ones whose count is fixed
-        // first.
-        let mut theta = vec![ps.sample()];
-        let n_accesses: usize = plans.iter().map(|p| p.links.memory.len()).sum();
-        let n_pointers: usize = plans.iter().map(|p| p.pointers.len()).sum();
-        let fixed = (tables::N_TABLES - 1) + 5 + n_accesses + crate::leaf::N_BYTECODE_SELECTORS + 4 + n_pointers;
-        let mut drawn = ps.sample_packed(fixed + m + chunks.width + chunks.d()).into_iter();
-        let mut take = |n: usize| -> Vec<F128> { drawn.by_ref().take(n).collect() };
-        theta.extend(take(tables::N_TABLES - 1));
-        let gamma_state: [F128; 2] = take(2).try_into().unwrap();
+        let theta = ps.sample_vec(tables::N_TABLES);
+        let tau = ps.sample_vec(m);
+        let gamma_state = [ps.sample(), ps.sample()];
         // A word `lo + y·hi` takes `γ_word·y` on its high limb.
-        let [g_addr, g_word, g_pres]: [F128; 3] = take(3).try_into().unwrap();
+        let [g_addr, g_word, g_pres] = std::array::from_fn(|_| ps.sample());
         let gamma_mem = [g_addr, g_word, g_word * F128::Y, g_pres];
-        let mu = plans.iter().map(|p| take(p.links.memory.len())).collect();
-        let alpha_bc = take(crate::leaf::N_BYTECODE_SELECTORS);
-        let [eta_start, eta_cover, eta_mem, eta_bc]: [F128; 4] = take(4).try_into().unwrap();
-        let eps = take(n_pointers);
-        let tau = take(m);
-        let zeta = take(chunks.width);
-        let nu = take(chunks.d());
+        let mu = plans.iter().map(|p| ps.sample_vec(p.links.memory.len())).collect();
+        let alpha_bc = ps.sample_vec(crate::leaf::N_BYTECODE_SELECTORS);
+        let zeta = ps.sample_vec(chunks.width);
+        let [eta_start, eta_cover, eta_mem, eta_bc] = std::array::from_fn(|_| ps.sample());
+        let n_pointers: usize = plans.iter().map(|p| p.pointers.len()).sum();
+        let (eps, nu) = (ps.sample_vec(n_pointers), ps.sample_vec(chunks.d()));
         let eps = eps.iter().map(|&e| nu.iter().map(|&n| e * n).collect()).collect();
         Self {
             theta,

@@ -151,21 +151,6 @@ impl<F: Scalar> FiatShamirState<F> {
         (0..n).map(|_| self.sample()).collect()
     }
 
-    /// Squeeze `n` challenges eight to a permutation: each takes whatever waits, and its output's rate, two lanes to
-    /// a challenge, gives the next eight. A grind's challenge is drawn first, by [`Self::sample`].
-    pub fn sample_packed(&mut self, n: usize) -> Vec<F> {
-        assert!(self.ground.is_none(), "a grind is followed by a challenge");
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
-            keccak256::keccak_f(&mut self.state);
-            let take = (n - out.len()).min(RATE_LANES / 2);
-            out.extend((0..take).map(|i| F::from_limbs([self.state[2 * i], self.state[2 * i + 1]])));
-            self.state[..RATE_LANES].fill(0);
-            self.n_pending = 0;
-        }
-        out
-    }
-
     /// Prover-side PoW grind: find the smallest `u64` nonce whose permutation, the one drawing the next challenge,
     /// leaves the low `bits` bits of its output's third lane zero; bind it, and keep that challenge for the next
     /// [`Self::sample`]. `bits = 0` is no grind at all. A CONTIGUOUS low-bit window, so a recursive verifier

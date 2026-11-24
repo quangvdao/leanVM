@@ -79,19 +79,6 @@ impl Sponge {
         })
     }
 
-    /// `count` challenges eight to a permutation: each takes whatever waits, and its output's rate, two lanes to a
-    /// challenge, gives the next eight. A grind's challenge is drawn first, by [`Self::sample`].
-    pub fn samples_packed(&mut self, count: usize) -> Vec<E> {
-        assert!(self.ground.is_none(), "a grind is followed by a challenge");
-        let mut out = Vec::with_capacity(count);
-        while out.len() < count {
-            self.duplex();
-            let take = (count - out.len()).min(8);
-            out.extend((0..take).map(|i| E::new(self.state[2 * i], self.state[2 * i + 1])));
-        }
-        out
-    }
-
     /// Absorb a grinding nonce and permute: the output's first two lanes are the next challenge, kept for
     /// [`Self::sample`], and its third lane is returned, the proof of work.
     pub(crate) fn absorb_nonce(&mut self, nonce: E) -> u64 {
@@ -152,11 +139,6 @@ impl<'a> Transcript<'a> {
 
     pub fn samples(&mut self, count: usize) -> Vec<E> {
         (0..count).map(|_| self.sample()).collect()
-    }
-
-    /// `count` challenges, eight to a permutation ([`Sponge::samples_packed`]).
-    pub fn samples_packed(&mut self, count: usize) -> Vec<E> {
-        self.sponge.samples_packed(count)
     }
 
     fn next(&mut self) -> Result<E, VerifierError> {

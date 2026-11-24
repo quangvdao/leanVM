@@ -313,11 +313,6 @@ LINK_W_ARMS = MAX_PTR_WIDTH + 1 - BYTECODE_LOG  # the pointer widths from BYTECO
 LINK_D_ARMS = CHUNK_CAP + 1 - LINK_D_MIN
 LINK_REC = FS_CELLS + 2  # a round's record: the sponge, the cursor, the claim
 LINK_TAIL_CAP = CHUNK_CAP + 1  # a row round's coefficients past c1
-# The link's challenges after theta_0 whose count is fixed (verifier::link::packed_challenges):
-# theta's rest, gamma, mu, alpha, eta and eps. tau, zeta and nu follow, then the last
-# permutation's unused cells.
-LINK_FIXED = N_TABLES - 1 + 5 + N_ACCESSES + LOG2_BYTECODE_COLS + 4 + N_POINTERS
-LINK_CHAL_CAP = 1 + LINK_FIXED + MAX_PTR_WIDTH + MAX_PTR_WIDTH + CHUNK_CAP + 7
 LINK_VALS_CAP = 96  # the functionals' values at the widest chunking
 EQ_Q_AT = 2 ** LINK_Q_VARS - 2  # eq(q_point, .) in its eqtree
 DEFER_STMT_CELLS = BYTECODE_VARS + 1
@@ -2602,9 +2597,9 @@ def selector_tables(point, point1):
     return sel_eq
 
 
-def squeeze_packed(fs0, fs1, fs2, fs3, fs4, out, count_g):
-    # count = log(count_g) permutations of the capacity alone, each writing its eight
-    # rate cells to out, in order; a record per permutation carries the capacity.
+def squeeze_run(fs0, fs1, fs2, fs3, fs4, out, count_g):
+    # count = log(count_g) challenges into out[0..count), each a permutation of the
+    # capacity alone, which a record per challenge carries between loop frames.
     recs = HeapBuf((count_g * GEN) ** FS_CELLS)
     recs[GEN ** 0] = fs0
     recs[GEN ** 1] = fs1
@@ -2615,9 +2610,7 @@ def squeeze_packed(fs0, fs1, fs2, fs3, fs4, out, count_g):
         rec = recs * xk ** FS_CELLS
         nxt = StackBuf(KECCAK_STATE)
         keccak([0, 0], [0, 0], nxt, cap=rec[0:FS_CELLS])
-        cells = out * xk ** 8
-        for j in unroll(0, 8):
-            cells[GEN ** j] = nxt[j]
+        out[xk] = nxt[0]
         nrec = rec * GEN ** FS_CELLS
         for j in unroll(0, FS_CELLS):
             nrec[GEN ** j] = nxt[KECCAK_STATE - FS_CELLS + j]
@@ -3133,9 +3126,13 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     h_logs = HeapBuf(N_TABLES)
     rows_bits = HeapBuf(N_TABLES * ROW_BITS)
     cbits = HeapBuf(MAX_PTR_WIDTH)
-    shape = HeapBuf(4)
-    chal = HeapBuf(LINK_CHAL_CAP)
+    shape = HeapBuf(3)
+    tau = HeapBuf(MAX_PTR_WIDTH)
+    alpha = HeapBuf(LOG2_BYTECODE_COLS)
     slot = HeapBuf(30)
+    zeta = HeapBuf(MAX_PTR_WIDTH)
+    eps = HeapBuf(N_POINTERS)
+    nu = HeapBuf(CHUNK_CAP)
     r_pt = HeapBuf(MAX_PTR_WIDTH)
     pre = HeapBuf(MAX_PTR_WIDTH + 1)
     vals3 = HeapBuf(3)
@@ -3228,9 +3225,8 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
         cbits[GEN ** k] = b * b
         rebuilt *= 1 + b * (1 + GEN ** (2 ** k))
     assert rebuilt == g_cycles
-    # g^n_rows (the tallest height), g^w, whether w is the cycles' bit length, and g^p for
-    # the p permutations that draw the link's packed challenges.
-    hint_witness(shape[0:4], "link_shape")
+    # g^n_rows (the tallest height), g^w, and whether w is the cycles' bit length.
+    hint_witness(shape[0:3], "link_shape")
     g_n = shape[GEN ** 0]
     g_w = shape[GEN ** 1]
     flag = shape[GEN ** 2]
@@ -3262,37 +3258,37 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     grind_check(pow_word, tabs, LINK_GRIND_BITS)
 
     # ---- the link's challenges ----
-    # The grind's permutation drew theta_0; the rest come eight to a permutation of the
-    # capacity alone, the fixed-count ones first. The hinted count p is the one with
-    # 8 p - 8 < count <= 8 p.
-    g_p = shape[GEN ** 3]
-    over = g_p ** 8 / (GEN ** LINK_FIXED * g_n * g_w * g_d)
-    vanish = 1
-    for j in unroll(0, 8):
-        vanish = vanish * (over + GEN ** j)
-    assert vanish == 0
-    chal[GEN ** 0] = theta0
-    fs0, fs1, fs2, fs3, fs4 = squeeze_packed(fs0, fs1, fs2, fs3, fs4, chal * GEN, g_p)
-    theta = chal
-    gam = theta * GEN ** N_TABLES
-    gs0 = gam[GEN ** 0]
-    gs1 = gam[GEN ** 1]
+    sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
+    no_rate = StackBuf(8)
+    theta = StackBuf(N_TABLES)
+    theta[0] = theta0
+    for t in unroll(1, N_TABLES):
+        sp, ch = squeeze(sp, no_rate, 0)
+        theta[t] = ch
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(sp[8], sp[9], sp[10], sp[11], sp[12], tau, g_n)
+    sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
+    sp, gs0 = squeeze(sp, no_rate, 0)
+    sp, gs1 = squeeze(sp, no_rate, 0)
     # On the address, the word and the presence; a word lo + Y hi takes gm1 Y on its high limb.
-    gm0 = gam[GEN ** 2]
-    gm1 = gam[GEN ** 3]
-    gm3 = gam[GEN ** 4]
-    mu = gam * GEN ** 5
-    alpha = mu * GEN ** N_ACCESSES
-    etas = alpha * GEN ** LOG2_BYTECODE_COLS
-    eta_start = etas[GEN ** 0]
-    eta_cover = etas[GEN ** 1]
-    eta_mem = etas[GEN ** 2]
-    eta_bc = etas[GEN ** 3]
+    sp, gm0 = squeeze(sp, no_rate, 0)
+    sp, gm1 = squeeze(sp, no_rate, 0)
+    sp, gm3 = squeeze(sp, no_rate, 0)
+    mu = StackBuf(N_ACCESSES)
+    for a in unroll(0, N_ACCESSES):
+        sp, ch = squeeze(sp, no_rate, 0)
+        mu[a] = ch
+    for i in unroll(0, LOG2_BYTECODE_COLS):
+        sp, ch = squeeze(sp, no_rate, 0)
+        alpha[GEN ** i] = ch
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(sp[8], sp[9], sp[10], sp[11], sp[12], zeta, g_w)
+    sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
+    sp, eta_start = squeeze(sp, no_rate, 0)
+    sp, eta_cover = squeeze(sp, no_rate, 0)
+    sp, eta_mem = squeeze(sp, no_rate, 0)
+    sp, eta_bc = squeeze(sp, no_rate, 0)
     # The mirror certificates' coefficients: pointer column q's chunk c takes eps_q nu_c.
-    eps = etas * GEN ** 4
-    tau = eps * GEN ** N_POINTERS
-    zeta = tau * g_n
-    nu = zeta * g_w
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(sp[8], sp[9], sp[10], sp[11], sp[12], eps, GEN ** N_POINTERS)
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(fs0, fs1, fs2, fs3, fs4, nu, g_d)
     eqtree(alpha, slot, LOG2_BYTECODE_COLS)
     slot = slot * GEN ** (2 ** LOG2_BYTECODE_COLS - 2)  # eq(alpha, .) over the 16 tuple slots
 
@@ -3305,7 +3301,6 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     spine = vals3[GEN ** 1]
     m1 = vals3[GEN ** 2]
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
-    no_rate = StackBuf(8)
     sp, spine_coef = squeeze(sp, no_rate, 0)
     sp, cert = squeeze(sp, no_rate, 0)
     sp, jump_0 = squeeze(sp, no_rate, 0)
@@ -3325,9 +3320,9 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
         if const(PW_KIND[i] == 0):
             pw_f = eta_bc * slot[GEN ** PW_ARG[i]]
         elif const(PW_KIND[i] == 1):
-            pw_f = em_g0 * mu[GEN ** PW_ARG[i]]
+            pw_f = em_g0 * mu[PW_ARG[i]]
         else:
-            pw_f = em_g1 * mu[GEN ** PW_ARG[i]]
+            pw_f = em_g1 * mu[PW_ARG[i]]
         pw_t = PW_COEF[i] * pw_f * splitv[GEN ** PW_COL[i]]
         if const(PW_FRAME[i] == 0):
             program = program + pw_t
@@ -3359,7 +3354,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     for t in unroll(0, N_TABLES):
         hh = kb[2 + t]
         bits_t = rows_bits * GEN ** (ROW_BITS * t)
-        th = theta[GEN ** t]
+        th = theta[t]
         omega, act, eq_tau = match(log(hh), range(0, N_ROW_LOGS), lambda h: table_point(th, tau, chi, bits_t, h))
         corner = c1chain[g_n] / c1chain[hh]
         s_gamma = gs0 * sent[GEN ** STATE_PC[t]] + gs1 * sent[GEN ** STATE_FP[t]]
@@ -3370,9 +3365,9 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
         memory = 0
         for a in unroll(ACC_START[t], ACC_START[t + 1]):
             if const(ACC_GATE[a] == LINK_NO_POS):
-                gm_a = mu[GEN ** a]
+                gm_a = mu[a]
             else:
-                gm_a = mu[GEN ** a] * sent[GEN ** ACC_GATE[a]]
+                gm_a = mu[a] * sent[GEN ** ACC_GATE[a]]
             acc_gm[a] = gm_a
             access = gm0 * link_form(sent, ACC_ADDR[a]) + gm3 + gm1 * link_form(sent, ACC_VALUE[a])
             memory = memory + gm_a * access
@@ -3397,7 +3392,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # The word reads weigh word(r) = m1 at their pointer.
     wm = em_g1 * m1
     for w in unroll(0, N_WORD_READS):
-        coef = coef + fq[WR_PTR[w]] * mu[GEN ** WR_ACC[w]] * link_form(sent, WR_SCALE[w]) * wm
+        coef = coef + fq[WR_PTR[w]] * mu[WR_ACC[w]] * link_form(sent, WR_SCALE[w]) * wm
     for a in unroll(0, N_ACCESSES):
         if const(ACC_SHIFT[a] == 0):
             coef = coef + fq[ACC_PTR[a]] * acc_gm[a] * ey
