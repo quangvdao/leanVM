@@ -1363,7 +1363,7 @@ fn group_value(chunks: &Chunks, table: &[F128], i: usize, group: &[u64], uniform
     }
     let mut values = [F128::ZERO; MAX_GROUP];
     let mut len = group.len() / 2;
-    for (v, pair) in values[..len].iter_mut().zip(group.chunks_exact(2)) {
+    for (v, pair) in values[..len].iter_mut().zip(group.as_chunks::<2>().0) {
         let a = eval_chunk(chunks, table, pair[0], i);
         *v = if chunks.bits(pair[0], i) == chunks.bits(pair[1], i) {
             a
