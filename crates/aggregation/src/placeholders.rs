@@ -2,10 +2,7 @@
 
 use super::MAX_RECURSIONS;
 use super::cells::pack_16_bytes;
-use super::child::{
-    MU_CAP, QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, block_groups, col_groups, merkle_cap_depth, whir_levels,
-};
-use super::claim_pool::{ClaimSite, claim_pool, coord_difference, coord_kind, coord_scale, push_coord_terms};
+use super::child::{QUERY_WINDOW_BITS, QUERY_WINDOWS_CAP, STREAM_CAP, merkle_cap_depth, whir_levels};
 use super::deferred::{BATCH_LAM_GRIND_BITS, RECURSION_AGG_LABEL};
 use super::hints::{DIGIT_GROUP, LX_DIGIT_GROUP, LX_WINDOW};
 use super::statement::{BIG_GROUPS, CLAIM_GROUP, STATEMENT_HEADER};
@@ -14,19 +11,13 @@ use fiat_shamir_prover::merkle::hash_to_scalars;
 use fiat_shamir_prover::{FiatShamirState, RATE_SCALARS, grinding_bits};
 use lean_da::{CELLS_PER_ROW, DA_MAX_ROWS, LOG_BLOB_SYMBOLS, LOG_CELL_SYMBOLS, LOG_CODEWORD_SYMBOLS};
 use lean_vm_core::constraints::xi_offsets;
-use lean_vm_core::cpu::{
-    KeccakLane, QKECCAK, block_kappa_sources, col_kappa_sources, from_scalar, keccak_value, layout_of, n_xi_powers,
-    to_scalar, xi_form_base,
-};
-use lean_vm_core::gkr::{ROUND_GRIND, y_grind};
+use lean_vm_core::cpu::{col_kappa_sources, from_scalar, to_scalar};
 use lean_vm_core::keccak::{MIN_SHAPE as KECCAK_MIN_SHAPE, SLOT_LOG};
-use lean_vm_core::leaf::{self, Block, Coord};
 use pcs::ntt::AdditiveNttF64;
 use primitives::field::{F64, F128, g_pow};
 use std::collections::BTreeMap;
-use verifier::bus_grinding_bits;
 use verifier::bus_layout::BUS_BITS;
-use verifier::bus_layout::{GLOBAL_COLUMN_BASES, N_TABLES, TABLE_LOG_FLOORS, TABLE_WIDTHS, tables};
+use verifier::bus_layout::{N_TABLES, TABLE_LOG_FLOORS};
 use verifier::{BATCH_GRINDING_BITS, FOLD_GRINDING_BITS, OOD_GRINDING_BITS, QUERY_GRINDING_BITS};
 
 /// A value as the guest's literal for it: an integer in decimal, a field element as the integer its limbs spell, a
@@ -90,24 +81,6 @@ impl Placeholders {
         self.set(name, values.into_iter().collect::<Vec<_>>());
     }
 }
-
-struct ClaimDescriptor {
-    buffer: usize,
-    column: usize,
-    qkeccak_slot: usize,
-    /// The kappa source `(src, adj)` of the claim's low dimension.
-    source: (usize, usize),
-}
-
-// The guest's `POINT_BUF_*`, the point a pooled claim is made at: the bus's `zeta`, the table
-// sumcheck's point, the public input's, that point on a slot of `q_keccak`, and none for an
-// output lane's, which the Keccak reduction takes as its claim on the permutation's output and
-// the opening never sees.
-const POINT_BUF_ZETA: usize = 0;
-const POINT_BUF_RHO: usize = 1;
-const POINT_BUF_PI: usize = 2;
-const POINT_BUF_QKECCAK_RHO: usize = 3;
-const POINT_BUF_KECCAK_OUT: usize = 4;
 
 /// A greedy (Paar) straight-line program computing each row's sum, or product where a row repeats an input:
 /// value `inputs + k` is op `k`, the sum or product of two earlier values, the pair most rows share first.
@@ -190,25 +163,12 @@ fn poly_factors(mut p: u64) -> Vec<u64> {
 /// The recursion program's placeholder map depends on table structure and bytecode
 /// size, so one compiled guest serves every proof layout.
 pub(super) fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
-    // Only block and coordinate structure is used here; stand-in sizes let us derive it before the guest's
-    // bytecode exists.
-    let layout = layout_of(kbc, 20, [1 << 10; N_TABLES]);
-    let sides = [layout.push, layout.pull, layout.count];
     let mut ph = Placeholders::default();
     constants(&mut ph);
-    let (pool, coord_claims) = claim_pool(&sides, kbc);
-    bus_placeholders(&mut ph, &sides, kbc, &coord_claims);
-    claim_placeholders(&mut ph, &pool, kbc);
     keccak_placeholders(&mut ph);
-    // The bus's least push depth over every execution of this bytecode: the least memory, every table at its floor.
-    // The bus grind sends a nonce at every depth the guest admits, which it absorbs with the OOD sample's value, and
-    // the root-most layer is binary and never the last.
-    let bus_min_mu = leaf::layout(&layout_of(kbc, verifier::MIN_LOG_MEMORY, [0; N_TABLES]).push).mu;
-    assert!(bus_grinding_bits(bus_min_mu) > 0 && bus_min_mu > 2);
-    ph.set("BUS_MIN_MU", bus_min_mu);
     field_placeholders(&mut ph);
     opening_placeholders(&mut ph, kbc);
-    bytecode_placeholders(&mut ph, &sides, kbc);
+    bytecode_placeholders(&mut ph, kbc);
     da_placeholders(&mut ph);
     signature_placeholders(&mut ph);
     stack_placeholders(&mut ph);
@@ -222,8 +182,7 @@ pub(super) fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
 fn constants(ph: &mut Placeholders) {
     use lean_sphincs::internals as sp;
     use lean_xmss::internals as lx;
-    use verifier::N_BUS_TREES;
-    use verifier::keccak::{EMBED_BITS, PACK, PRODUCT_BITS};
+    use verifier::keccak::{PACK, PRODUCT_BITS};
     let nonces = |bits: u32| usize::from(bits > 0);
     // The F128 tower F64[Y]/(Y^2 + xY + 1): Y_TOWER embeds Y for AIR lane reassembly; Y_INV = Y + x splits a word
     // into its two K limbs.
@@ -234,37 +193,18 @@ fn constants(ph: &mut Placeholders) {
         ("STREAM_CAP", &STREAM_CAP),
         ("QW", &QUERY_WINDOW_BITS),
         ("QUERY_WINDOWS_CAP", &QUERY_WINDOWS_CAP),
-        ("MU_CAP", &MU_CAP),
         ("MIN_LOG_MEM", &verifier::MIN_LOG_MEMORY),
         ("MAX_LOG_MEM", &verifier::MAX_LOG_MEMORY),
         ("INV_GEN", &F128::from(F64::G.inv())),
         ("Y_TOWER", &y_tower),
         ("Y_INV", &y_tower.inv()),
-        // The tables, and the table sumcheck's xi layout from the native verifier's own numbers: a disjoint range of
-        // identities per table, then one power per bus tree (verifier::N_BUS_TREES), shared by every table. Sharing
-        // is what lets the target be derived from the trees' leaf claims instead of trusted (xi_form_base).
+        // The tables.
         ("N_TABLES", &N_TABLES),
-        ("NO_TABLE", &N_TABLES),
         ("FLOORS", &TABLE_LOG_FLOORS),
-        ("ETA_OFFSET", &xi_offsets(tables().iter().map(|t| t.n_constraints()))),
-        ("ETA_FORM_BASE", &xi_form_base()),
-        ("N_ETA_POWS", &n_xi_powers()),
-        ("N_TABLE_COLS", &TABLE_WIDTHS),
-        ("TABLE_COL_BASE", &xi_offsets(TABLE_WIDTHS.iter().copied())),
-        ("N_COL_EVALS", &TABLE_WIDTHS.iter().sum::<usize>()),
-        ("TABLE_COLS_CAP", &(TABLE_WIDTHS.iter().max().unwrap() + 1)),
-        // The grinds: the bus's by the push depth, a sumcheck round of degree `d`, eq factor included, then each
-        // other challenge the guest grinds for.
-        ("BUS_GRIND_BITS", &(0..64).map(bus_grinding_bits).collect::<Vec<_>>()),
+        // The grinds: a sumcheck round of degree `d`, eq factor included, then each other challenge the guest
+        // grinds for.
         ("ROUND2_GRIND_BITS", &grinding_bits(2)),
         ("ROUND3_GRIND_BITS", &grinding_bits(3)),
-        ("ROUND5_GRIND_BITS", &ROUND_GRIND),
-        ("GKR_COMBINER_GRIND_BITS", &grinding_bits(N_BUS_TREES as u128 - 1)),
-        // y: a binary layer's (only ever the root-most, never the last), a radix-four one's, the last layer's doubled.
-        ("GKR_Y1_GRIND_BITS", &y_grind(1, false)),
-        ("GKR_Y_GRIND_BITS", &y_grind(2, false)),
-        ("GKR_Y_LAST_GRIND_BITS", &y_grind(2, true)),
-        ("XI_GRIND_BITS", &grinding_bits(n_xi_powers() as u128 - 1)),
         // The Keccak segment then the lane, 25 lanes in five coordinates.
         ("KECCAK_SEG_GRIND_BITS", &grinding_bits((shape.seg_log() + 5) as u128)),
         ("KECCAK_S_GRIND_BITS", &grinding_bits(PRODUCT_BITS as u128 - 1)),
@@ -282,7 +222,6 @@ fn constants(ph: &mut Placeholders) {
         ("KECCAK_SEGMENTS", &shape.segments()),
         ("KECCAK_SEG_LOG", &shape.seg_log()),
         ("KECCAK_PACK", &PACK),
-        ("KECCAK_EMBED_BITS", &EMBED_BITS),
         ("KECCAK_PROD_BITS", &PRODUCT_BITS),
         ("KECCAK_PI", &keccak256::PI),
         ("KECCAK_RHO", &keccak256::RHO),
@@ -291,7 +230,6 @@ fn constants(ph: &mut Placeholders) {
         ("QKECCAK_VARS_CAP", &(33 + SLOT_LOG)),
         // The stacked opening and the statement.
         ("N_COLUMN_LOGS", &(verifier::MAX_STACKED_LOG + 1)),
-        ("PCS_MIN_MU", &verifier::MIN_STACKED_LOG),
         ("LIG_N_RATES", &(MAX_LOG_INV_RATE - MIN_LOG_INV_RATE + 1)),
         ("LOG2_BYTECODE_COLS", &BUS_BITS),
         ("STMT_HEADER", &STATEMENT_HEADER),
@@ -320,172 +258,6 @@ fn constants(ph: &mut Placeholders) {
     for &(name, value) in constants {
         ph.set(name, value);
     }
-}
-
-/// The bus blocks and their coordinates and terms, given each coordinate's `(fresh, slot)` in the claim pool.
-fn bus_placeholders(ph: &mut Placeholders, sides: &[Vec<Block>; 3], kbc: usize, coord_claims: &[(usize, usize)]) {
-    let bks = block_kappa_sources(kbc);
-    // Each side's first block, then the end.
-    let sblk = xi_offsets(sides.iter().map(Vec::len).chain([0]));
-    assert_eq!(bks.len(), sblk[3], "a kappa source per block");
-    // A TABLE block's coordinates, flattened into terms: the guest rebuilds each as
-    // `Σ_terms`, so a derived value (an XOR/MUL result, a DEREF store, a JUMP
-    // successor) costs terms rather than columns. A framework coordinate has none:
-    // it decomposes into pooled claims instead.
-    // Per coordinate: its kind, its constant, its value on its table's padding row (zero for a framework
-    // coordinate) and its terms.
-    let (mut block_coords, mut coordinates, mut terms) = (Vec::new(), Vec::new(), Vec::new());
-    for (blk, &(source, _)) in sides.iter().flatten().zip(&bks) {
-        block_coords.push(coordinates.len()..coordinates.len() + blk.coords.len());
-        for (i, c) in blk.coords.iter().enumerate() {
-            let start = terms.len();
-            if let Some(t) = source.checked_sub(2) {
-                push_coord_terms(c, GLOBAL_COLUMN_BASES[t], &mut terms);
-            }
-            let padding = blk.padding.get(i).map_or(0, |v| v.0);
-            coordinates.push((coord_kind(c), u128::from(coord_scale(c)), padding, start..terms.len()));
-        }
-    }
-    ph.set("SIDE_BLOCK_START", &sblk);
-    ph.set("N_BLOCKS", sblk[3]);
-    ph.set("N_COORDS", coordinates.len());
-    // Push and pull emit bus blocks in matched pairs, so their baked kappa-source
-    // segments are identical; the guest computes only push's side total and
-    // aliases pull's mu to push's on this basis.
-    assert_eq!(
-        bks[sblk[0]..sblk[1]],
-        bks[sblk[1]..sblk[2]],
-        "push/pull kappa sources must match"
-    );
-    // The guest also reuses push's padding term for pull, which needs the same padding
-    // tuples (a padding row's counts are zero, so a count's `g·` changes nothing).
-    assert!(
-        sides[0].iter().zip(&sides[1]).all(|(a, b)| a.padding == b.padding),
-        "push/pull padding tuples must match"
-    );
-    let bgroups = block_groups(&bks, &sblk);
-    ph.set("N_BLOCK_GROUPS", bgroups.len());
-    ph.list("BLOCK_GROUP_START", bgroups.iter().copied().chain([bks.len()]));
-    ph.list(
-        "SIDE_GROUP_START",
-        sblk.iter().map(|&b| bgroups.partition_point(|&start| start < b)),
-    );
-    ph.list("BLOCK_KAPPA_SRC", bks.iter().map(|&(s, _)| s));
-    ph.list("BLOCK_KAPPA_ADJ", bks.iter().map(|&(_, a)| a));
-    ph.list(
-        "BLOCK_TABLE",
-        bks.iter().map(|&(s, _)| s.checked_sub(2).unwrap_or(N_TABLES)),
-    );
-    ph.list(
-        "BLOCK_SIDE",
-        sides
-            .iter()
-            .enumerate()
-            .flat_map(|(s, blocks)| std::iter::repeat_n(s, blocks.len())),
-    );
-    ph.list("BLOCK_COORD_OFF", block_coords.iter().map(|r| r.start));
-    ph.list("BLOCK_COORD_COUNT", block_coords.iter().map(|r| r.len()));
-    ph.list("COORD_TYPE", coordinates.iter().map(|c| c.0));
-    ph.list("COORD_CONST", coordinates.iter().map(|c| c.1));
-    ph.list("COORD_PADDING", coordinates.iter().map(|c| c.2));
-    ph.list("COORD_TERM_OFF", coordinates.iter().map(|c| c.3.start));
-    ph.list("COORD_TERM_COUNT", coordinates.iter().map(|c| c.3.len()));
-    let fresh = coord_claims.iter().map(|c| c.0);
-    ph.list("COORD_FRESH", fresh.clone());
-    // A fresh coordinate's place in the run of words the decomposition absorbs, which
-    // decides where it waits in the Fiat-Shamir sponge.
-    ph.list("COORD_FRESH_POS", xi_offsets(fresh.clone()));
-    ph.set("N_FRESH", fresh.clone().sum::<usize>());
-    ph.set("N_BUS_CLAIMS", fresh.sum::<usize>());
-    ph.list("COORD_CLAIM_SLOT", coord_claims.iter().map(|c| c.1));
-    // A pull table-block coordinate's difference from its push twin's, as merged terms
-    // appended after every coordinate's own: the guest counts a pull block's form as
-    // push's plus these, the two blocks sharing eq_hi. A pull block also reads its `Index` coordinates off its push
-    // twin's, at the same places.
-    let index = coord_kind(&Coord::Index);
-    let (mut diff_off, mut diff_count) = (vec![0usize; coordinates.len()], vec![0usize; coordinates.len()]);
-    for b in sblk[1]..sblk[2] {
-        let (pull, push) = (block_coords[b].clone(), block_coords[b - sblk[1]].clone());
-        assert!(
-            bks[b] == bks[b - sblk[1]] && pull.len() == push.len(),
-            "pull block {b} must mirror its push twin"
-        );
-        for (p, q) in pull.zip(push) {
-            assert_eq!(
-                coordinates[p].0 == index,
-                coordinates[q].0 == index,
-                "pull block {b}'s Index coordinates must sit where its push twin's do"
-            );
-            let merged = coord_difference(&terms[coordinates[p].3.clone()], &terms[coordinates[q].3.clone()]);
-            diff_off[p] = terms.len();
-            diff_count[p] = merged.len();
-            terms.extend(merged);
-        }
-    }
-    ph.set("COORD_DIFF_OFF", diff_off);
-    ph.set("COORD_DIFF_COUNT", diff_count);
-    ph.list("TERM_TYPE", terms.iter().map(|t| t.kind));
-    ph.list("TERM_CONST", terms.iter().map(|t| t.constant));
-    ph.list("TERM_COL_A", terms.iter().map(|t| t.column_a));
-    ph.list("TERM_COL_B", terms.iter().map(|t| t.column_b));
-    // 1 + g^(2^i).
-    let g_squarings = std::iter::successors(Some(F128::from(F64::G)), |g| Some(*g * *g));
-    ph.list("INDEX_MLE_FACTORS", g_squarings.take(34).map(|g| F128::ONE + g));
-}
-
-/// The claim pool's descriptors.
-fn claim_placeholders(ph: &mut Placeholders, pool: &[ClaimSite], kbc: usize) {
-    // Each column's index among the committed ones.
-    let mut committed = 0..;
-    let compact: Vec<Option<usize>> = (col_kappa_sources(kbc).iter())
-        .map(|source| source.map(|_| committed.next().unwrap()))
-        .collect();
-    let compact_col = |column: usize| compact[column].expect("a claim targets a committed column");
-    let qkeccak = compact_col(QKECCAK);
-    let claims: Vec<ClaimDescriptor> = (pool.iter())
-        .map(|site| match *site {
-            ClaimSite::Framework { column, source } => (POINT_BUF_ZETA, compact_col(column), 0, source),
-            // A table column's claim is at its table's chi[..tau].
-            ClaimSite::TableColumn { column, table } => match keccak_value(column) {
-                None => (POINT_BUF_RHO, compact_col(column), 0, (2 + table, 0)),
-                Some(KeccakLane::Slot(slot)) => (POINT_BUF_QKECCAK_RHO, qkeccak, slot, (2 + table, 0)),
-                Some(KeccakLane::Output(_)) => (POINT_BUF_KECCAK_OUT, qkeccak, 0, (2 + table, 0)),
-            },
-            ClaimSite::MemoryLimb { column } => (POINT_BUF_PI, compact_col(column), 0, (1, 0)),
-        })
-        .map(|(buffer, column, qkeccak_slot, source)| ClaimDescriptor {
-            buffer,
-            column,
-            qkeccak_slot,
-            source,
-        })
-        .collect();
-    ph.set("N_CLAIMS", claims.len());
-    ph.list("CLAIM_POINT_BUF", claims.iter().map(|c| c.buffer));
-    ph.list("CLAIM_COMMITTED_COL", claims.iter().map(|c| c.column));
-    ph.list("CLAIM_KAPPA_SRC", claims.iter().map(|c| c.source.0));
-    ph.list("CLAIM_KAPPA_ADJ", claims.iter().map(|c| c.source.1));
-    ph.list(
-        "CLAIM_QKECCAK_SLOT_BITS",
-        claims
-            .iter()
-            .flat_map(|c| (0..SLOT_LOG).map(move |k| (c.qkeccak_slot >> k) & 1)),
-    );
-    // The output lanes' claims, consecutive in the pool: the reduction's claim on the output.
-    let out_pool = claims
-        .iter()
-        .position(|c| c.buffer == POINT_BUF_KECCAK_OUT)
-        .expect("the output lanes' claims");
-    assert!(
-        (0..claims.len()).all(|j| (claims[j].buffer == POINT_BUF_KECCAK_OUT)
-            == (out_pool..out_pool + keccak256::STATE_LANES).contains(&j))
-    );
-    ph.set("KECCAK_OUT_POOL", out_pool);
-    // The stacked opening batches the ring-switched claim, the pool's on-stack claims and the
-    // Keccak reduction's claim on its output word and level 0's OOD claim; the batching is accounted for up to a cap.
-    let stacked = 2 + claims.iter().filter(|c| c.buffer != POINT_BUF_KECCAK_OUT).count() + 1;
-    assert!(stacked <= verifier::MAX_STACKED_CLAIMS, "too many stacked claims");
-    ph.set("QKECCAK_COMMITTED_COL", qkeccak);
 }
 
 /// The Keccak reduction's RMFE projection and embedding as straight-line programs, and its iota and linear layer, as
@@ -573,6 +345,9 @@ fn keccak_placeholders(ph: &mut Placeholders) {
 
 /// The F128 coordinate basis and the ring switch's points.
 fn field_placeholders(ph: &mut Placeholders) {
+    // 1 + g^(2^i).
+    let g_squarings = std::iter::successors(Some(F128::from(F64::G)), |g| Some(*g * *g));
+    ph.list("INDEX_MLE_FACTORS", g_squarings.take(34).map(|g| F128::ONE + g));
     // Coordinate basis e_i of F128 over F2 (spans the whole field): the 64 binary
     // basis vectors in each of the two tower limbs. The guest uses these vectors to
     // reconstruct a word from its 128 coordinate bits.
@@ -775,11 +550,6 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
     ph.set("LIG_MIN_SHIFT_INV", F128::from(g_pow(minm).inv()));
     let cks: Vec<(usize, usize)> = col_kappa_sources(kbc).into_iter().flatten().collect();
     ph.set("N_COMMITTED_COLS", cks.len());
-    ph.list("COL_KAPPA_SRC", cks.iter().map(|&(s, _)| s));
-    ph.list("COL_KAPPA_ADJ", cks.iter().map(|&(_, a)| a));
-    let groups = col_groups(&cks);
-    ph.set("N_COL_GROUPS", groups.len());
-    ph.list("COL_GROUP_START", groups.iter().copied().chain([cks.len()]));
     // The subspace-vanishing values of a level's message columns and their inverses, by the column count: block `n`
     // at n(n+1)/2.
     let by_cols: Vec<F64> = (0..=max_cols)
@@ -811,17 +581,9 @@ fn stack_placeholders(ph: &mut Placeholders) {
 }
 
 /// The stacked bytecode's claim, the batch's seed, and the statement's layout.
-fn bytecode_placeholders(ph: &mut Placeholders, sides: &[Vec<Block>; 3], kbc: usize) {
+fn bytecode_placeholders(ph: &mut Placeholders, kbc: usize) {
     ph.set("BYTECODE_LOG", kbc);
-    // The stacked bytecode: an encoding column per side for each two public coordinates, aligned with the bus
-    // tuple, so their slots span the fingerprint's own bits. The defer region is
-    // the claim's point (row, then slot) and its value.
-    let public = sides
-        .iter()
-        .flatten()
-        .flat_map(|b| &b.coords)
-        .filter(|c| matches!(c, Coord::Public(_)));
-    ph.set("BYTECODE_COLS", public.count() / 2);
+    // The defer region is the stacked bytecode claim's point (row, then slot) and its value.
     let defer_size = kbc + BUS_BITS + 1;
     ph.set("DEFER_SIZE", defer_size);
     ph.set("BYTECODE_VARS", kbc + BUS_BITS);
@@ -970,7 +732,7 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
     let blocks = stack_blocks();
     let block_of = |column: usize| blocks.iter().position(|b| b.column == column);
     assert_eq!(
-        [MEMORY_0, MEMORY_1, QKECCAK].map(|c| block_of(c)),
+        [MEMORY_0, MEMORY_1, QKECCAK].map(&block_of),
         [Some(0), Some(1), Some(2)],
         "the framework blocks lead the stack"
     );
@@ -978,11 +740,10 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
 
     // The sent run: each table's non-pointer columns.
     let mut sent_pos: Vec<Vec<usize>> = Vec::new();
-    let (mut sent_start, mut sent_target) = (Vec::new(), Vec::new());
+    let mut sent_target = Vec::new();
     for table in &tables {
         let pointers = table.links.pointers();
         let base = GLOBAL_COLUMN_BASES[table.opcode];
-        sent_start.push(sent_target.len());
         let mut pos = vec![NO_POS; table.width()];
         for (c, slot) in pos.iter_mut().enumerate().filter(|(c, _)| !pointers.contains(c)) {
             *slot = sent_target.len();
@@ -995,7 +756,6 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
         }
         sent_pos.push(pos);
     }
-    sent_start.push(sent_target.len());
     let n_sent = sent_target.len();
 
     // Forms over the sent run.
@@ -1140,7 +900,6 @@ fn link_placeholders(ph: &mut Placeholders, kbc: usize) {
 
     ph.set("LINK_N_SENT", n_sent);
     ph.set("LINK_NO_POS", NO_POS);
-    ph.list("SENT_START", sent_start);
     ph.list("SENT_TARGET", sent_target);
     ph.set("SENT_OUT_LANES", sent_pos[OP_KECCAK][KECCAK_OUT]);
     ph.list("FORM_START", form_start);

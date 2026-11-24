@@ -39,7 +39,6 @@
 
 mod cells;
 mod child;
-mod claim_pool;
 mod coverage;
 mod deferred;
 mod error;

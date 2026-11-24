@@ -272,7 +272,7 @@ fn forged_link_hints_are_rejected() {
     let up = |name: &'static str, at: usize| -> Forgery {
         Box::new(move |hints: &mut Hints| {
             let entry = hints.entry_mut(name, 0);
-            entry[at] = entry[at] * count(1);
+            entry[at] *= count(1);
         })
     };
     let forgeries: [Forgery; 4] = [
@@ -338,7 +338,7 @@ fn guest_column_selectors_match_native_eq() {
     }
 }
 
-/// `certify_stack`, `stack_selectors` and `stack_low_eq` reproduce the native binary stripe: for stacks of random table
+/// `certify_stack` and `stack_spread_selectors` reproduce the native binary stripe: for stacks of random table
 /// heights, each block's claim at a random row reads the eq of `Placement::stack_point` against a random opening point.
 /// A wrong expected weight fails the run.
 #[test]
@@ -358,14 +358,19 @@ fn guest_stack_weights_match_native_stripe() {
     point1 = HeapBuf(4 * SEL_NIBBLES)
     for k in unroll(0, 4 * SEL_NIBBLES):
         point1[GEN ** k] = 1 + point[GEN ** k]
-    selectors = stack_selectors(spot_off, piece_log, width, point, point1, g_squares, lane_g)
+    sel_v, spread, lane_prod = stack_spread_selectors(spot_off, piece_log, kappa_base, point, point1, g_squares, lane_g)
+    lane1 = point1 * lane_g
     rows = HeapBuf(N_STK_BLOCKS * {ROW_CAP})
     hint_witness(rows[0:N_STK_BLOCKS * {ROW_CAP}], "rows")
     expected = HeapBuf(N_STK_BLOCKS)
     hint_witness(expected[0:N_STK_BLOCKS], "expected")
     for b in unroll(0, N_STK_BLOCKS):
-        low = stack_low_eq(rows * GEN ** ({ROW_CAP} * b), point1, piece_log[GEN ** b], width[GEN ** b], lane_g)
-        assert low * selectors[GEN ** b] == expected[GEN ** b]
+        p = rows * GEN ** ({ROW_CAP} * b)
+        piece_g = piece_log[GEN ** b]
+        chain = HeapBuf(EQ_CHAIN_ARMS)
+        eq_prefix_chain(chain, 1, p, point1, piece_g)
+        high = match(log(spread[GEN ** b]), range(0, 6), lambda w: eq_run(p * piece_g, lane1, w))
+        assert chain[piece_g] * high * sel_v[GEN ** b] == expected[GEN ** b]
     return
 "#
         ),
