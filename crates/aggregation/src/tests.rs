@@ -264,6 +264,28 @@ fn forged_opening_hints_are_rejected() {
     }
 }
 
+/// The link's shape and the program's value ride in as hints: a forged table height, tallest height or pointer width
+/// fails its certification, and a forged program value the link's terminal check.
+#[test]
+fn forged_link_hints_are_rejected() {
+    let child = prove(&[], &get_signers::<StableProver>(SMALL_LEAF_SIZE), &[]);
+    let up = |name: &'static str, at: usize| -> Forgery {
+        Box::new(move |hints: &mut Hints| {
+            let entry = hints.entry_mut(name, 0);
+            entry[at] = entry[at] * count(1);
+        })
+    };
+    let forgeries: [Forgery; 4] = [
+        up("table_logs", 1),
+        up("link_shape", 0),
+        up("link_shape", 1),
+        Box::new(|hints: &mut Hints| hints.entry_mut("bc_value", 0)[0] += F128::ONE),
+    ];
+    for forgery in forgeries {
+        assert_forgery_rejected(forgery, std::slice::from_ref(&child), vec![], vec![], &[]);
+    }
+}
+
 #[test]
 fn guest_column_selectors_match_native_eq() {
     let kbc = 18;
@@ -439,7 +461,6 @@ fn guest_stack_weights_match_native_stripe() {
 /// a partial group alone. The leaves share three signers, so the parent rebuilds the
 /// right list on the walk that allows repeated slots (`child_claim_list_any`).
 #[test]
-#[ignore = "hotwire: the recursion guest still verifies the bus, so it cannot prove a node over Hotwire children"]
 fn aggregate_two_to_one() {
     let big = 2 * CLAIM_GROUP + 3;
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE + big);
@@ -520,7 +541,6 @@ fn invalid_da_selections_are_rejected_before_building_the_proof() {
 /// root, the first's by default or the one it selects, or none; a node with blobs
 /// publishes their matrix's, whatever its children hold.
 #[test]
-#[ignore = "hotwire: the recursion guest still verifies the bus, so it cannot prove a node over Hotwire children"]
 fn a_node_passes_on_one_childs_da_root() {
     let signers = get_signers::<StableProver>(SMALL_LEAF_SIZE);
     let mut children = vec![prove(&[], &signers, &[])];
@@ -694,7 +714,6 @@ fn da_root(rows: &[Codeword]) -> Hash {
 /// Claims left undeclared take duplicate slots. The first narrowing drops every
 /// claim on one message, the second all but one claim.
 #[test]
-#[ignore = "hotwire: the recursion guest still verifies the bus, so it cannot prove a node over Hotwire children"]
 fn a_node_may_publish_less_than_it_covers() {
     let at_a = get_signers::<StableProver>(3);
     let at_b = get_signers_for::<StableProver>(2, MESSAGE_B);
@@ -772,7 +791,6 @@ fn raw_signatures_may_go_undeclared() {
 /// left leaf holds one message, the right both, and the node needs a duplicate
 /// slot for the claim both leaves cover.
 #[test]
-#[ignore = "hotwire: the recursion guest still verifies the bus, so it cannot prove a node over Hotwire children"]
 fn aggregate_two_messages() {
     let at_a = get_signers::<StableProver>(4);
     let at_b = get_signers_for::<StableProver>(2, MESSAGE_B);
@@ -848,7 +866,6 @@ fn a_child_walk_cannot_step_back() {
 /// lists landing in their own; the root adds a raw signature of each scheme, leanXMSS on a second message, alongside its
 /// children. The root's proof goes over the wire.
 #[test]
-#[ignore = "hotwire: the recursion guest still verifies the bus, so it cannot prove a node over Hotwire children"]
 fn aggregate_three_levels() {
     let xmss = get_signers::<StableProver>(17);
     let sphincs = get_lean_sphincs_signers::<StableProver>(5);

@@ -4,7 +4,7 @@
 use super::cells::count;
 use super::child::gen_verify;
 use super::coverage::plan_coverage;
-use super::deferred::{DeferredBytecodeClaim, aggregate_deferred_claims, bytecode_sums};
+use super::deferred::{DeferredBytecodeClaim, aggregate_deferred_claims, bytecode_sums, bytecode_value};
 use super::error::AggregateError;
 use super::guest::{fs_seed, unified_guest};
 #[cfg(test)]
@@ -191,7 +191,10 @@ pub fn aggregate<P: Prover>(
     let fresh_sums = bytecode_sums::<P>(&fresh_points);
     let kbc = unified_guest().prog.len().trailing_zeros() as usize;
     // Each child's witness is its own, one child per worker: nothing inside dispatches.
-    let verified = P::map_collect(children.len(), |i| gen_verify(kbc, &children[i].1.proof, &summaries[i]));
+    let verified = P::map_collect(children.len(), |i| {
+        let bc_value = bytecode_value(&fresh_sums[i], &fresh_points[i]);
+        gen_verify(kbc, &children[i].1.proof, &summaries[i], bc_value)
+    });
     for (i, ((claims, _), verified)) in children.iter().zip(verified).enumerate() {
         hints.push(
             "child_meta",

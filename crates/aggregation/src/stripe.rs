@@ -1,9 +1,6 @@
 //! The binary stripe as the guest certifies it (`certify_stack`): the stack's block groups and the witness that
 //! places each block.
 
-// Only the snippet test reads the witness until `verify_sub` certifies the stack.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::cells::count;
 use primitives::field::F128;
 use verifier::layout::{MIN_STACKED_LOG, SizeSource, StackBlock, stack_blocks};
@@ -34,6 +31,13 @@ pub(super) fn block_groups(blocks: &[StackBlock]) -> Vec<usize> {
         .collect()
 }
 
+/// The stack's log size for blocks of log sizes `kappas`: every block takes `2^max(kappa, MAX_STRIPE_WIDTH)` words,
+/// and the stack is the least power of two holding them, at least `2^MIN_STACKED_LOG`.
+pub(super) fn stack_log(kappas: &[usize]) -> usize {
+    let total: u64 = kappas.iter().map(|&k| 1u64 << k.max(MAX_STRIPE_WIDTH)).sum();
+    (64 - (total - 1).leading_zeros() as usize).max(MIN_STACKED_LOG)
+}
+
 /// The witness streams `certify_stack` reads for blocks of log sizes `kappas` (in [`stack_blocks`] order): the group
 /// order, the lane count's bits, and per block its lane group, whether it stays whole, whether its log size is below
 /// its group's width, and its in-lane offset over the lanes of its group.
@@ -46,7 +50,7 @@ pub(super) fn stack_hints(kappas: &[usize]) -> Vec<(&'static str, Vec<F128>)> {
     order.sort_by_key(|&g| (std::cmp::Reverse(taken(starts[g])), !blocks[starts[g]].ring, starts[g]));
 
     let total: u64 = (0..blocks.len()).map(|b| 1u64 << taken(b)).sum();
-    let log = (64 - (total - 1).leading_zeros() as usize).max(MIN_STACKED_LOG);
+    let log = stack_log(kappas);
     let lane = log - INITIAL_FOLDING_FACTOR;
     let lanes = total.div_ceil(1 << lane);
     // Each guest group as (first lane, log width).

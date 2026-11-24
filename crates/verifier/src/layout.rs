@@ -36,6 +36,11 @@ impl Form {
         forms.into_iter().fold(Form::default(), |acc, form| acc + form)
     }
 
+    /// The monomials and their coefficients: `[]` is 1, `[i]` is `x_i`, `[i, j]` is `x_i·x_j`.
+    pub fn terms(&self) -> impl Iterator<Item = (&[usize], E)> {
+        self.terms.iter().map(|(monomial, &c)| (monomial.as_slice(), c))
+    }
+
     pub fn evaluate(&self, column: &[E]) -> E {
         E::sum(
             self.terms
