@@ -85,11 +85,6 @@ pub(crate) enum LOp {
         first: u32,
         dst: Off,
     },
-    /// In `main`, first in the branch that enters the `own_tables` loop `lp`: one `SET` per slot of the
-    /// jump tables only code reached through `lp` reads ([`JumpTables`]). Assembly expands it.
-    LoopTables {
-        lp: String,
-    },
     /// `KECCAK`: one permutation. The four `m` cells and `b8` are addressed
     /// independently, `tail` (4 cells), `cap` (4 cells) and the output `c` (its first
     /// `out_cells` cells) are consecutive runs; the flags name the layouts read and written.
@@ -162,10 +157,7 @@ impl Lowered {
 /// pc it jumps to, in `main`'s frame past its own cells. `main`'s frame sits at a
 /// fixed address (`fp = g^0`), so a dispatch reads slot `x = g^j` of a table with
 /// one `DEREF` ([`LOp::Slot`]). Code at pc 0, before `main` and in its frame, writes
-/// every slot once, with one `SET` each, except the slots of an `own_tables` loop:
-/// the tables only code reached through that loop reads. They come last, a run per
-/// loop, and `main` writes them in the branch that enters the loop ([`LOp::LoopTables`]),
-/// so a run that skips the loop skips them too.
+/// every slot once, with one `SET` each.
 #[derive(Default)]
 pub(crate) struct JumpTables {
     /// Each slot's target: an arm's first instruction ([`KVal::At`]) or, for a

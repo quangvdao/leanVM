@@ -62,7 +62,6 @@ fn visit(op: &mut LOp, f: &mut dyn FnMut(&mut Off, Role)) {
             f(x, Role::Use);
             f(dst, Role::Dest);
         }
-        LOp::LoopTables { .. } => {}
         LOp::Keccak {
             m,
             tail,

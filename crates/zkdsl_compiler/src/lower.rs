@@ -1423,14 +1423,7 @@ impl FnLower<'_> {
                 let x = self.pure(PureOp::Xor, la, lb);
                 self.lower_call(callee, args, Some(x), &[], tail);
             }
-            StmtKind::For {
-                var,
-                lo,
-                hi,
-                body,
-                own_tables,
-            } => self.lower_for(var, *lo, hi, body, *own_tables),
-            StmtKind::LoopTables(lp) => self.emit(LOp::LoopTables { lp: lp.clone() }),
+            StmtKind::For { var, lo, hi, body } => self.lower_for(var, *lo, hi, body),
             // Compile-time unrolling: emit the body per integer, the counter
             // substituted as its literal. Every copy executes (this is
             // straight-line code, not a branch), so bindings simply rebind (a
@@ -1514,7 +1507,7 @@ impl FnLower<'_> {
     /// Free variables of the body that are bound in the enclosing scope are
     /// captured by value as extra helper parameters (e.g. a `HeapBuf` pointer
     /// threaded through the loop).
-    fn lower_for(&mut self, var: &str, lo: u64, hi: &ForBound, body: &[Stmt], own_tables: bool) {
+    fn lower_for(&mut self, var: &str, lo: u64, hi: &ForBound, body: &[Stmt]) {
         let id = self.loop_ctr;
         self.loop_ctr += 1;
         let loop_name = format!("__loop{id}_{}", self.fn_name);
@@ -1676,42 +1669,23 @@ impl FnLower<'_> {
             ForBound::Runtime(_) => {
                 // The entry test and the first call's argument both read the bound,
                 // so one with a call or an allocation in it is bound once first.
-                // An `own_tables` loop's branch reads it a third time.
-                let bind = calls_or_allocates(&entry_bound) || (own_tables && !matches!(entry_bound, Expr::Var(_)));
-                let entry_bound = if bind {
+                let entry_bound = if calls_or_allocates(&entry_bound) {
                     let name = format!("{loop_name}__entry");
                     self.stmt(&Stmt::new(self.cur_line, StmtKind::Let(name.clone(), entry_bound)));
                     Expr::Var(name)
                 } else {
                     entry_bound
                 };
-                let call = Stmt::new(
+                let stmt = Stmt::new(
                     self.cur_line,
                     StmtKind::CallIfNe(
                         Expr::GPow(lo as u128),
                         entry_bound.clone(),
-                        loop_name.clone(),
-                        cap_args(Expr::GPow(lo as u128), entry_bound.clone()),
+                        loop_name,
+                        cap_args(Expr::GPow(lo as u128), entry_bound),
                     ),
                 );
-                if !own_tables {
-                    self.stmt(&call);
-                } else if !self.is_main {
-                    self.fail(
-                        "`own_tables=True` writes jump tables in `main`'s frame, so only a loop in `main` can take it",
-                    );
-                } else {
-                    // `if g^lo != stop:` the tables, then the call, on its own test of the same cells.
-                    let tables = Stmt::new(self.cur_line, StmtKind::LoopTables(loop_name));
-                    self.lower_if(
-                        false,
-                        &Expr::GPow(lo as u128),
-                        &entry_bound,
-                        &[tables, call],
-                        &[],
-                        false,
-                    );
-                }
+                self.stmt(&stmt);
             }
         }
     }

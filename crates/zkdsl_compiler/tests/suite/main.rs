@@ -10,7 +10,6 @@ mod field_div;
 mod hint_log2_ceil;
 mod inline_expr;
 mod inline_returns;
-mod jump_tables;
 mod layout;
 mod loop_frames;
 mod miscompiles;
