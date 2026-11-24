@@ -121,8 +121,11 @@ pub(crate) const RING_SWITCH_ERROR_NUMERATOR: usize = 2;
 /// `2·|S|` `K`-equations, in `128` `K`-unknowns, and with `2·|S| < 128` a
 /// nonzero error lies in the kernel for EVERY coefficient choice and passes
 /// with probability one.
-pub(crate) fn build_coordinate_weights(challenges: &[F128; MAP_CHALLENGES]) -> [F128; DEGREE_E] {
-    std::array::from_fn(|w| apply_map(coordinate_basis(w), challenges))
+///
+/// With `scale`, the weights are those of `v -> Phi(scale v)`, for a claim that joins a merged ring switch as `scale`
+/// times itself.
+pub(crate) fn build_coordinate_weights(challenges: &[F128; MAP_CHALLENGES], scale: F128) -> [F128; DEGREE_E] {
+    std::array::from_fn(|w| apply_map(scale * coordinate_basis(w), challenges))
 }
 
 /// `Phi(value)` of [`build_coordinate_weights`], stage by stage.
@@ -504,7 +507,7 @@ mod tests {
 
             // Column side: sum_w weights[w] * t_w over the transposed K columns.
             let columns = transpose_s_hat(&s_hat_v);
-            let lhs = inner_product_base_ext(&columns, &build_coordinate_weights(&challenges));
+            let lhs = inner_product_base_ext(&columns, &build_coordinate_weights(&challenges, F128::ONE));
 
             // Row side: sum_j x^j * Phi(y_j), the guest's loop.
             let x = F128::new(2, 0);

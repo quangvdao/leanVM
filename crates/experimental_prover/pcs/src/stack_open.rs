@@ -17,7 +17,8 @@
 //!   claim `<q_keccak, rs_eq_ind> = sumcheck_claim` against the transparent
 //!   E-valued weight `rs_eq_ind`.
 //!
-//! All claims are lambda-folded into ONE combined weight `b_stack` over the
+//! The ring-switched claims merge into one, claim `j` as `rho^j` times itself inside the map. That claim and the
+//! point claims are lambda-folded into ONE combined weight `b_stack` over the
 //! whole stack plus one `target`, then proved by
 //! `whir::recursive_prover_with_prepared_basis`. The weight is never
 //! materialized over the stack: level 0's fold rounds run on its terms (see the `basis`
@@ -27,7 +28,8 @@
 //!
 //! ## Transcript order
 //!
-//! Grind [`BATCH_GRINDING_BITS`], sample the shared linear map, then one batching challenge for both claim families, then run WHIR. The caller already bound each claim's slices and value through the transcript, so none is observed again here.
+//! Grind [`BATCH_GRINDING_BITS`], sample the shared linear map, then `rho` when there are several ring-switched claims,
+//! then one batching challenge for the merged ring claim and the point claims, then run WHIR. The caller already bound each claim's slices and value through the transcript, so none is observed again here.
 //!
 //! ## The combined weight
 //!
@@ -285,21 +287,26 @@ pub fn open_batch_mixed_whir_stacked(
             }
         })
         .collect();
-    // One grind covers the map challenges and the batching challenge below: one verifier message.
+    // One grind covers the map challenges, rho and the batching challenge below: one verifier message.
     ps.grind(BATCH_GRINDING_BITS);
     let map_challenges = ring_switch::sample_map_challenges(ps);
-    let coordinate_weights = ring_switch::build_coordinate_weights(&map_challenges);
+    // Several ring claims merge into one: claim `j` joins as `rho^j` times itself, inside the map, which is not
+    // `E`-linear (`verifier::ring_switch`).
+    let rho = if ring.claims.len() > 1 { ps.sample() } else { F128::ONE };
 
-    // 2. The ONE batching challenge both families take disjoint power ranges of. Nothing is
-    //    observed first: every claim value reached the caller through a binding stream read, so
-    //    the challenge already depends on all of them (`lean_vm_core::pcs::open`).
-    let lambdas = powers(ps.sample(), ring.claims.len() + point_claims.len());
-    let (lambdas_rs, lambdas_pd) = lambdas.split_at(ring.claims.len());
+    // 2. The ONE batching challenge: the merged ring claim takes its zeroth power, the point claims the next. Nothing
+    //    is observed first: every claim value reached the caller through a binding stream read, so the challenge
+    //    already depends on all of them (`lean_vm_core::pcs::open`).
+    let lambdas = powers(ps.sample(), 1 + point_claims.len());
+    let lambdas_pd = &lambdas[1..];
 
     let rs_outputs: Vec<_> = rs_states
         .into_iter()
-        .zip(lambdas_rs.iter().copied())
-        .map(|(state, lambda)| ring_switch::prove_finish_deferred(state, &coordinate_weights, lambda))
+        .zip(powers(rho, ring.claims.len()))
+        .map(|(state, rho_j)| {
+            let weights = ring_switch::build_coordinate_weights(&map_challenges, rho_j);
+            ring_switch::prove_finish_deferred(state, &weights, F128::ONE)
+        })
         .collect();
     drop(span);
 

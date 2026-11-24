@@ -114,41 +114,45 @@ pub struct RingClaim {
 /// A claim on the stack: its weight at a stack point, and its value.
 pub type RingStackClaim = (Box<dyn Fn(&[E]) -> E>, E);
 
-/// Each claim's 64 slices become one dense claim `sum_u W(u) column(u) = target`.
+/// The claims' 64 slices become one dense claim `sum_u W(u) column(u) = target`.
 ///
-/// Draw Phi once they are all fixed, shared by every claim, then take each target `T = sum_i x^i Phi(s_i)` against
-/// the MLE-friendly weight `W = sum_p Phi(scale_p eq(point_p, .))` on each piece's placement.
+/// Draw Phi once they are all fixed, then, for several claims, `rho`: claim `j` joins as `rho^j` times itself, its
+/// slices and its pieces' scales. Phi is not `E`-linear, so `rho` scales inside it. Take the target `T = sum_i x^i
+/// Phi(s_i)` against the MLE-friendly weight `W = sum_p Phi(scale_p eq(point_p, .))` on each piece's placement.
 ///
-/// One grind covers the map's challenges and the stacked opening's batching challenge, drawn next.
-pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Result<Vec<RingStackClaim>, VerifierError> {
+/// One grind covers the map's challenges, `rho` and the stacked opening's batching challenge, drawn next.
+pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Result<RingStackClaim, VerifierError> {
     transcript.grind_check(BATCH_GRINDING_BITS)?;
     let challenges = transcript.samples(2 * RING_MAP_WIDTH);
     let (f, g) = challenges.split_at(RING_MAP_WIDTH);
-    let coefficients = ring_coefficients(f, g);
-    Ok(claims
-        .into_iter()
-        .map(|claim| {
-            let target = ring_target(&claim.slices, f, g);
-            let mut groups: Vec<PointGroup> = Vec::new();
-            let mut points: Vec<Vec<E>> = Vec::new();
-            for piece in claim.pieces {
-                let scale = frobenius(piece.scale);
-                match points.iter().position(|p| *p == piece.point) {
-                    Some(g) => groups[g].pieces.push((piece.placement, scale)),
-                    None => {
-                        groups.push(PointGroup {
-                            point: piece.point.iter().map(|&r| frobenius(r)).collect(),
-                            pieces: vec![(piece.placement, scale)],
-                        });
-                        points.push(piece.point);
-                    }
+    let rho = if claims.len() > 1 { transcript.sample() } else { ONE };
+    let mut slices = vec![ZERO; K_BITS];
+    let mut groups: Vec<PointGroup> = Vec::new();
+    let mut points: Vec<Vec<E>> = Vec::new();
+    let mut rho_j = ONE;
+    for claim in claims {
+        for (sum, &s) in slices.iter_mut().zip(&claim.slices) {
+            *sum += rho_j * s;
+        }
+        for piece in claim.pieces {
+            let scale = frobenius(rho_j * piece.scale);
+            match points.iter().position(|p| *p == piece.point) {
+                Some(g) => groups[g].pieces.push((piece.placement, scale)),
+                None => {
+                    groups.push(PointGroup {
+                        point: piece.point.iter().map(|&r| frobenius(r)).collect(),
+                        pieces: vec![(piece.placement, scale)],
+                    });
+                    points.push(piece.point);
                 }
             }
-            let coefficients = coefficients.clone();
-            let weight = move |x: &[E]| ring_weight(&groups, x, &coefficients);
-            (Box::new(weight) as Box<dyn Fn(&[E]) -> E>, target)
-        })
-        .collect())
+        }
+        rho_j *= rho;
+    }
+    let target = ring_target(&slices, f, g);
+    let coefficients = ring_coefficients(f, g);
+    let weight = move |x: &[E]| ring_weight(&groups, x, &coefficients);
+    Ok((Box::new(weight), target))
 }
 
 #[cfg(test)]

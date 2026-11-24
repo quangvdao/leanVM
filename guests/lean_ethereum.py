@@ -2979,10 +2979,10 @@ def slot_point(tpt, point, h5_g, lane_g, w: Const):
     return 0
 
 
-def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, lam, gm1b, gm2b, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z):
+def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, c_link, lam, gm1b, gm2b, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z):
     # Every stack claim's weight at the opening point, batched by the powers of lam in
-    # the native order: the Keccak inputs' ring claim, the pointer columns' ring claim,
-    # the memory term, the sent columns, the public input's two, the Keccak outputs,
+    # the native order: the ring claim (the Keccak inputs', then the pointer columns' as
+    # rho times theirs, on the map c_link), the memory term, the sent columns, the public input's two, the Keccak outputs,
     # the OOD sample. A block's claim at row point p is eq(p[..piece], x[..piece]), its
     # next v coordinates against the lowest lane ones, and its selector.
     rchi = HeapBuf((MAX_PTR_WIDTH + 1) * BASE_FIELD_BITS)
@@ -3019,7 +3019,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     # The pointer columns' ring claim, column q scaled by eq(q_point, q). A table's
     # columns on as many lanes as its first share that column's row, Frobenius being
     # additive; any other column takes its own.
-    ring_rows(rchi, chi, point1, c_table, g_n)
+    ring_rows(rchi, chi, point1, c_link, g_n)
     # A q_keccak slot's bits, for the sent columns and the pointer columns on slots.
     eq_prefix_chain(chain_chi, 1, chi, point1, g_n)
     done = match(log(v2), range(0, 6), lambda w: slot_point(tpt, point, h5_g, lane_g, w))
@@ -3060,7 +3060,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
             scl = eq_q * GEN ** (EQ_Q_AT + PTR_START[t])
             msk = pmask * GEN ** PTR_START[t]
             w_link = w_link + ring_cols(trow, scl, msk, const(PTR_START[t + 1] - PTR_START[t]))
-    w_total = w_total + lam * w_link
+    w_total = w_total + w_link
 
     # The memory term at r[..log_mem], on both limbs.
     eq_prefix_chain(chain_r, 1, r_pt, point1, g_log_mem)
@@ -3074,7 +3074,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     a_m1 = r_pt * p_m1
     assert log(v_m1) < 6
     er_m1 = match(log(v_m1), range(0, 6), lambda v: eq_run(a_m1, lane1, v))
-    lam_pow = lam * lam
+    lam_pow = lam
     w_mem = gm1b * chain_r[p_m0] * er_m0 * sel_v[GEN ** 0] + gm2b * chain_r[p_m1] * er_m1 * sel_v[GEN ** 1]
     w_total = w_total + lam_pow * w_mem
 
@@ -3423,7 +3423,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     sp = fs_cap(fs0, fs1, fs2, fs3, fs4)
 
     # ---- stacked opening: ring switch, then the claims' batch ----
-    # One grind covers the map's challenges and the batching challenge lam, drawn next.
+    # One grind covers the map's challenges, rho and the batching challenge lam, drawn next.
     rate = StackBuf(8)
     ch = StackBuf(2 * RING_MAP_WIDTH)  # f_0 .. f_7, then g_0 .. g_7
     sp, map_first, cursor = fs_grind_squeeze(sp, rate, 0, cursor, tabs, BATCH_GRIND_BITS)
@@ -3443,11 +3443,23 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             if const(p + 1 != RING_MAP_WIDTH):
                 for t in unroll(0, RING_MAP_WIDTH):
                     power = power * power
-    target_keccak = ring_switch_target(kslices, map_challenges)
-    target_link = ring_switch_target(sent * GEN ** LINK_N_SENT, map_challenges)
+    # The two ring claims as one, the pointer columns' as rho times theirs: rho scales
+    # inside the map, so their slices take it, and their map is v -> Phi(rho v), the
+    # Frobenius sum with c_k rho^(2^k).
+    sp, rho = squeeze(sp, rate, 0)
+    c_link = HeapBuf(BASE_FIELD_BITS)
+    rho_k = rho
+    for k in unroll(0, BASE_FIELD_BITS):
+        c_link[GEN ** k] = c_table[GEN ** k] * rho_k
+        if const(k + 1 != BASE_FIELD_BITS):
+            rho_k = rho_k * rho_k
+    merged = HeapBuf(BASE_FIELD_BITS)
+    link_slices = sent * GEN ** LINK_N_SENT
+    for i in unroll(0, BASE_FIELD_BITS):
+        merged[GEN ** i] = kslices[GEN ** i] + rho * link_slices[GEN ** i]
     sp, lam = squeeze(sp, rate, 0)
-    target = target_keccak + lam * target_link
-    lam_pow = lam * lam
+    target = ring_switch_target(merged, map_challenges)
+    lam_pow = lam
     target = target + lam_pow * m1
     for j in unroll(0, LINK_N_SENT):
         if const(SENT_TARGET[j] != LINK_NO_POS):
@@ -3465,7 +3477,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # consumed prefix, whose every word is transcript-bound; the unused suffix
     # is outside the recursively verified proof and intentionally unconstrained.
 
-    check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, lam, below_mem, Y_TOWER * below_mem, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z)
+    check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv, chi, g_n, r_pt, g_log_mem, rm, z_vals, eq_q, c_table, c_link, lam, below_mem, Y_TOWER * below_mem, point, point1, inner_total, yr_at_tail, sumcheck_target, ood_z)
 
     # ---- export this sub-proof's claim: the split program at r[..kbc] ----
     for k in unroll(0, BYTECODE_LOG):

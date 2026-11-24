@@ -263,13 +263,13 @@ pub fn verify_keccak_batch(
         point,
         scale: ONE,
     };
-    let mut claims: Vec<StackClaim> = ring_switch(
+    let mut claims: Vec<StackClaim> = vec![ring_switch(
         vec![RingClaim {
             pieces: vec![piece],
             slices,
         }],
         &mut transcript,
-    )?;
+    )?];
     if let Some((point, word)) = openings.outputs {
         claims.push((Box::new(move |x| eq_eval(&point, x)), word));
     }
@@ -357,8 +357,8 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 6] Ring switching: the Keccak reduction's input slices on q_keccak, then the pointer columns' slices. Both lead
-    // the batch, then the memory term and the point claims.
+    // 6] Ring switching: the Keccak reduction's input slices on q_keccak, then the pointer columns' slices, as one
+    // claim that leads the batch, then the memory term and the point claims.
     // A striped q_keccak is its pieces, each at the low end of the point, as a split pointer column is.
     let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
     let lane = layout.stack_log - INITIAL_FOLDING_FACTOR;
@@ -375,7 +375,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
             .collect(),
         slices,
     };
-    let mut stack_claims: Vec<StackClaim<'static>> = ring_switch(vec![keccak_ring, link.ring], &mut transcript)?;
+    let mut stack_claims: Vec<StackClaim<'static>> = vec![ring_switch(vec![keccak_ring, link.ring], &mut transcript)?];
     let (memory_point, memory_scales, memory_value) = link.memory;
     let memory_points: Vec<(Vec<E>, E)> = [MEMORY_0, MEMORY_1]
         .into_iter()
