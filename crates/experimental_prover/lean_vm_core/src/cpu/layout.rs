@@ -185,11 +185,26 @@ impl Witness {
         self.layout.placements[i].view(&self.q, self.layout.shape.mu - crate::pcs::LOG_BATCH)
     }
 
+    /// Where a column's rows sit in the stack: its own block, or its slot's rows of `q_keccak`.
+    #[cfg(test)]
+    fn rows_of(&self, i: usize) -> witness::Placement {
+        let lane = self.layout.shape.mu - crate::pcs::LOG_BATCH;
+        match keccak_value(i) {
+            Some(KeccakLane::Slot(slot)) => {
+                let q = self.layout.placements[QKECCAK];
+                let n = q.n_vars - crate::keccak::SLOT_LOG;
+                q.rows(slot << n, n, lane)
+            }
+            _ => self.layout.placements[i],
+        }
+    }
+
     /// A committed column's rows, to change: the change reaches the stack at [`Witness::write_edits`].
     #[cfg(test)]
     pub(crate) fn column_mut(&mut self, i: usize) -> &mut [F64] {
         if !self.edits.iter().any(|(c, _)| *c == i) {
-            let rows = self.column(i).to_vec();
+            let lane = self.layout.shape.mu - crate::pcs::LOG_BATCH;
+            let rows = self.rows_of(i).view(&self.q, lane).to_vec();
             self.edits.push((i, rows));
         }
         let (_, rows) = self.edits.iter_mut().find(|(c, _)| *c == i).expect("just added");
@@ -202,7 +217,7 @@ impl Witness {
         let lane = self.layout.shape.mu - crate::pcs::LOG_BATCH;
         let stream = primitives::stream::Stream::new();
         for (i, rows) in std::mem::take(&mut self.edits) {
-            let window = self.layout.placements[i].view_mut(&mut self.q, lane);
+            let window = self.rows_of(i).view_mut(&mut self.q, lane);
             // SAFETY: the rows are the column's, and nothing else writes the stack meanwhile.
             unsafe { window.write(&stream, 0, &rows) };
         }

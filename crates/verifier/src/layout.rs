@@ -135,24 +135,42 @@ pub struct StateLink {
     pub next: [Form; 2],
 }
 
-/// A row's read of the program: its pointer, its `pc`, its opcode and its operand slots.
+/// A row's read of the program: its pointer, its `pc`, its opcode, and each operand equation `Σ_{s ∈ slots} BC_s = form`
+/// it checks against its instruction, weighed by the first slot's challenge. A slot no equation names is read only
+/// through the accesses' [`Read`]s.
 #[derive(Clone, Debug)]
 pub struct BytecodeLink {
     pub pointer: usize,
     pub pc: usize,
     pub opcode: usize,
-    pub operands: Vec<Form>,
+    pub operands: Vec<(Vec<usize>, Form)>,
 }
 
-/// A row's memory access: its pointer and how far past the pointer's cell it reads, the column gating it if any,
-/// the address and the word's two limbs.
+/// A term of an access's value that the row reads where one of its pointers points, rather than from its columns.
+#[derive(Clone, Debug)]
+pub enum Read {
+    /// `scale·word(σ)`, the word in the cell the row's pointer column `pointer` names; `scale` has degree at most one.
+    Word { pointer: usize, scale: Form },
+    /// `scale·BC_slot(σ_bc)`, a slot of the row's instruction.
+    Slot { slot: usize, scale: E },
+    /// `scale·fp·BC_slot(σ_bc)`.
+    Frame { slot: usize, scale: E },
+    /// `scale·pc·BC_slot(σ_bc)`, where `pc = g^{σ_bc}`.
+    Pc { slot: usize, scale: E },
+}
+
+/// A row's memory access: its pointer and how far past the pointer's cell it reads, the column gating it if any, the
+/// address, and the word `lo + y·hi`. The address is `address + g^e·fp·BC_slot(σ_bc)` for `frame = Some((slot, e))`,
+/// and the word is `value + Σ reads`.
 #[derive(Clone, Debug)]
 pub struct Access {
     pub pointer: usize,
     pub shift: usize,
     pub gate: Option<usize>,
     pub address: Form,
-    pub values: [Form; 2],
+    pub frame: Option<(usize, u64)>,
+    pub value: Form,
+    pub reads: Vec<Read>,
 }
 
 /// Everything a table links, over its own local column indices.
@@ -162,6 +180,9 @@ pub struct Links {
     bytecode: Option<BytecodeLink>,
     pub memory: Vec<Access>,
 }
+
+/// `y`, the generator of `E` over `K`: a word is `lo + y·hi`.
+pub const Y: E = E::new(0, 1);
 
 impl Links {
     fn state_derived(&mut self, cycle: usize, pc: usize, fp: usize, npc: Form, nfp: Form) {
@@ -177,7 +198,7 @@ impl Links {
         self.state_derived(cycle, pc, fp, col(pc, 1), col(fp, 0));
     }
 
-    fn bytecode(&mut self, pc: usize, pointer: usize, opcode: usize, operands: Vec<Form>) {
+    fn bytecode(&mut self, pc: usize, pointer: usize, opcode: usize, operands: Vec<(Vec<usize>, Form)>) {
         self.bytecode = Some(BytecodeLink {
             pointer,
             pc,
@@ -186,26 +207,34 @@ impl Links {
         });
     }
 
-    fn memory(&mut self, address: Form, pointer: usize, values: &[Form; 2]) {
-        self.memory_shifted(address, pointer, 0, None, values);
-    }
-
     /// The access to the cell `shift` past the one `pointer` names, when the column `gate` is 1 if there is one; at
-    /// 0 the access takes part in no link.
-    fn memory_shifted(&mut self, address: Form, pointer: usize, shift: usize, gate: Option<usize>, values: &[Form; 2]) {
+    /// 0 the access takes part in no link. A gated access reads nothing: its coefficients already hold the gate.
+    #[allow(clippy::too_many_arguments)]
+    fn access(
+        &mut self,
+        pointer: usize,
+        shift: usize,
+        gate: Option<usize>,
+        address: Form,
+        frame: Option<(usize, u64)>,
+        value: Form,
+        reads: Vec<Read>,
+    ) {
+        assert!(gate.is_none() || (frame.is_none() && reads.is_empty()));
         self.memory.push(Access {
             pointer,
             shift,
             gate,
             address,
-            values: values.clone(),
+            frame,
+            value,
+            reads,
         });
     }
 
-    /// The cell's limbs are the named columns, a missing high one zero.
-    fn memory_cols(&mut self, address: Form, pointer: usize, columns: &[usize]) {
-        let values = std::array::from_fn(|limb| columns.get(limb).map_or(constant(ZERO), |&column| col(column, 0)));
-        self.memory(address, pointer, &values);
+    /// An ungated access to the cell at `fp·BC_slot(σ_bc)`.
+    fn framed(&mut self, pointer: usize, slot: usize, value: Form, reads: Vec<Read>) {
+        self.access(pointer, 0, None, Form::default(), Some((slot, 0)), value, reads);
     }
 
     pub fn state(&self) -> &StateLink {
@@ -253,72 +282,89 @@ impl Table {
     }
 }
 
+fn word(pointer: usize) -> Read {
+    Read::Word {
+        pointer,
+        scale: constant(ONE),
+    }
+}
+
+// The operands of XOR, MUL, SET, DEREF and JUMP sit in bytecode slots 4, 5, 6, 7 and 8, in the order the ISA lists them.
+
 fn links_arith(opcode: usize, multiply: bool) -> Links {
-    let [pc, fp, o_a, o_b, o_c, ix_a, ix_b, ix_c, ix_bc, ix_cycle] = cols(
-        ARITH_COLUMNS,
-        [
-            "pc", "fp", "o_a", "o_b", "o_c", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle",
-        ],
-    );
-    let va = cols(ARITH_COLUMNS, ["va_0", "va_1"]);
-    let vb = cols(ARITH_COLUMNS, ["vb_0", "vb_1"]);
+    let columns = if multiply { MUL_COLUMNS } else { XOR_COLUMNS };
+    let [pc, fp, ix_a, ix_b, ix_c, ix_bc, ix_cycle] =
+        cols(columns, ["pc", "fp", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle"]);
     let mut links = Links::default();
     links.state_step(ix_cycle, pc, fp);
-    let operands = vec![col(o_a, 0), col(o_b, 0), col(o_c, 0), constant(ZERO), constant(ZERO)];
-    links.bytecode(pc, ix_bc, opcode, operands);
-    links.memory_cols(prod(fp, o_a, 0), ix_a, &va);
-    links.memory_cols(prod(fp, o_b, 0), ix_b, &vb);
-    // Each product lane's terms `g^e va_j vb_k`, as (j, k, e): y^2 = x y + 1, and x = g.
-    const TOWER_LANES: [&[(usize, usize, u64)]; 2] = [&[(0, 0, 0), (1, 1, 0)], &[(0, 1, 0), (1, 0, 0), (1, 1, 1)]];
-    let result = if multiply {
-        TOWER_LANES.map(|lane| Form::sum(lane.iter().map(|&(j, k, e)| prod(va[j], vb[k], e))))
+    links.bytecode(pc, ix_bc, opcode, vec![]);
+    if multiply {
+        // `a` is committed, `b` is read where its pointer points, and `c = a·b` is linear in that read.
+        let [a0, a1] = cols(columns, ["a_0", "a_1"]);
+        let a = col(a0, 0) + Form::term(vec![a1], Y);
+        links.framed(ix_a, 4, a.clone(), vec![]);
+        links.framed(ix_b, 5, Form::default(), vec![word(ix_b)]);
+        links.framed(
+            ix_c,
+            6,
+            Form::default(),
+            vec![Read::Word {
+                pointer: ix_b,
+                scale: a,
+            }],
+        );
     } else {
-        std::array::from_fn(|i| col(va[i], 0) + col(vb[i], 0))
-    };
-    links.memory(prod(fp, o_c, 0), ix_c, &result);
+        links.framed(ix_a, 4, Form::default(), vec![word(ix_a)]);
+        links.framed(ix_b, 5, Form::default(), vec![word(ix_b)]);
+        links.framed(ix_c, 6, Form::default(), vec![word(ix_a), word(ix_b)]);
+    }
     links
 }
 
 fn links_set() -> Links {
-    let [pc, fp, o, ix, ix_bc, ix_cycle] = cols(SET_COLUMNS, ["pc", "fp", "o", "ix", "ix_bc", "ix_cycle"]);
-    let k = cols(SET_COLUMNS, ["k_0", "k_1"]);
+    let [pc, fp, ix, ix_bc, ix_cycle] = cols(SET_COLUMNS, ["pc", "fp", "ix", "ix_bc", "ix_cycle"]);
     let mut links = Links::default();
     links.state_step(ix_cycle, pc, fp);
-    let operands = vec![col(o, 0), col(k[0], 0), col(k[1], 0), constant(ZERO), constant(ZERO)];
-    links.bytecode(pc, ix_bc, OP_SET, operands);
-    links.memory_cols(prod(fp, o, 0), ix, &k);
+    links.bytecode(pc, ix_bc, OP_SET, vec![]);
+    // The stored immediate's two limbs are slots 5 and 6 of the instruction.
+    let immediate = vec![Read::Slot { slot: 5, scale: ONE }, Read::Slot { slot: 6, scale: Y }];
+    links.framed(ix, 4, Form::default(), immediate);
     links
 }
 
 fn links_deref() -> Links {
-    let [pc, fp, o1, o2, o3, f_pc, f_fp, ptr] =
-        cols(DEREF_COLUMNS, ["pc", "fp", "o1", "o2", "o3", "f_pc", "f_fp", "ptr"]);
+    let [pc, fp, ptr, o2, s] = cols(DEREF_COLUMNS, ["pc", "fp", "ptr", "o2", "s"]);
     let [ix_ptr, ix_target, ix_local, ix_bc, ix_cycle] =
         cols(DEREF_COLUMNS, ["ix_ptr", "ix_target", "ix_local", "ix_bc", "ix_cycle"]);
-    let v3 = cols(DEREF_COLUMNS, ["v3_0", "v3_1"]);
-
-    let gated = |lane: usize| [col(lane, 0), prod(f_pc, lane, 0), prod(f_fp, lane, 0)];
-
-    // v2 = (1 + f_pc + f_fp)*v3 + f_pc*(g^2*pc) + f_fp*fp, lane-wise: only the low lane takes the two K-valued sources.
-    let store = [
-        Form::sum(gated(v3[0]).into_iter().chain([prod(f_pc, pc, 2), prod(f_fp, fp, 0)])),
-        Form::sum(gated(v3[1])),
-    ];
     let mut links = Links::default();
     links.state_step(ix_cycle, pc, fp);
-    let operands = vec![col(o1, 0), col(o2, 0), col(o3, 0), col(f_pc, 0), col(f_fp, 0)];
-    links.bytecode(pc, ix_bc, OP_DEREF, operands);
-    links.memory_cols(prod(fp, o1, 0), ix_ptr, &[ptr]);
-    links.memory(prod(ptr, o2, 0), ix_target, &store);
-    links.memory_cols(prod(fp, o3, 0), ix_local, &v3);
+    // `s = f_pc + f_fp`, which is 1 exactly when a flag is set.
+    links.bytecode(
+        pc,
+        ix_bc,
+        OP_DEREF,
+        vec![(vec![5], col(o2, 0)), (vec![7, 8], col(s, 0))],
+    );
+    links.framed(ix_ptr, 4, col(ptr, 0), vec![]);
+    // v2 = (1 + s)*v3 + f_pc*(g^2*pc) + f_fp*fp: only the low lane takes the two K-valued sources.
+    let store = vec![
+        Read::Word {
+            pointer: ix_local,
+            scale: constant(ONE) + col(s, 0),
+        },
+        Read::Pc {
+            slot: 7,
+            scale: gpow(2),
+        },
+        Read::Frame { slot: 8, scale: ONE },
+    ];
+    links.access(ix_target, 0, None, prod(ptr, o2, 0), None, Form::default(), store);
+    links.framed(ix_local, 6, Form::default(), vec![word(ix_local)]);
     links
 }
 
 fn links_jump() -> Links {
-    let [pc, fp, o_c, o_d, o_f, cond, dest, frame, b] = cols(
-        JUMP_COLUMNS,
-        ["pc", "fp", "o_c", "o_d", "o_f", "v_cond", "v_pc", "v_fp", "b"],
-    );
+    let [pc, fp, cond, dest, frame, b] = cols(JUMP_COLUMNS, ["pc", "fp", "v_cond", "v_pc", "v_fp", "b"]);
     let [ix_c, ix_d, ix_f, ix_bc, ix_cycle] = cols(JUMP_COLUMNS, ["ix_c", "ix_d", "ix_f", "ix_bc", "ix_cycle"]);
     let mut links = Links::default();
     // next_pc = b*dest + (b+1)*g*pc, next_fp = b*frame + (b+1)*fp, both derived.
@@ -329,11 +375,11 @@ fn links_jump() -> Links {
         prod(b, dest, 0) + prod(b, pc, 1) + col(pc, 1),
         prod(b, frame, 0) + prod(b, fp, 0) + col(fp, 0),
     );
-    let operands = vec![col(o_c, 0), col(o_d, 0), col(o_f, 0), constant(ZERO), constant(ZERO)];
-    links.bytecode(pc, ix_bc, OP_JUMP, operands);
-    links.memory_cols(prod(fp, o_c, 0), ix_c, &[cond]);
-    links.memory_cols(prod(fp, o_d, 0), ix_d, &[dest]);
-    links.memory_cols(prod(fp, o_f, 0), ix_f, &[frame]);
+    links.bytecode(pc, ix_bc, OP_JUMP, vec![]);
+    // The three words are K-valued: committed as one lane, the high one zero.
+    links.framed(ix_c, 4, col(cond, 0), vec![]);
+    links.framed(ix_d, 5, col(dest, 0), vec![]);
+    links.framed(ix_f, 6, col(frame, 0), vec![]);
     links
 }
 
@@ -378,43 +424,54 @@ fn layout_limb(even: Option<usize>, odd: Option<usize>, flag: usize, missing: Op
     )
 }
 
+/// The bytecode slot of KECCAK's offset operand `i`, in the order `m0..m3, tail, b8, cap, out`.
+pub const fn keccak_offset_slot(i: usize) -> usize {
+    4 + i
+}
+
 fn links_keccak() -> Links {
-    let [pc, fp, free] = cols(KECCAK_HEAD, ["pc", "fp", "free"]);
-    let o_m = cols(KECCAK_HEAD, ["o_m0", "o_m1", "o_m2", "o_m3"]);
-    let [o_tail, o_b8, o_cap, o_out] = cols(KECCAK_HEAD, ["o_tail", "o_b8", "o_cap", "o_out"]);
+    let [pc, fp, free, o_out] = cols(KECCAK_HEAD, ["pc", "fp", "free", "o_out"]);
     let [in_odd, out_odd, out_two, out_all] = cols(KECCAK_HEAD, ["odd_in", "odd_out", "out_two", "out_all"]);
     let mut links = Links::default();
     links.state_step(KECCAK_CYCLE, pc, fp);
-    let operands = o_m
+    // The seven read offsets ride the instruction alone; `out` and the four flags are committed.
+    let operands = [o_out, in_odd, out_odd, out_two, out_all]
         .into_iter()
-        .chain([o_tail, o_b8, o_cap, o_out, in_odd, out_odd, out_two, out_all]);
-    links.bytecode(pc, KECCAK_IX_BC, OP_KECCAK, operands.map(|i| col(i, 0)).collect());
+        .enumerate()
+        .map(|(i, c)| (vec![keccak_offset_slot(7) + i], col(c, 0)))
+        .collect();
+    links.bytecode(pc, KECCAK_IX_BC, OP_KECCAK, operands);
     // The thirteen cells read (four addressed ones, the tail run, b8, the cap run), then the thirteen written, each
     // holding its lanes in the layout its flag names: a read cell's free lane is the column `free`, a written one's zero.
     // Output cell 0 is always written, cell 1 when `out_two` is 1, and cells 2..13 when `out_all` is 1.
-    // A cell's operand, as `KECCAK_HEAD` orders the eight, and its step past the operand's cell, whose pointer is
-    // `KECCAK_IX + operand`.
+    // A cell's operand, as `keccak_offset_slot` orders the eight, and its step past the operand's cell, whose pointer
+    // is `KECCAK_IX + operand`.
     let part = |cell: usize| match cell {
         0..4 => (cell, 0),
         4..8 => (4, cell - 4),
         8 => (5, 0),
         _ => (6, cell - 9),
     };
-    let offsets = [o_m[0], o_m[1], o_m[2], o_m[3], o_tail, o_b8, o_cap, o_out];
     let (even, odd) = (keccak_cell_lanes(false), keccak_cell_lanes(true));
     for (side, lanes, flag, missing) in [(0, KECCAK_IN, in_odd, Some(free)), (1, KECCAK_OUT, out_odd, None)] {
         let lane = |lane: Option<usize>| lane.map(|lane| lanes + lane);
         for cell in 0..KECCAK_CELLS {
             let limb = |e: Option<usize>, o: Option<usize>| layout_limb(lane(e), lane(o), flag, missing);
-            let values = [limb(even[cell].0, odd[cell].0), limb(even[cell].1, odd[cell].1)];
-            let ((operand, step), gate) = match (side, cell) {
-                (0, _) => (part(cell), None),
-                (_, 0) => ((7, 0), None),
-                (_, 1) => ((7, 1), Some(out_two)),
-                _ => ((7, cell), Some(out_all)),
-            };
-            let address = prod(fp, offsets[operand], step as u64);
-            links.memory_shifted(address, KECCAK_IX + operand, step, gate, &values);
+            let mut value = limb(even[cell].0, odd[cell].0);
+            value.add_scaled(&limb(even[cell].1, odd[cell].1), Y);
+            if side == 0 {
+                let (operand, step) = part(cell);
+                let frame = Some((keccak_offset_slot(operand), step as u64));
+                links.access(KECCAK_IX + operand, step, None, Form::default(), frame, value, vec![]);
+            } else {
+                let gate = match cell {
+                    0 => None,
+                    1 => Some(out_two),
+                    _ => Some(out_all),
+                };
+                let address = prod(fp, o_out, cell as u64);
+                links.access(KECCAK_IX + 7, cell, gate, address, None, value, vec![]);
+            }
         }
     }
     links
@@ -428,18 +485,17 @@ pub const OP_JUMP: usize = 4;
 pub const OP_KECCAK: usize = 5;
 pub const N_TABLES: usize = 6;
 
+const XOR_COLUMNS: &[&str] = &["pc", "fp", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle"];
+const MUL_COLUMNS: &[&str] = &["pc", "fp", "a_0", "a_1", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle"];
+const SET_COLUMNS: &[&str] = &["pc", "fp", "ix", "ix_bc", "ix_cycle"];
 #[rustfmt::skip]
-const ARITH_COLUMNS: &[&str] = &["pc", "fp", "o_a", "o_b", "o_c", "va_0", "va_1", "vb_0", "vb_1", "ix_a", "ix_b", "ix_c", "ix_bc", "ix_cycle"];
-const SET_COLUMNS: &[&str] = &["pc", "fp", "o", "k_0", "k_1", "ix", "ix_bc", "ix_cycle"];
+const DEREF_COLUMNS: &[&str] = &["pc", "fp", "ptr", "o2", "s", "ix_ptr", "ix_target", "ix_local", "ix_bc", "ix_cycle"];
 #[rustfmt::skip]
-const DEREF_COLUMNS: &[&str] = &["pc", "fp", "o1", "o2", "o3", "f_pc", "f_fp", "ptr", "v3_0", "v3_1", "ix_ptr", "ix_target", "ix_local", "ix_bc", "ix_cycle"];
-#[rustfmt::skip]
-const JUMP_COLUMNS: &[&str] = &["pc", "fp", "o_c", "o_d", "o_f", "v_cond", "v_pc", "v_fp", "ix_c", "ix_d", "ix_f", "ix_bc", "w", "b", "ix_cycle"];
+const JUMP_COLUMNS: &[&str] = &["pc", "fp", "v_cond", "v_pc", "v_fp", "w", "b", "ix_c", "ix_d", "ix_f", "ix_bc", "ix_cycle"];
 // KECCAK's columns: these, then the input lanes `in_l`, the output lanes `out_l`, a pointer `ix_c` for each cell
 // read then each written, `ix_bc` and `ix_cycle`. The fifty value lanes are not committed in the table: an input lane is one of
 // q_keccak's slots, and the output lanes' claims are the Keccak reduction's claim on the output.
-#[rustfmt::skip]
-const KECCAK_HEAD: &[&str] = &["pc", "fp", "o_m0", "o_m1", "o_m2", "o_m3", "o_tail", "o_b8", "o_cap", "o_out", "odd_in", "odd_out", "out_two", "out_all", "free"];
+const KECCAK_HEAD: &[&str] = &["pc", "fp", "o_out", "odd_in", "odd_out", "out_two", "out_all", "free"];
 const KECCAK_CELLS: usize = 13; // a sponge state, read then written
 pub const KECCAK_IN: usize = KECCAK_HEAD.len();
 pub const KECCAK_OUT: usize = KECCAK_IN + STATE_LANES;
@@ -510,8 +566,8 @@ pub fn tables() -> Vec<Table> {
         *padding = E::new(lane, 0);
     }
     vec![
-        table(OP_XOR, named(ARITH_COLUMNS), links_arith(OP_XOR, false), |_| vec![]),
-        table(OP_MUL, named(ARITH_COLUMNS), links_arith(OP_MUL, true), |_| vec![]),
+        table(OP_XOR, named(XOR_COLUMNS), links_arith(OP_XOR, false), |_| vec![]),
+        table(OP_MUL, named(MUL_COLUMNS), links_arith(OP_MUL, true), |_| vec![]),
         table(OP_SET, named(SET_COLUMNS), links_set(), |_| vec![]),
         table(OP_DEREF, named(DEREF_COLUMNS), links_deref(), |_| vec![]),
         table(OP_JUMP, named(JUMP_COLUMNS), links_jump(), jump_constraints),
@@ -520,8 +576,8 @@ pub fn tables() -> Vec<Table> {
 }
 
 pub const TABLE_WIDTHS: [usize; N_TABLES] = [
-    ARITH_COLUMNS.len(),
-    ARITH_COLUMNS.len(),
+    XOR_COLUMNS.len(),
+    MUL_COLUMNS.len(),
     SET_COLUMNS.len(),
     DEREF_COLUMNS.len(),
     JUMP_COLUMNS.len(),

@@ -358,20 +358,14 @@ fn assert_row(w: &mut Witness, pc: usize) -> usize {
         .expect("an XOR row runs the assert")
 }
 
-/// An assert reads operand `a` from frame cell 9 rather than 1: its operand column says 9 and its pointer names that
-/// cell. Cell 9 is the next frame's cell 1, written earlier in the iteration with the same `g^8`, so the row agrees
-/// with memory and its state; only its read of the program is wrong.
+/// An assert's pointer for operand `a` names frame cell 9 rather than 1. Cell 9 is the next frame's cell 1, written
+/// earlier in the iteration with the same `g^8`, so the row agrees with memory; only the address the program gives
+/// for operand `a`, `fp·g^1`, is wrong.
 #[test]
 fn a_wrong_instruction_is_rejected() {
     rejected(|w| {
         let (chunks, links) = (chunks(w), plan(XOR).links);
         let row = assert_row(w, ASSERT_PCS.start);
-        let o_a = match links.bytecode.operands[0] {
-            Coord::Col(c) => c,
-            _ => panic!("XOR's operand a is a column"),
-        };
-        assert_eq!(column(w, XOR, o_a)[row], g_pow(1));
-        column(w, XOR, o_a)[row] = g_pow(9);
         let word = &mut column(w, XOR, links.memory[0].pointer)[row];
         let cell = chunks.decode(word.0).expect("one-hot");
         let memory = execute(&program(), &[], PI).expect("the program runs").mem;
