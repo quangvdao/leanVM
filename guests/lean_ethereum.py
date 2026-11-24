@@ -259,6 +259,17 @@ COL_KAPPA_SRC = COL_KAPPA_SRC_PLACEHOLDER
 COL_KAPPA_ADJ = COL_KAPPA_ADJ_PLACEHOLDER
 N_COL_GROUPS = N_COL_GROUPS_PLACEHOLDER
 COL_GROUP_START = COL_GROUP_START_PLACEHOLDER  # a column group's first column, then N_COMMITTED_COLS
+# The stack's blocks (verifier::layout::stack_blocks): each one's kappa source and adjustment, and whether the
+# opening reads it through ring weights. A block group is a run of blocks sharing all three.
+N_STK_BLOCKS = N_STK_BLOCKS_PLACEHOLDER
+STK_SRC = STK_SRC_PLACEHOLDER
+STK_ADJ = STK_ADJ_PLACEHOLDER
+STK_RING = STK_RING_PLACEHOLDER
+N_STK_GROUPS = N_STK_GROUPS_PLACEHOLDER
+STK_GROUP_START = STK_GROUP_START_PLACEHOLDER  # a block group's first block, then N_STK_BLOCKS
+STK_STRIDE = STK_STRIDE_PLACEHOLDER  # above twice the block count: a rank key's size step
+STK_KEY_BOUND = SIZE_BITS * STK_STRIDE  # above any step between two rank keys
+STK_MIN_LOG = STK_MIN_LOG_PLACEHOLDER
 PCS_MIN_MU = PCS_MIN_MU_PLACEHOLDER
 # Global maxima; StackBuf frame sizes are parse-time, so they must be baked.
 LIG_MAX_LEVELS = LIG_MAX_LEVELS_PLACEHOLDER
@@ -316,6 +327,7 @@ SIDE_TAB_AT = RANK_KEYS_AT + SIZE_BITS
 WIN_TAB_AT = SIDE_TAB_AT + N_BLOCK_GROUPS  # a bit window's pattern by its g-power: [g^n] = n
 WIN_TAB_BITS = 11
 WIN_TAB_LEN = 2 ** WIN_TAB_BITS
+TAKEN_AT = WIN_TAB_AT + WIN_TAB_LEN  # a block's taken log by its kappa: [g^k] = g^max(k, 5)
 LIG_N_LEVELS = LIG_N_LEVELS_PLACEHOLDER
 LIG_YR_LEVEL = LIG_YR_LEVEL_PLACEHOLDER
 LIG_YR_LOG_LEN = LIG_YR_LOG_LEN_PLACEHOLDER
@@ -727,7 +739,7 @@ def exponent_tables():
     # powers of two into field products. It spans SIZE_BITS because
     # `log2_ceil_in_the_exponent` bounds its result there and indexes it at g^L.
     # Past them, the opening selector's nibble shares: g^(u 2^(4j)) at SIZE_BITS + 16j + u.
-    g_squares = HeapBuf(WIN_TAB_AT + WIN_TAB_LEN)
+    g_squares = HeapBuf(TAKEN_AT + SIZE_BITS)
     sq_run = GEN
     for j in unroll(0, SIZE_BITS):
         g_squares[GEN ** j] = sq_run
@@ -749,6 +761,11 @@ def exponent_tables():
     # Last, a bit window's pattern by its g-power, for `query_window`.
     for n in unroll(0, WIN_TAB_LEN):
         g_squares[GEN ** (WIN_TAB_AT + n)] = const(n)
+    # And a stack block's taken log, at least the widest lane group's.
+    for k in unroll(0, 5):
+        g_squares[GEN ** (TAKEN_AT + k)] = GEN ** 5
+    for k in unroll(5, SIZE_BITS):
+        g_squares[GEN ** (TAKEN_AT + k)] = GEN ** k
     return g_squares
 
 
@@ -3493,6 +3510,175 @@ def certify_placement(kappa_base, g_squares):
             if const(c + 1 != COL_GROUP_START[gi + 1]):
                 off *= step
     return g_total, col_off_g
+
+
+def certify_stack(kappa_base, g_squares):
+    # Certify the binary stripe (multilinear::stack_offsets). Every block takes
+    # 2^max(kappa, 5) words, and the blocks go end to end, sorted by that size down,
+    # ring blocks first among equals, then by index. A block group is consecutive in
+    # that order, so a hinted order of the groups, certified strictly descending in
+    # its rank key, places every block at a running sum `at`. The lanes split into
+    # groups of 2^w lanes, the powers of two in the lane count L, largest first, at
+    # most 32 lanes each. A block smaller than its group is cut into one piece per lane
+    # of the group, at one in-lane offset: its Spot's offset is the group's first word
+    # plus `into / 2^w`, where `into` is `at` less that first word.
+    # Returns the stack's log and lane log, as g-powers, and per block its Spot's
+    # offset, its piece log max(kappa, w_eff) - w_eff and its width w_eff (0 if whole).
+    kb = StackBuf(N_TABLES + 2)
+    for i in unroll(0, N_TABLES + 2):
+        kb[i] = kappa_base[GEN ** i]
+    taken_tab = g_squares * GEN ** TAKEN_AT
+    group_key = HeapBuf(N_STK_GROUPS)
+    group_size = HeapBuf(N_STK_GROUPS)
+    for gi in unroll(0, N_STK_GROUPS):
+        b0 = STK_GROUP_START[gi]
+        kappa_g = kb[STK_SRC[b0]] * GEN ** STK_ADJ[b0]
+        assert log(kappa_g) < SIZE_BITS
+        taken_g = taken_tab[kappa_g]
+        # The key's exponent: taken STK_STRIDE + ring N_STK_BLOCKS - first block.
+        group_key[GEN ** gi] = taken_g ** STK_STRIDE * GEN ** (STK_RING[b0] * N_STK_BLOCKS) * INV_GEN ** b0
+        group_size[GEN ** gi] = g_squares[taken_g] ** (STK_GROUP_START[gi + 1] - b0)
+    group_order = HeapBuf(N_STK_GROUPS)
+    hint_witness(group_order[0:N_STK_GROUPS], "stk_group_order")
+    group_at = HeapBuf(N_STK_GROUPS)
+    g_total = GEN ** 0
+    for rank in unroll(0, N_STK_GROUPS):
+        gi = group_order[GEN ** rank]
+        assert log(gi) < N_STK_GROUPS
+        key = group_key[gi]
+        # A negative step wraps around the order of GEN and cannot pass this check.
+        if rank != 0:
+            assert log(prev_key / key * INV_GEN) < STK_KEY_BOUND
+        group_at[gi] = g_total  # write-once: a repeated group collides
+        g_total *= group_size[gi]
+        prev_key = key
+
+    gmv = log2_ceil_in_the_exponent(g_total, g_squares, STK_MIN_LOG, SIZE_BITS)
+    lane_g = gmv * INV_GEN ** 6
+    # L, the lanes the blocks fill: 0 <= L 2^lane - total < 2^lane.
+    lane_bits = HeapBuf(7)
+    hint_witness(lane_bits[0:7], "stk_lane_bits")
+    g_lanes = GEN ** 0
+    for k in unroll(0, 7):
+        b = lane_bits[GEN ** k]
+        assert b * b == b
+        g_lanes *= 1 + b * (1 + g_squares[lane_g * GEN ** k])
+    assert log(g_lanes / g_total) < log(g_squares[lane_g])
+    # The lane groups: group j < 6 is 2^j lanes, there iff bit j of L is, after the
+    # higher bits' lanes; groups 6 and 7 are the two halves of a full stack.
+    grp_valid = HeapBuf(8)
+    grp_first = HeapBuf(8)  # g^(first lane 2^lane)
+    grp_w = HeapBuf(8)
+    b6 = lane_bits[GEN ** 6]
+    grp_valid[GEN ** 6] = b6
+    grp_first[GEN ** 6] = GEN ** 0
+    grp_w[GEN ** 6] = GEN ** 5
+    grp_valid[GEN ** 7] = b6
+    grp_first[GEN ** 7] = g_squares[lane_g * GEN ** 5]
+    grp_w[GEN ** 7] = GEN ** 5
+    first = 1 + b6 * (1 + g_squares[lane_g * GEN ** 6])
+    for jj in unroll(0, 6):
+        j = 5 - jj
+        b = lane_bits[GEN ** j]
+        grp_valid[GEN ** j] = b
+        grp_first[GEN ** j] = first
+        grp_w[GEN ** j] = GEN ** j
+        first *= 1 + b * (1 + g_squares[lane_g * GEN ** j])
+
+    # Per block: its group j, whether it is whole, whether kappa < w_eff, and g^(into / 2^w_eff).
+    block_hint = HeapBuf(4 * N_STK_BLOCKS)
+    hint_witness(block_hint[0:4 * N_STK_BLOCKS], "stk_block")
+    spot_off = HeapBuf(N_STK_BLOCKS)
+    piece_log = HeapBuf(N_STK_BLOCKS)
+    width = HeapBuf(N_STK_BLOCKS)
+    for gi in unroll(0, N_STK_GROUPS):
+        b0 = STK_GROUP_START[gi]
+        kappa_g = kb[STK_SRC[b0]] * GEN ** STK_ADJ[b0]
+        taken_g = taken_tab[kappa_g]
+        step = g_squares[taken_g]
+        at_g = group_at[GEN ** gi]
+        for b in unroll(b0, STK_GROUP_START[gi + 1]):
+            j = block_hint[GEN ** (4 * b)]
+            whole = block_hint[GEN ** (4 * b + 1)]
+            small = block_hint[GEN ** (4 * b + 2)]
+            off_g = block_hint[GEN ** (4 * b + 3)]
+            assert log(j) < 8
+            assert grp_valid[j] == 1
+            w_g = grp_w[j]
+            first_g = grp_first[j]
+            into_g = at_g / first_g
+            assert log(into_g) < log(g_squares[lane_g * w_g])
+            # Whole iff taken >= w + lane: d = taken - w - lane is >= 0 if whole, else -d - 1 is.
+            assert whole * whole == whole
+            d_g = taken_g / (lane_g * w_g)
+            d_neg = 1 / (d_g * GEN)
+            assert log(d_neg + whole * (d_g + d_neg)) < SIZE_BITS
+            w_eff = w_g + whole * (w_g + 1)
+            # kappa' = max(kappa, w_eff): e = w_eff - kappa, and e - 1 >= 0 if small, else -e >= 0.
+            assert small * small == small
+            e_g = w_eff / kappa_g
+            e_neg = 1 / e_g
+            assert log(e_neg + small * (e_g * INV_GEN + e_neg)) < SIZE_BITS
+            kappa1 = kappa_g + small * (kappa_g + w_eff)
+            assert log(w_eff) < 6
+            spread = match(log(w_eff), range(0, 6), lambda w: pow_2w(off_g, w))
+            assert spread == into_g
+            spot_off[GEN ** b] = first_g * off_g
+            piece_log[GEN ** b] = kappa1 / w_eff
+            width[GEN ** b] = w_eff
+            at_g *= step
+    return gmv, lane_g, spot_off, piece_log, width
+
+
+def pow_2w(x, w: Const):
+    # x^(2^w).
+    y = x
+    for i in unroll(0, w):
+        y = y * y
+    return y
+
+
+def stack_selectors(spot_off, piece_log, width, point, point1, g_squares, lane_g):
+    # Each block's selector at the opening point: the eq of its Spot's offset bits
+    # above its piece against the point, less the factors of a split block's lowest
+    # w_eff lane coordinates, which its row point takes (stack_low_eq). The offset is
+    # zero on those lane bits, the group's first lane being a multiple of 2^w. The point
+    # is zero past the stack's log, as column_selector needs.
+    sel_eq = selector_tables(point, point1)
+    sel_g = g_squares * GEN ** SIZE_BITS
+    lane_eq = point1 * lane_g
+    lane_inv = HeapBuf(6)  # 1 / prod_{i < w} eq(0, x_(lane + i))
+    lane_inv[GEN ** 0] = 1
+    acc = lane_eq[GEN ** 0]
+    for i in unroll(1, 6):
+        lane_inv[GEN ** i] = 1 / acc
+        if const(i != 5):
+            acc *= lane_eq[GEN ** i]
+    selectors = HeapBuf(N_STK_BLOCKS)
+    for b in unroll(0, N_STK_BLOCKS):
+        offset = spot_off[GEN ** b]
+        sel = match(log(piece_log[GEN ** b]), range(0, N_COLUMN_LOGS), lambda kappa: column_selector(offset, sel_eq, sel_g, kappa))
+        selectors[GEN ** b] = sel * lane_inv[width[GEN ** b]]
+    return selectors
+
+
+def stack_low_eq(p, point1, piece_g, w_eff, lane_g):
+    # A block's claim at row point p (zero past its kappa, up to kappa' = piece + w_eff):
+    # the eq of its low `piece` coordinates against the in-lane ones, and of the next
+    # w_eff against the group's lowest lane coordinates.
+    chain = HeapBuf(EQ_CHAIN_ARMS)
+    eq_prefix_chain(chain, 1, p, point1, piece_g)
+    assert log(w_eff) < 6
+    high = match(log(w_eff), range(0, 6), lambda w: eq_run(p * piece_g, point1 * lane_g, w))
+    return chain[piece_g] * high
+
+
+def eq_run(a, b1, n: Const):
+    # prod_{k < n} eq(a_k, b_k), b1 = 1 + b.
+    v = 1
+    for k in unroll(0, n):
+        v = v * (a[GEN ** k] + b1[GEN ** k])
+    return v
 
 
 def column_selector(offset, sel_eq, sel_g, kappa: Const):

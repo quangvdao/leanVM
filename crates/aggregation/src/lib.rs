@@ -51,6 +51,7 @@ mod proof;
 #[cfg(any(test, feature = "signers-cache"))]
 pub mod signers_cache;
 mod statement;
+mod stripe;
 #[cfg(test)]
 mod tests;
 

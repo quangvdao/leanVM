@@ -211,6 +211,7 @@ pub(super) fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     bytecode_placeholders(&mut ph, &sides, kbc);
     da_placeholders(&mut ph);
     signature_placeholders(&mut ph);
+    stack_placeholders(&mut ph);
     ph.0
 }
 
@@ -789,6 +790,23 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
         .collect();
     ph.list("VANISH_BY_COLS", by_cols.iter().map(|&v| F128::from(v)));
     ph.list("VANISH_INVS_BY_COLS", by_cols.iter().map(|v| F128::from(v.inv())));
+}
+
+/// The stack's blocks and their groups, as `certify_stack` reads them.
+fn stack_placeholders(ph: &mut Placeholders) {
+    let blocks = verifier::layout::stack_blocks();
+    let starts = super::stripe::block_groups(&blocks);
+    ph.set("N_STK_BLOCKS", blocks.len());
+    ph.list(
+        "STK_SRC",
+        blocks.iter().map(|block| super::stripe::source_index(block.source)),
+    );
+    ph.list("STK_ADJ", blocks.iter().map(|block| block.adj));
+    ph.list("STK_RING", blocks.iter().map(|block| usize::from(block.ring)));
+    ph.set("N_STK_GROUPS", starts.len());
+    ph.list("STK_GROUP_START", starts.iter().copied().chain([blocks.len()]));
+    ph.set("STK_STRIDE", 2 * blocks.len() + 1);
+    ph.set("STK_MIN_LOG", verifier::layout::MIN_STACKED_LOG);
 }
 
 /// The stacked bytecode's claim, the batch's seed, and the statement's layout.

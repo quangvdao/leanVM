@@ -316,6 +316,123 @@ fn guest_column_selectors_match_native_eq() {
     }
 }
 
+/// `certify_stack`, `stack_selectors` and `stack_low_eq` reproduce the native binary stripe: for stacks of random table
+/// heights, each block's claim at a random row reads the eq of `Placement::stack_point` against a random opening point.
+/// A wrong expected weight fails the run.
+#[test]
+fn guest_stack_weights_match_native_stripe() {
+    use verifier::layout::{N_TABLES as TABLES, SizeSource, TABLE_LOG_FLOORS as FLOORS, stack_blocks};
+    const ROW_CAP: usize = 40;
+    let guest = guest_snippet(
+        &format!(
+            r#"    g_squares = exponent_tables()
+    kappa_base = HeapBuf(N_TABLES + 2)
+    hint_witness(kappa_base[0:N_TABLES + 2], "kappa_base")
+    gmv, lane_g, spot_off, piece_log, width = certify_stack(kappa_base, g_squares)
+    stack_log = hint_witness("stack_log")
+    assert gmv == stack_log
+    point = HeapBuf(4 * SEL_NIBBLES)
+    hint_witness(point[0:4 * SEL_NIBBLES], "point")
+    point1 = HeapBuf(4 * SEL_NIBBLES)
+    for k in unroll(0, 4 * SEL_NIBBLES):
+        point1[GEN ** k] = 1 + point[GEN ** k]
+    selectors = stack_selectors(spot_off, piece_log, width, point, point1, g_squares, lane_g)
+    rows = HeapBuf(N_STK_BLOCKS * {ROW_CAP})
+    hint_witness(rows[0:N_STK_BLOCKS * {ROW_CAP}], "rows")
+    expected = HeapBuf(N_STK_BLOCKS)
+    hint_witness(expected[0:N_STK_BLOCKS], "expected")
+    for b in unroll(0, N_STK_BLOCKS):
+        low = stack_low_eq(rows * GEN ** ({ROW_CAP} * b), point1, piece_log[GEN ** b], width[GEN ** b], lane_g)
+        assert low * selectors[GEN ** b] == expected[GEN ** b]
+    return
+"#
+        ),
+        18,
+    );
+    let blocks = stack_blocks();
+    let mut rng = StdRng::seed_from_u64(1);
+    let mut random = || {
+        let (c0, c1) = rand::Rng::random(&mut rng);
+        F128::new(c0, c1)
+    };
+    let map = placeholder_map(18);
+    let lig = |name: &str| map[&format!("{name}_PLACEHOLDER")].parse::<usize>().unwrap();
+    let sel_bits = 4 * (lig("LIG_MIN_LOG_SIZE") + lig("LIG_N_LOG_SIZES") - 1).div_ceil(4);
+    // (log memory, table heights): a stack at the PCS floor with few lanes, a full one, and a mix of small tables.
+    let cases: [(usize, [usize; TABLES]); 5] = [
+        (1, [0, 0, 0, 0, 0, 0]),
+        (4, [2, 3, 1, 0, 4, 9]),
+        (12, [10, 11, 9, 8, 7, 9]),
+        (16, [14, 15, 13, 12, 11, 10]),
+        (17, [16, 16, 16, 16, 14, 12]),
+    ];
+    for (case, (log_memory, heights)) in cases.into_iter().enumerate() {
+        let heights: Vec<usize> = heights.iter().zip(FLOORS).map(|(&h, floor)| h.max(floor)).collect();
+        let kappas: Vec<usize> = blocks
+            .iter()
+            .map(|block| {
+                block.adj
+                    + match block.source {
+                        SizeSource::Memory => log_memory,
+                        SizeSource::Table(t) => heights[t],
+                    }
+            })
+            .collect();
+        let ring: Vec<bool> = blocks.iter().map(|block| block.ring).collect();
+        let (spots, log) = verifier::stack_offsets(&kappas, &ring, verifier::MIN_STACKED_LOG, 6);
+        let lane = log - 6;
+        let point: Vec<F128> = (0..sel_bits)
+            .map(|k| if k < log { random() } else { F128::ZERO })
+            .collect();
+        let mut rows = vec![F128::ZERO; blocks.len() * ROW_CAP];
+        let mut expected = Vec::new();
+        for (b, (&kappa, spot)) in kappas.iter().zip(&spots).enumerate() {
+            let row: Vec<F128> = (0..kappa).map(|_| random()).collect();
+            rows[b * ROW_CAP..b * ROW_CAP + kappa].copy_from_slice(&row);
+            let placement = verifier::Placement {
+                variables: kappa,
+                index: spot.offset,
+                piece_variables: spot.piece,
+            };
+            let at = placement.stack_point(&row.iter().map(to_scalar).collect::<Vec<_>>(), log, lane);
+            expected.push(
+                at.iter()
+                    .zip(&point)
+                    .fold(F128::ONE, |acc, (&a, &x)| acc * (F128::ONE + from_scalar(a) + x)),
+            );
+        }
+        let mut hints = Hints::default();
+        hints.push(
+            "kappa_base",
+            [0, log_memory]
+                .into_iter()
+                .chain(heights.iter().copied())
+                .map(count)
+                .collect(),
+        );
+        for (name, values) in super::stripe::stack_hints(&kappas) {
+            hints.push(name, values);
+        }
+        hints.push("stack_log", vec![count(log)]);
+        hints.push("point", point);
+        hints.push("rows", rows);
+        let mut forged = hints.clone();
+        forged.push("expected", {
+            let mut wrong = expected.clone();
+            let at = case * 7 % wrong.len();
+            wrong[at] += F128::ONE;
+            wrong
+        });
+        hints.push("expected", expected);
+        let execution = execute(&guest, &hints.0, [F128::ZERO; 2]).unwrap();
+        assert!(execution.unconstrained_reads.is_empty(), "case {case}");
+        assert!(
+            execute(&guest, &forged.0, [F128::ZERO; 2]).is_err(),
+            "case {case}: a wrong weight passes"
+        );
+    }
+}
+
 /// The right leaf holds more claims than one loop frame of its list hashes
 /// ([`CLAIM_GROUP`]), so both that leaf and the parent rebuilding it run the
 /// list's group loop and then a partial last group, while the left leaf's list is

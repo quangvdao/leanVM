@@ -552,32 +552,78 @@ fn column_kappas(tables: &[Table], log_memory: usize, table_log_heights: &[usize
     kappas
 }
 
-/// The columns with a block of their own in the stack, out of `columns`. A column q_keccak carries gets none: it is
-/// one of its slots, 2^height words, whether an input lane or a KECCAK column riding a spare slot (`qkeccak_slot`). An
-/// output lane is not committed at all, nothing ever opening it.
-fn stacked_blocks(columns: usize) -> Vec<usize> {
-    let base = GLOBAL_COLUMN_BASES[OP_KECCAK];
-    let outputs = base + KECCAK_OUT..base + KECCAK_OUT + STATE_LANES;
-    (0..columns)
-        .filter(|column| qkeccak_slot(*column).is_none() && !outputs.contains(column))
-        .collect()
+/// What a stack block's log size is, in terms of the announced sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeSource {
+    Memory,
+    Table(usize),
+}
+
+/// A column with a block of its own in the stack: its log size is its source's plus `adj`, and `ring` marks the
+/// blocks the opening reads through ring weights (the pointer columns and q_keccak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackBlock {
+    pub column: usize,
+    pub source: SizeSource,
+    pub adj: usize,
+    pub ring: bool,
+}
+
+/// The stack's blocks, in global column order. A column q_keccak carries gets none: it is one of its slots, 2^height
+/// words, whether an input lane or a KECCAK column riding a spare slot (`qkeccak_slot`). An output lane is not
+/// committed at all, nothing ever opening it.
+pub fn stack_blocks() -> Vec<StackBlock> {
+    let outputs =
+        GLOBAL_COLUMN_BASES[OP_KECCAK] + KECCAK_OUT..GLOBAL_COLUMN_BASES[OP_KECCAK] + KECCAK_OUT + STATE_LANES;
+    let mut blocks = vec![
+        StackBlock {
+            column: MEMORY_0,
+            source: SizeSource::Memory,
+            adj: 0,
+            ring: false,
+        },
+        StackBlock {
+            column: MEMORY_1,
+            source: SizeSource::Memory,
+            adj: 0,
+            ring: false,
+        },
+        StackBlock {
+            column: QKECCAK,
+            source: SizeSource::Table(OP_KECCAK),
+            adj: log2_ceil(QKECCAK_SLOTS as u64),
+            ring: true,
+        },
+    ];
+    for table in tables() {
+        let base = GLOBAL_COLUMN_BASES[table.opcode];
+        let pointers = table.links.pointers();
+        for local in 0..table.width() {
+            let column = base + local;
+            if qkeccak_slot(column).is_none() && !outputs.contains(&column) {
+                let ring = pointers.contains(&local);
+                blocks.push(StackBlock {
+                    column,
+                    source: SizeSource::Table(table.opcode),
+                    adj: 0,
+                    ring,
+                });
+            }
+        }
+    }
+    blocks
 }
 
 /// The stack of columns of these log sizes: each stacked column's offset, and its log size, floored at the PCS minimum.
-/// The pointer columns and q_keccak are [`stack_offsets`]'s ring blocks.
-fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
-    let blocks = stacked_blocks(kappas.len());
-    let block_kappas: Vec<usize> = blocks.iter().map(|&column| kappas[column]).collect();
-    let mut pointer = vec![false; kappas.len()];
-    for table in tables {
-        for column in table.links.pointers() {
-            pointer[GLOBAL_COLUMN_BASES[table.opcode] + column] = true;
-        }
-    }
-    pointer[QKECCAK] = true;
-    let ring: Vec<bool> = blocks.iter().map(|&column| pointer[column]).collect();
+fn stack(kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
+    let blocks = stack_blocks();
+    let block_kappas: Vec<usize> = blocks.iter().map(|block| kappas[block.column]).collect();
+    let ring: Vec<bool> = blocks.iter().map(|block| block.ring).collect();
     let (block_offsets, stack_log) = stack_offsets(&block_kappas, &ring, MIN_STACKED_LOG, INITIAL_FOLDING_FACTOR);
-    (blocks.into_iter().zip(block_offsets).collect(), stack_log)
+    (
+        blocks.iter().map(|block| block.column).zip(block_offsets).collect(),
+        stack_log,
+    )
 }
 
 /// The stack of the smallest execution of a bytecode of `2^log_bytecode` instructions: the least memory, every table at
@@ -585,7 +631,7 @@ fn stack(tables: &[Table], kappas: &[usize]) -> (BTreeMap<usize, Spot>, usize) {
 /// is public and has no committed column, so the stack does not depend on its size.
 pub fn min_execution_stacked_log(_log_bytecode: usize) -> usize {
     let tables = tables();
-    stack(&tables, &column_kappas(&tables, MIN_LOG_MEMORY, &TABLE_LOG_FLOORS)).1
+    stack(&column_kappas(&tables, MIN_LOG_MEMORY, &TABLE_LOG_FLOORS)).1
 }
 
 pub fn build_layout<'a>(
@@ -613,7 +659,7 @@ pub fn build_layout<'a>(
 
     let keccak = keccak_shape(&table_log_heights);
     let kappas = column_kappas(&tables, log_memory, &table_log_heights);
-    let (offsets, stack_log) = stack(&tables, &kappas);
+    let (offsets, stack_log) = stack(&kappas);
     let lane = stack_log - INITIAL_FOLDING_FACTOR;
     let block = |column: usize| {
         let spot = offsets.get(&column)?;
