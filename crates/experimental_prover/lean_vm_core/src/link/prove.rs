@@ -762,11 +762,12 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
     #[cfg(test)]
     let m1 = m1 + cheat::MEMORY_TERM.get();
     ps.add_scalars(&[w_plus_r, spine_r, m1]);
+    let [plus, spine, cert, jump_0, jump_1] = ps.sample_packed(5).try_into().unwrap();
     let fresh = Fresh {
-        plus: ps.sample(),
-        spine: ps.sample(),
-        cert: ps.sample(),
-        jump: [ps.sample(), ps.sample()],
+        plus,
+        spine,
+        cert,
+        jump: [jump_0, jump_1],
     };
     let eq0_r = below_power(r, 0);
     let eq_zeta_r = index_end.values[7];

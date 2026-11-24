@@ -28,8 +28,8 @@
 //!
 //! ## Transcript order
 //!
-//! Grind [`BATCH_GRINDING_BITS`], sample the shared linear map, then `rho` when there are several ring-switched claims,
-//! then one batching challenge for the merged ring claim and the point claims, then run WHIR. The caller already bound each claim's slices and value through the transcript, so none is observed again here.
+//! Grind [`BATCH_GRINDING_BITS`], then one packed draw: the shared linear map, `rho` when there are several
+//! ring-switched claims, and one batching challenge for the merged ring claim and the point claims. Then run WHIR. The caller already bound each claim's slices and value through the transcript, so none is observed again here.
 //!
 //! ## The combined weight
 //!
@@ -287,17 +287,23 @@ pub fn open_batch_mixed_whir_stacked(
             }
         })
         .collect();
-    // One grind covers the map challenges, rho and the batching challenge below: one verifier message.
-    ps.grind(BATCH_GRINDING_BITS);
-    let map_challenges = ring_switch::sample_map_challenges(ps);
-    // Several ring claims merge into one: claim `j` joins as `rho^j` times itself, inside the map, which is not
+    // One grind covers the map challenges, rho and the batching challenge below: one verifier message, one packed
+    // draw. Several ring claims merge into one: claim `j` joins as `rho^j` times itself, inside the map, which is not
     // `E`-linear (`verifier::ring_switch`).
-    let rho = if ring.claims.len() > 1 { ps.sample() } else { F128::ONE };
+    ps.grind(BATCH_GRINDING_BITS);
+    let merging = ring.claims.len() > 1;
+    let drawn = ps.sample_packed(ring_switch::MAP_CHALLENGES + usize::from(merging) + 1);
+    let map_challenges: [F128; ring_switch::MAP_CHALLENGES] = drawn[..ring_switch::MAP_CHALLENGES].try_into().unwrap();
+    let rho = if merging {
+        drawn[ring_switch::MAP_CHALLENGES]
+    } else {
+        F128::ONE
+    };
 
     // 2. The ONE batching challenge: the merged ring claim takes its zeroth power, the point claims the next. Nothing
     //    is observed first: every claim value reached the caller through a binding stream read, so the challenge
     //    already depends on all of them (`lean_vm_core::pcs::open`).
-    let lambdas = powers(ps.sample(), 1 + point_claims.len());
+    let lambdas = powers(drawn[drawn.len() - 1], 1 + point_claims.len());
     let lambdas_pd = &lambdas[1..];
 
     let rs_outputs: Vec<_> = rs_states

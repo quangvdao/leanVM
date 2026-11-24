@@ -367,7 +367,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let sent = transcript.next_scalars(3)?;
     let values_at_r = values_start..transcript.stream_offset();
     let (w_plus, spine, m1) = (sent[0], sent[1], sent[2]);
-    let [plus, spine_coef, cert, jump_0, jump_1] = [0; 5].map(|_| transcript.sample());
+    let [plus, spine_coef, cert, jump_0, jump_1] = transcript.samples_packed(5).try_into().unwrap();
     let below = |k: usize| product(r[k.min(width)..].iter().map(|&x| ONE + x));
     let y_mem = gamma_mem[0] * index_mle(&r) + gamma_mem[3] * below(layout.log_memory) + gamma_mem[1] * m1;
     let bytecode_point = [&r[..layout.log_bytecode], &alpha[..]].concat();

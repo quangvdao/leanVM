@@ -120,12 +120,15 @@ pub type RingStackClaim = (Box<dyn Fn(&[E]) -> E>, E);
 /// slices and its pieces' scales. Phi is not `E`-linear, so `rho` scales inside it. Take the target `T = sum_i x^i
 /// Phi(s_i)` against the MLE-friendly weight `W = sum_p Phi(scale_p eq(point_p, .))` on each piece's placement.
 ///
-/// One grind covers the map's challenges, `rho` and the stacked opening's batching challenge, drawn next.
-pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Result<RingStackClaim, VerifierError> {
+/// One grind covers the map's challenges, `rho` and the stacked opening's batching challenge, one packed draw, which
+/// returns the batching challenge too.
+pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Result<(RingStackClaim, E), VerifierError> {
     transcript.grind_check(BATCH_GRINDING_BITS)?;
-    let challenges = transcript.samples(2 * RING_MAP_WIDTH);
-    let (f, g) = challenges.split_at(RING_MAP_WIDTH);
-    let rho = if claims.len() > 1 { transcript.sample() } else { ONE };
+    let merging = claims.len() > 1;
+    let challenges = transcript.samples_packed(2 * RING_MAP_WIDTH + usize::from(merging) + 1);
+    let (f, rest) = challenges.split_at(RING_MAP_WIDTH);
+    let (g, rest) = rest.split_at(RING_MAP_WIDTH);
+    let (rho, batching) = if merging { (rest[0], rest[1]) } else { (ONE, rest[0]) };
     let mut slices = vec![ZERO; K_BITS];
     let mut groups: Vec<PointGroup> = Vec::new();
     let mut points: Vec<Vec<E>> = Vec::new();
@@ -152,7 +155,7 @@ pub fn ring_switch(claims: Vec<RingClaim>, transcript: &mut Transcript) -> Resul
     let target = ring_target(&slices, f, g);
     let coefficients = ring_coefficients(f, g);
     let weight = move |x: &[E]| ring_weight(&groups, x, &coefficients);
-    Ok((Box::new(weight), target))
+    Ok(((Box::new(weight), target), batching))
 }
 
 #[cfg(test)]

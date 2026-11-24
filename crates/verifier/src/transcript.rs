@@ -80,10 +80,20 @@ impl Sponge {
     }
 
     /// `count` challenges eight to a permutation: each takes whatever waits, and its output's rate, two lanes to a
-    /// challenge, gives the next eight. A grind's challenge is drawn first, by [`Self::sample`].
+    /// challenge, gives the next eight. Right after a grind, its permutation gives the first seven: every cell but the
+    /// second, which holds the proof of work.
     pub fn samples_packed(&mut self, count: usize) -> Vec<E> {
-        assert!(self.ground.is_none(), "a grind is followed by a challenge");
         let mut out = Vec::with_capacity(count);
+        if count > 0
+            && let Some(first) = self.ground.take()
+        {
+            out.push(first);
+            out.extend(
+                (2..8)
+                    .take(count - 1)
+                    .map(|i| E::new(self.state[2 * i], self.state[2 * i + 1])),
+            );
+        }
         while out.len() < count {
             self.duplex();
             let take = (count - out.len()).min(8);
