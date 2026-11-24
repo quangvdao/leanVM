@@ -165,7 +165,7 @@ pub(crate) struct Challenges {
     pub eta_cover: F128,
     pub eta_mem: F128,
     pub eta_bc: F128,
-    /// Per global pointer column, per chunk.
+    /// Per global pointer column, per chunk: `ε_q·ν_c`.
     pub eps: Vec<Vec<F128>>,
 }
 
@@ -187,7 +187,8 @@ impl Challenges {
         let zeta = ps.sample_vec(chunks.width);
         let [eta_start, eta_cover, eta_mem, eta_bc] = std::array::from_fn(|_| ps.sample());
         let n_pointers: usize = plans.iter().map(|p| p.pointers.len()).sum();
-        let eps = (0..n_pointers).map(|_| ps.sample_vec(chunks.d())).collect();
+        let (eps, nu) = (ps.sample_vec(n_pointers), ps.sample_vec(chunks.d()));
+        let eps = eps.iter().map(|&e| nu.iter().map(|&n| e * n).collect()).collect();
         Self {
             theta,
             tau,

@@ -340,7 +340,9 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
     let alpha = transcript.samples(BUS_BITS);
     let zeta = transcript.samples(width);
     let [eta_start, eta_cover, eta_mem, eta_bc] = [0; 4].map(|_| transcript.sample());
-    let eps: Vec<Vec<E>> = (0..n_pointers).map(|_| transcript.samples(d)).collect();
+    // The mirror certificates' coefficients: pointer column `q`'s chunk `c` takes `ε_q·ν_c`.
+    let eps = transcript.samples(n_pointers);
+    let nu = transcript.samples(d);
     let slot = eq_kernel(&alpha);
     let s_init = gamma_state[0] + gamma_state[1];
     let s_fin = gamma_state[0] * gpow((1 << layout.log_bytecode) - 1) + gamma_state[1];
@@ -389,7 +391,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
 
     // The values at the row point, and what they make of the summand there.
     let mut columns = Vec::with_capacity(N_TABLES);
-    let (mut coef, mut shifts, mut certs, mut base) = (ZERO, vec![ZERO; max_shift], vec![ZERO; d], ZERO);
+    let (mut coef, mut shifts, mut cert_weight, mut base) = (ZERO, vec![ZERO; max_shift], ZERO, ZERO);
     let mut pieces = Vec::with_capacity(n_pointers);
     let mut q = 0;
     for (t, table) in tables.iter().enumerate() {
@@ -464,9 +466,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
                     }
                 }
             }
-            for (c, &epsilon) in certs.iter_mut().zip(&eps[q]) {
-                *c += e * omega * cert * epsilon;
-            }
+            cert_weight += e * omega * eps[q];
             // A split column is its pieces, each at the low end of the row point.
             let placement = layout.placements[GLOBAL_COLUMN_BASES[t] + pointer].expect("a pointer column is committed");
             for (piece, weight) in placement.pieces(layout.stack_log - INITIAL_FOLDING_FACTOR, &point) {
@@ -487,6 +487,7 @@ pub fn verify_link(layout: &Layout, transcript: &mut Transcript) -> Result<LinkE
         let functionals = Functionals::new(&chunks, &r, max_shift);
         let values = functionals.values(&chunks, &slices);
         let eq0_q = product(q_point.iter().map(|&x| ONE + x));
+        let certs: Vec<E> = nu.iter().map(|&n| cert * cert_weight * n).collect();
         let last = functionals.summand(coef, &shifts, &values, &certs) + eq0_q * base;
         require(last == claim, VerifierError::LinkTerminal)?;
     }

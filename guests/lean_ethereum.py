@@ -2778,11 +2778,11 @@ def link_form(sent, f: Const):
     return acc
 
 
-def link_terminal(r, sent, coef, shifts, cw, eps, rest, claim, w: Const):
+def link_terminal(r, sent, coef, shifts, cert_w, nu, rest, claim, w: Const):
     # The summand at the end point (link::Functionals::summand) from the pointer words'
     # 64 bit-slices, at the w-bit chunking: each functional's value, the pointer, the
-    # shifted pointers by the carry chain, and the mirror certificate. `rest` is
-    # eq0(q) times the base terms.
+    # shifted pointers by the carry chain, and the mirror certificate, chunk i under
+    # cert_w nu_i. `rest` is eq0(q) times the base terms.
     d = CHUNK_D[w]
     carry = CHUNK_CARRY[w]
     eqs = HeapBuf(CHUNK_CAP * 128)
@@ -2847,9 +2847,7 @@ def link_terminal(r, sent, coef, shifts, cw, eps, rest, claim, w: Const):
         shifted = shifted + shifts[GEN ** s] * x
     cert = 0
     for i in unroll(0, d):
-        ci = 0
-        for q in unroll(0, N_POINTERS):
-            ci = ci + cw[GEN ** q] * eps[GEN ** (q * d + i)]
+        ci = cert_w * nu[GEN ** i]
         mirror = 1
         for k in unroll(CHUNK_IDX[CHUNK_CAP * w + i], CHUNK_IDX[CHUNK_CAP * w + i] + CHUNK_WIDTH[CHUNK_CAP * w + i]):
             x = r[GEN ** k]
@@ -3132,7 +3130,8 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     alpha = HeapBuf(LOG2_BYTECODE_COLS)
     slot = HeapBuf(30)
     zeta = HeapBuf(MAX_PTR_WIDTH)
-    eps = HeapBuf(N_POINTERS * CHUNK_CAP)
+    eps = HeapBuf(N_POINTERS)
+    nu = HeapBuf(CHUNK_CAP)
     r_pt = HeapBuf(MAX_PTR_WIDTH)
     pre = HeapBuf(MAX_PTR_WIDTH + 1)
     vals3 = HeapBuf(3)
@@ -3142,7 +3141,6 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     eq_q = HeapBuf(2 ** (LINK_Q_VARS + 1) - 2)
     c1chain = HeapBuf(MAX_PTR_WIDTH + 1)
     sent = HeapBuf(LINK_N_SENT + BASE_FIELD_BITS)
-    cw = HeapBuf(N_POINTERS)
     shifts = HeapBuf(LINK_MAX_SHIFT)
     z_vals = HeapBuf(2 * QKECCAK_VARS_CAP)
     kslices = HeapBuf(BASE_FIELD_BITS)
@@ -3287,7 +3285,9 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     sp, eta_cover = squeeze(sp, no_rate, 0)
     sp, eta_mem = squeeze(sp, no_rate, 0)
     sp, eta_bc = squeeze(sp, no_rate, 0)
-    fs0, fs1, fs2, fs3, fs4 = squeeze_run(sp[8], sp[9], sp[10], sp[11], sp[12], eps, g_d ** N_POINTERS)
+    # The mirror certificates' coefficients: pointer column q's chunk c takes eps_q nu_c.
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(sp[8], sp[9], sp[10], sp[11], sp[12], eps, GEN ** N_POINTERS)
+    fs0, fs1, fs2, fs3, fs4 = squeeze_run(fs0, fs1, fs2, fs3, fs4, nu, g_d)
     eqtree(alpha, slot, LOG2_BYTECODE_COLS)
     slot = slot * GEN ** (2 ** LOG2_BYTECODE_COLS - 2)  # eq(alpha, .) over the 16 tuple slots
 
@@ -3347,6 +3347,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     coef = 0
     base = 0
     plus_part = 0
+    cert_w = 0
     fq = StackBuf(N_POINTERS)  # eq(q_point, q) * corner * omega, per pointer
     acc_gm = StackBuf(N_ACCESSES)  # mu * gate, per access
     for t in unroll(0, N_TABLES):
@@ -3380,7 +3381,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
             e = eq_q[GEN ** (EQ_Q_AT + q)] * corner
             eo = e * omega
             fq[q] = eo
-            cw[GEN ** q] = eo * cert
+            cert_w = cert_w + eo * eps[GEN ** q]
             if const(q == PTR_START[t]):
                 coef = coef + e * act * (eta_cover * eqzr + spine_coef * s_gamma)
                 plus_part = plus_part + eo * plus
@@ -3403,7 +3404,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
                 sh = sh + fq[ACC_PTR[a]] * acc_gm[a] * ey
         shifts[GEN ** s] = sh
     rest = eq_q[GEN ** EQ_Q_AT] * base
-    done = match(log(g_w * INV_GEN ** BYTECODE_LOG), range(0, LINK_W_ARMS), lambda k: link_terminal(r_pt, sent, coef, shifts, cw, eps, rest, claim, k + BYTECODE_LOG))
+    done = match(log(g_w * INV_GEN ** BYTECODE_LOG), range(0, LINK_W_ARMS), lambda k: link_terminal(r_pt, sent, coef, shifts, cert_w * cert, nu, rest, claim, k + BYTECODE_LOG))
 
     # ---- public-input binding: each memory limb's line through the public words ----
     lo_0, hi_0 = split_limbs(pi_0)
