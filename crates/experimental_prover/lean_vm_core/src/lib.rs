@@ -35,6 +35,10 @@ pub mod witness;
 pub use fiat_shamir::SECURITY_BITS;
 pub use prover::ExperimentalProver;
 
+/// Whether `scripts/tier-rustc` compiled this copy with a CPU tier's target features (`crates/experimental_tiers`).
+#[doc(hidden)]
+pub const __TIER: bool = cfg!(leanvm_tier);
+
 /// `stage!("Commit", || …)`: one named prover stage, run inside its `tracing` span,
 /// which is what the CLI's `--tracing` tree shows.
 macro_rules! stage {

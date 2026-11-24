@@ -5,8 +5,7 @@ public import LeanVM.Protocol.LeanVMRpm
 public import LeanVM.Guest.Batch.Children
 public import LeanVM.Guest.Batch.Rpm
 public import LeanVM.Guest.EndRpm
-public import LeanVM.Guest.Budget.ClosedN
-public import LeanVM.Guest.Budget.Fits
+public import LeanVM.Guest.Budget.Closed
 public import LeanVM.Prover.End
 public import LeanVM.Prover.EndChild
 public import LeanVM.Protocol.Verifier.Defers
@@ -18,9 +17,7 @@ public import LeanVM.Guest.EndExecHonest
 public import LeanVM.Guest.EndExecFinal
 public import XmssSecurity.Rpm
 public import Sphincs.Security
-public import LeanDa.RpmComplete
-public import LeanDa.PiOnly
-public import LeanDa.RpmArg
+public import LeanDa.End
 public import Statement.Theorems
 public import Statement.Corollaries
 public import LeanVM.Protocol.WithHash
@@ -49,9 +46,9 @@ program too (`GuestKnowledgeSoundness`, `Statement/LeanVmGuest.lean`):
 `LeanVM.Cost.compiledGuestWitnessDecoder`, the
 proofs' decoder `LeanVM.Guest.End.decode` compiled (`LeanVM/Cost/Decoder/`, its top `decTopC`),
 within `guestWitnessDecoderSizeBound` (`Cost/DecoderSize.lean`) and computing `decode` on every valid
-execution (`Cost/DecoderSpec.lean`: `decoderProgram_spec`) within its budget, its price within
-`guestDecoderPrice` (`LeanVM.Cost.Bounds.Guest.decoderPriceWithinBudget :
-DecoderPriceWithinBudget`, `Cost/Bounds/Guest/Budget.lean`). `theorems_hold` and
+execution (`Cost/DecoderSpec.lean`: `decoderProgram_spec`) within its budget
+(`LeanVM.Cost.Bounds.Guest.decoderPriceWithinBudget : DecoderPriceWithinBudget`,
+`Cost/Bounds/Guest/Budget.lean`). `theorems_hold` and
 `corollaries_hold` take no hypothesis (the `example` after `theorems_hold` pins the statement).
 Its fields are proved by `theorems_of_decoderSpec`, for any decoder program meeting
 `DecoderProgramSpec` for a decoder whose decodings explain the input (`DecoderExplains`,
@@ -383,9 +380,9 @@ theorem LeanVM.theorems_of_decoderSpec {decoderProgram : LeanVM.Cost.MachineProg
   batchingSound := LeanVM.Guest.Batch.batch_sound_holds
   leanXmssStronglyUnforgeable := XmssSecurity.leanXmss_rpm_security
   leanSphincsStronglyUnforgeable := Sphincs.leanSphincsStronglyUnforgeable
-  leanDaComplete := LeanDa.leanDa_perfectlyComplete_rpm
+  leanDaComplete := LeanDa.leanDa_complete
   leanDaPositionBinding := LeanDa.leanDa_positionBinding_rpm
-  leanDaCodeBinding := LeanDa.leanDa_codeBinding_rpm_bound
+  leanDaMembershipSound := LeanDa.leanDa_membershipSound_rpm
 
 /-- info: 'LeanVM.theorems_of_decoderSpec' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
@@ -446,8 +443,8 @@ theorem LeanVM.corollaries_of_theorems {extractorProgram decoderProgram : LeanVM
     Statement.Corollaries (leanVmKnowledgeExtractor := extractorProgram)
       (guestWitnessDecoder := decoderProgram) where
   aggregateSound := by
-    intro A Q hA hQ
-    refine le_trans (prEvent_mono _ _ _ ?_) (h.leanVmKnowledgeSoundness A Q hA hQ)
+    intro A Q hA
+    refine le_trans (prEvent_mono _ _ _ ?_) (h.leanVmKnowledgeSoundness A Q hA)
     rintro ⟨prog, input, π, b, T⟩ ⟨s, hb, hprog, hpub, hs, hno⟩
     dsimp only at hprog
     subst hprog
@@ -455,7 +452,7 @@ theorem LeanVM.corollaries_of_theorems {extractorProgram decoderProgram : LeanVM
     rintro ⟨t, hx, hv⟩
     obtain ⟨d, hdec, hd, hrel⟩ := h.guestKnowledgeSoundness input t hv
     refine hno ⟨t, d, hx, hdec, ?_⟩
-    rcases h.statementDigestBinds _ _ _ _ _ hrel.hasBytecodeShape hs.1 (hd.trans hpub) with ⟨h1, h2⟩ | hc
+    rcases h.statementDigestBinds _ _ _ _ _ hrel.hasBytecodeShape hs.hasBytecodeShape (hd.trans hpub) with ⟨h1, h2⟩ | hc
     · exact Or.inl ⟨h1, h2, h1 ▸ h2 ▸ hrel⟩
     · exact Or.inr hc
   guestProverComplete s w hrel hlim :=
