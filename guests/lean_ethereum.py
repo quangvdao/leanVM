@@ -2951,20 +2951,22 @@ def ring_tail_row(out, row, zs, ps, v: Const):
     return 0
 
 
-def ring_cols(row, scl, msk, n: Const):
-    # sum_q msk_q sum_k row_k scl_q^(2^k), the row read once.
+def ring_cols(row, scl, msk, q0: Const, n: Const):
+    # sum_q msk_q sum_k row_k scl_q^(2^k) over pointer columns q0..q0+n on blocks, the
+    # row read once. A column on a q_keccak slot takes its weight elsewhere.
     rs = StackBuf(BASE_FIELD_BITS)
     for k in unroll(0, BASE_FIELD_BITS):
         rs[k] = row[GEN ** k]
     total = 0
     for q in unroll(0, n):
-        acc = 0
-        sv = scl[GEN ** q]
-        for k in unroll(0, BASE_FIELD_BITS):
-            acc = acc + rs[k] * sv
-            if const(k != BASE_FIELD_BITS - 1):
-                sv = sv * sv
-        total = total + acc * msk[GEN ** q]
+        if const(PTR_BLOCK[q0 + q] // N_STK_BLOCKS == 0):
+            acc = 0
+            sv = scl[GEN ** q]
+            for k in unroll(0, BASE_FIELD_BITS):
+                acc = acc + rs[k] * sv
+                if const(k != BASE_FIELD_BITS - 1):
+                    sv = sv * sv
+            total = total + acc * msk[GEN ** q]
     return total
 
 
@@ -3040,7 +3042,6 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
             for q in unroll(PTR_START[t], PTR_START[t + 1]):
                 b = PTR_BLOCK[q]
                 if const(b // N_STK_BLOCKS != 0):
-                    pmask[GEN ** q] = 0
                     w_slot = ring_tail(row_h5, chi, point1, eq_q[GEN ** (EQ_Q_AT + q)], 0)
                     pext[GEN ** q] = w_slot * tq[GEN ** (2 ** QKECCAK_SLOT_LOG - 2 + b - N_STK_BLOCKS)] * sel2
                 else:
@@ -3059,7 +3060,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
                 w_link = w_link + pext[GEN ** q]
             scl = eq_q * GEN ** (EQ_Q_AT + PTR_START[t])
             msk = pmask * GEN ** PTR_START[t]
-            w_link = w_link + ring_cols(trow, scl, msk, const(PTR_START[t + 1] - PTR_START[t]))
+            w_link = w_link + ring_cols(trow, scl, msk, PTR_START[t], const(PTR_START[t + 1] - PTR_START[t]))
     w_total = w_total + w_link
 
     # The memory term at r[..log_mem], on both limbs.
