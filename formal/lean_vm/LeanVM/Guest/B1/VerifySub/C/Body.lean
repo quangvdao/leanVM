@@ -8,6 +8,9 @@
 module
 
 public import LeanVM.Guest.B1.VerifySub.C.ValsB
+public import LeanVM.Guest.B1.Bits.GrindPlaced
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_sub»
 
 /-!
 # The body, honestly
@@ -40,45 +43,60 @@ def vsWv11 (k : ℕ) : ℕ := [27, 30, 33, 36, 52, 55, 58, 61, 268, 271, 283].ge
 
 /-! Pieces of the atoms needing a side condition. -/
 
-def vsSPw : List Atom := (List.range 11).map fun k ↦ .load (.n (vsWv11 k)) (.n 25) k
-def vsSProws : List Atom := (List.range 6).map fun i ↦ .load (.n (vsX (i + 1))) (.n 26) i
-def vsSPquot : List Atom := [.mul (.n 64) (.n 66) (.n 65), .mul (.n 72) (.n 79) (.n 78)]
+def vsSPw : List Atom := (List.range 11).map fun k ↦ .load (.n (vsWv11 k)) (.n (val% «verify_sub» "stream")) k
+def vsSProws : List Atom := (List.range 6).map fun i ↦ .load (.n (vsX (i + 1))) (.n (val% «verify_sub» "table_rows")) i
+def vsSPquot : List Atom := [.mul (.n (val% «verify_sub» "rate_sel~0")) (.n (val% «verify_sub» "rate_sel")) (.n (val% «verify_sub» "rate_sel~1")), .mul (.n (val% «verify_sub» "g_log_mem")) (.n (val% «verify_sub» "s17#2")) (.n (val% «verify_sub» "s17#1"))]
 def vsSPrng : List Atom :=
-  [.rangeCheck (.n 66) (.n 68) (.n 69) (.n 70) (.n 67),
-    .rangeCheck (.n 72) (.n 74) (.n 75) (.n 76) (.n 73),
-    .rangeCheck (.n 79) (.n 80) (.n 81) (.n 82) (.n 77),
-    .rangeCheck (.n 278) (.n 280) (.n 281) (.n 282) (.n 279),
-    .rangeCheck (.n 321) (.n 323) (.n 324) (.n 325) (.n 322)]
+  [.rangeCheck (.n (val% «verify_sub» "rate_sel")) (.n (val% «verify_sub» "s13#1")) (.n (val% «verify_sub» "s13#2")) (.n (val% «verify_sub» "s13#3")) (.n (val% «verify_sub» "s13#0")),
+    .rangeCheck (.n (val% «verify_sub» "g_log_mem")) (.n (val% «verify_sub» "s16#1")) (.n (val% «verify_sub» "s16#2")) (.n (val% «verify_sub» "s16#3")) (.n (val% «verify_sub» "s16#0")),
+    .rangeCheck (.n (val% «verify_sub» "s17#2")) (.n (val% «verify_sub» "s17#3")) (.n (val% «verify_sub» "s17#4")) (.n (val% «verify_sub» "s17#5")) (.n (val% «verify_sub» "s17#0")),
+    .rangeCheck (.n (val% «verify_sub» "size_sel")) (.n (val% «verify_sub» "s37#1")) (.n (val% «verify_sub» "s37#2")) (.n (val% «verify_sub» "s37#3")) (.n (val% «verify_sub» "s37#0")),
+    .rangeCheck (.n (val% «verify_sub» "bus_grind")) (.n (val% «verify_sub» "s44#1")) (.n (val% «verify_sub» "s44#2")) (.n (val% «verify_sub» "s44#3")) (.n (val% «verify_sub» "s44#0"))]
 def vsSPdims : List Atom :=
-  .load (.n 72) (.n 71) 0 :: .load (.n 566) (.n 71) 6 ::
-    (List.range 6).map fun t ↦ .load (.n (86 + t)) (.n 71) (1 + t)
-def vsSPkb : List Atom := (List.range 8).map fun i ↦ .load (.n (84 + i)) (.n 83) i
+  .load (.n (val% «verify_sub» "g_log_mem")) (.n (val% «verify_sub» "dims_g")) 0 :: .load (.n (val% «verify_sub» "tau_keccak_g")) (.n (val% «verify_sub» "dims_g")) 6 ::
+    (List.range 6).map fun t ↦ .load (.n ((val% «verify_sub» "kb[2]") + t)) (.n (val% «verify_sub» "dims_g")) (1 + t)
+def vsSPkb : List Atom := (List.range 8).map fun i ↦ .load (.n ((val% «verify_sub» "kb[0]") + i)) (.n (val% «verify_sub» "kappa_base")) i
 def vsSPpush : List Atom :=
   (List.range 54).map fun b ↦ .load (.n (vsPushD b)) (.n (vsPushP b)) (Tables.blockKappaAdj b)
 def vsSPfpw : List Atom :=
-  (List.range 16).map fun i ↦ .load (.n (if i = 0 then 312 else 322 + 13 * i)) (.n 334) i
+  (List.range 16).map fun i ↦ .load (.n (if i = 0 then 364 else 374 + 13 * i)) (.n (val% «verify_sub» "fp_w")) i
 def vsSPmaps : List Atom :=
-  .load (.n 585) (.n 578) 0 :: (List.range 16).map fun i ↦ .load (.n (vsCh i)) (.n 814) i
+  .load (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0")) (.n (val% «verify_sub» "cursor@4")) 0 :: (List.range 16).map fun i ↦ .load (.n (vsCh i)) (.n (val% «verify_sub» "map_challenges")) i
 def vsSPctab : List Atom :=
   (List.range 8).flatMap fun b ↦ (List.range 8).map fun p ↦
-    .load (.n (vsCtabD b p)) (.n 815) (8 * p + b)
+    .load (.n (vsCtabD b p)) (.n (val% «verify_sub» "c_table")) (8 * p + b)
 def vsSPlam : List Atom :=
-  .load (.n 1881) (.n 309) 0 :: (List.range 134).map fun i ↦
-    .load (.n (1342 + 4 * i)) (.n (vsClaimAt (vsKept i)).1) (vsClaimAt (vsKept i)).2
-def vsSPz : List Atom := (List.range 19).map fun k ↦ .load (.n (1893 + k)) (.n 254) k
-def vsSPzo : List Atom := (List.range 19).map fun k ↦ .load (.n (1893 + k)) (.n 5) k
-def vsSPal : List Atom := (List.range 4).map fun k ↦ .load (.n (1912 + k)) (.n 553) k
-def vsSPalo : List Atom := (List.range 4).map fun k ↦ .load (.n (1912 + k)) (.n 5) (19 + k)
-def vsSPlast : List Atom := [.load (.n 563) (.n 5) 23]
+  .load (.n (val% «verify_sub» "target@136~1")) (.n (val% «verify_sub» "ood_value")) 0 :: (List.range 134).map fun i ↦
+    .load (.n (1446 + 4 * i)) (.n (vsClaimAt (vsKept i)).1) (vsClaimAt (vsKept i)).2
+def vsSPz : List Atom := (List.range 19).map fun k ↦ .load (.n ((val% «verify_sub» "s79.u0.s0#0") + k)) (.n (val% «verify_sub» "zeta")) k
+def vsSPzo : List Atom := (List.range 19).map fun k ↦ .load (.n ((val% «verify_sub» "s79.u0.s0#0") + k)) (.n (val% «verify_sub» "defer_out")) k
+def vsSPal : List Atom := (List.range 4).map fun k ↦ .load (.n ((val% «verify_sub» "s80.u0.s0#0") + k)) (.n (val% «verify_sub» "bc_point")) k
+def vsSPalo : List Atom := (List.range 4).map fun k ↦ .load (.n ((val% «verify_sub» "s80.u0.s0#0") + k)) (.n (val% «verify_sub» "defer_out")) (19 + k)
+def vsSPlast : List Atom := [.load (.n (val% «verify_sub» "bc_value")) (.n (val% «verify_sub» "defer_out")) 23]
+
+/-- The atoms of a block. -/
+def vsAtomsOf (l : List Stmt) : List Atom := l.filterMap fun s ↦ match s with
+  | .atom a => some a
+  | _ => none
+
+theorem vs_mem_atomsOf {l : List Stmt} {a : Atom} (h : a ∈ vsAtomsOf l) : Stmt.atom a ∈ l := by
+  obtain ⟨s, hs, e⟩ := List.mem_filterMap.1 h
+  cases s <;> simp_all
+
+/-- The inlined grinds' atoms: the out-of-domain one's, the ring map's. -/
+def vsSPg1 : List Atom :=
+  vsAtomsOf (gcInlineOT 15 301 winTabAt (.n (val% «verify_sub» "nxt[1]@3")) (.n (val% «verify_sub» "g_squares")))
+def vsSPg2 : List Atom :=
+  vsAtomsOf (gcInlineOT 13 653 winTabAt (.n (val% «verify_sub» "nxt[1]@20")) (.n (val% «verify_sub» "g_squares")))
 
 /-- The atoms of the body needing a side condition, piece by piece. -/
 def vsSidePieces : List Atom :=
   [vsSPw, vsSProws, vsSPquot, vsSPrng, vsSPdims, vsSPkb, vsSPpush, vsSPfpw, vsSPmaps, vsSPctab,
-    vsSPlam, vsSPz, vsSPzo, vsSPal, vsSPalo, vsSPlast].flatten
+    vsSPlam, vsSPz, vsSPzo, vsSPal, vsSPalo, vsSPlast, vsSPg1, vsSPg2].flatten
 
 /-- A statement is no atom needing a side condition, or one of `vsSidePieces`. -/
 def vsSideOk : Stmt → Bool
-  | .atom a => !needsSide a || vsSidePieces.contains a
+  | .atom a => !needsSide a || vsSidePieces.any (atomEqb a)
   | _ => true
 
 theorem vs_sideCls : vsCPre.all vsSideOk = true := by decide +kernel
@@ -86,8 +104,9 @@ theorem vs_sideCls : vsCPre.all vsSideOk = true := by decide +kernel
 theorem vs_side_mem {a : Atom} (hs : Stmt.atom a ∈ vsCPre) (hn : needsSide a = true) :
     a ∈ vsSidePieces := by
   have h := List.all_eq_true.mp vs_sideCls _ hs
-  simp only [vsSideOk, hn, Bool.not_true, Bool.false_or, List.contains_iff_mem] at h
-  exact h
+  simp only [vsSideOk, hn, Bool.not_true, Bool.false_or] at h
+  obtain ⟨b, hb, he⟩ := List.any_eq_true.mp h
+  exact atomEqb_sound he ▸ hb
 
 /-! ## What the sections take -/
 
@@ -131,15 +150,15 @@ structure VsSecData (rd : Reader) (w : ℕ → E) (args : List E) : Type where
   h253 : w 253 = gen ^ d
   h276 : w 276 = gen ^ m
   /-- `ood_value`, `fp_w`, `col_eval_words`, `claim_pool`. -/
-  hood : ∃ v, LoadHolds rd (w 309) 0 v
-  hfpw : ReadsAt rd (w 334) (w 312 :: ((vsFpwFs w).squeezeN 15).1)
-  hcol : ∀ k < 153, ∃ v, LoadHolds rd (w 565) k v
+  hood : ∃ v, LoadHolds rd (w 361) 0 v
+  hfpw : ReadsAt rd (w 386) (w 364 :: ((vsFpwFs w).squeezeN 15).1)
+  hcol : ∀ k < 153, ∃ v, LoadHolds rd (w 617) k v
   hpool : ∀ k ∈ [0, 1, 2, 3, 157, 158], ∃ v, LoadHolds rd (w 6) k v
   /-- The ring map's nonce, challenges and `c_table`. -/
   nonce : E
-  hnonce : LoadHolds rd (w 578) 0 nonce
-  hmaps : ReadsAt rd (w 814) (vsRchs (vsKCap w) nonce)
-  hct : ReadsAt rd (w 815) (ringCoefficients ((vsRchs (vsKCap w) nonce).take 8)
+  hnonce : LoadHolds rd (w 630) 0 nonce
+  hmaps : ReadsAt rd (w 918) (vsRchs (vsKCap w) nonce)
+  hct : ReadsAt rd (w 919) (ringCoefficients ((vsRchs (vsKCap w) nonce).take 8)
     ((vsRchs (vsKCap w) nonce).drop 8))
   /-- `zeta`, `bc_point` and the deferred claim's cells. -/
   zs : List E
@@ -147,8 +166,15 @@ structure VsSecData (rd : Reader) (w : ℕ → E) (args : List E) : Type where
   hz : ReadsAt rd (w 254) zs
   al : List E
   hall : al.length = 4
-  hal : ReadsAt rd (w 553) al
-  hout : ReadsAt rd (args.getD 5 0) (zs.take 19 ++ al ++ [w 563])
+  hal : ReadsAt rd (w 605) al
+  hout : ReadsAt rd (args.getD 5 0) (zs.take 19 ++ al ++ [w 615])
+  /-- The window tables at `g_squares·g^WIN_TAB_AT`; the inlined grinds' windows, the honest ones
+  of their words, which pass. -/
+  hwt : WinTabs rd (args.getD 4 0 * gen ^ winTabAt)
+  hgw1 : ∀ j ≤ gcW 15, w (301 + j) = gcWin 15 (cellsOfState (vsOodSt rd w args (ws.getD 10 0)) false 1) j
+  hpow1 : ((cellsOfState (vsOodSt rd w args (ws.getD 10 0)) false 1).limb 0).lane.toNat % 2 ^ 15 = 0
+  hgw2 : ∀ j ≤ gcW 13, w (653 + j) = gcWin 13 (cellsOfState (vsMapSt (vsKCap w) nonce) false 1) j
+  hpow2 : ((cellsOfState (vsMapSt (vsKCap w) nonce) false 1).limb 0).lane.toNat % 2 ^ 13 = 0
 
 /-! ## Helpers -/
 
@@ -160,9 +186,9 @@ theorem vs_rdAt_of_load {rd : Reader} {p : E} {k : ℕ} {v : E} (h : LoadHolds r
     rdAt rd p k = v := by
   unfold rdAt; rw [h.2]; rfl
 
-theorem vsSPw_notS : ∀ k < 11, Atom.load (.n (vsWv11 k)) (.n 25) k ∉ vsSL := by decide +kernel
+theorem vsSPw_notS : ∀ k < 11, Atom.load (.n (vsWv11 k)) (.n (val% «verify_sub» "stream")) k ∉ vsSL := by decide +kernel
 
-theorem vsSPdims_notS : ∀ t < 6, Atom.load (.n (86 + t)) (.n 71) (1 + t) ∉ vsSL := by
+theorem vsSPdims_notS : ∀ t < 6, Atom.load (.n ((val% «verify_sub» "kb[2]") + t)) (.n (val% «verify_sub» "dims_g")) (1 + t) ∉ vsSL := by
   decide +kernel
 
 theorem vsSPpush_notS : ∀ b < 54,
@@ -231,12 +257,12 @@ variable {rd : Reader} {w : ℕ → E} {args : List E}
 
 local notation "ς" => vsσ rd w args
 
-theorem vs_param4 (hl : args.length = 6) : ς (.n 4) = args.getD 4 0 := vsC_param hl (by omega)
-theorem vs_param5 (hl : args.length = 6) : ς (.n 5) = args.getD 5 0 := vsC_param hl (by omega)
+theorem vs_param4 (hl : args.length = 6) : ς (.n (val% «verify_sub» "g_squares")) = args.getD 4 0 := vsC_param hl (by omega)
+theorem vs_param5 (hl : args.length = 6) : ς (.n (val% «verify_sub» "defer_out")) = args.getD 5 0 := vsC_param hl (by omega)
 
 /-- `kb` in the frame: `1`, `g^logMem`, `dims_g[1 .. 6]`. -/
 theorem vs_kbV (D : VsSecData rd w args) :
-    ∀ i < 8, ς (.n (84 + i)) = (1 :: w 72 :: D.hsW).getD i 0 := by
+    ∀ i < 8, ς (.n ((val% «verify_sub» "kb[0]") + i)) = (1 :: w 72 :: D.hsW).getD i 0 := by
   obtain ⟨h65, -, -, h72, -, -, -, -, h84, h85, h86⟩ :=
     vs_sizesV (rd := rd) (w := w) D.hl D.hr1 D.hlm1 D.h64 D.h72
   intro i hi
@@ -301,7 +327,7 @@ theorem vsSPdims_holds (D : VsSecData rd w args) :
     ∀ a ∈ vsSPdims, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
   intro a ha hs
   have hg := vs_goodS (rd := rd) (w := w) D.hl hs
-  have e71 : ς (.n 71) = w 71 := vs_w D.hl (by decide)
+  have e71 : ς (.n (val% «verify_sub» "dims_g")) = w 71 := vs_w D.hl (by decide)
   simp only [vsSPdims, List.mem_cons, List.mem_map, List.mem_range] at ha
   rcases ha with rfl | rfl | ⟨t, ht, rfl⟩
   · refine vs_ld_store (vs_w D.hl (by decide)) ?_
@@ -335,15 +361,15 @@ theorem vsSPfpw_holds (D : VsSecData rd w args) :
   intro a ha _
   obtain ⟨i, hi, rfl⟩ := List.mem_map.1 ha
   rw [List.mem_range] at hi
-  have hlen : (w 312 :: ((vsFpwFs w).squeezeN 15).1).length = 16 := by
+  have hlen : (w 364 :: ((vsFpwFs w).squeezeN 15).1).length = 16 := by
     simp [vs_squeezeN_length]
   have hr := vs_rdg D.hfpw (k := i) (by omega)
-  rw [← vs_w (rd := rd) (w := w) (args := args) D.hl (a := 334) (by decide)] at hr
+  rw [← vs_w (rd := rd) (w := w) (args := args) D.hl (a := 386) (by decide)] at hr
   refine vs_ld_store ?_ hr
   rcases i with _ | i
   · exact vs_w D.hl (by decide)
   · simp only [Nat.add_one_ne_zero, ↓reduceIte, List.getD_cons_succ]
-    rw [show 322 + 13 * (i + 1) = 335 + 13 * i by omega]
+    rw [show 374 + 13 * (i + 1) = 387 + 13 * i by omega]
     exact (vs_fpw (rd := rd) (w := w) D.hl).1 i (by omega)
 
 theorem vsRchs_length (cap : List E) (n : E) : (vsRchs cap n).length = 16 := by
@@ -351,7 +377,7 @@ theorem vsRchs_length (cap : List E) (n : E) : (vsRchs cap n).length = 16 := by
 
 theorem vsSPmaps_holds (D : VsSecData rd w args) :
     ∀ a ∈ vsSPmaps, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
-  obtain ⟨-, -, -, hch, -⟩ := vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce
+  obtain ⟨-, -, hch, -⟩ := vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce
   intro a ha hs
   simp only [vsSPmaps, List.mem_cons, List.mem_map, List.mem_range] at ha
   rcases ha with rfl | ⟨i, hi, rfl⟩
@@ -363,7 +389,7 @@ theorem vsSPmaps_holds (D : VsSecData rd w args) :
 
 theorem vsSPctab_holds (D : VsSecData rd w args) :
     ∀ a ∈ vsSPctab, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
-  obtain ⟨-, -, -, hch, -⟩ := vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce
+  obtain ⟨-, -, hch, -⟩ := vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce
   intro a ha _
   obtain ⟨b, hb, ha⟩ := List.mem_flatMap.1 ha
   obtain ⟨p, hp, rfl⟩ := List.mem_map.1 ha
@@ -373,7 +399,7 @@ theorem vsSPctab_holds (D : VsSecData rd w args) :
   generalize vsRchs (vsKCap w) D.nonce = R at hch hct hR
   have ht8 : (R.take 8).length = 8 := by simp [hR]
   refine vs_ld_store (vs_ctabV D.hl hb p hp) ?_
-  rw [hch p (by omega), hch (8 + b) (by omega), vs_w D.hl (a := 815) (by decide)]
+  rw [hch p (by omega), hch (8 + b) (by omega), vs_w D.hl (a := 919) (by decide)]
   have hr := vs_rdg hct (k := 8 * p + b)
     (by rw [ringCoefficients_eq ht8]; simp [List.length_flatMap, hR]; omega)
   rw [ringCoefficients_eq ht8, vs_getD_flatMap8 (fun q ↦ by simp [hR]) 8 p b hp hb] at hr
@@ -399,16 +425,16 @@ theorem vsSPlam_holds (D : VsSecData rd w args) :
       unfold vsClaimAt
       split_ifs with h
       · obtain ⟨v, hv⟩ := D.hcol (vsKept i - 4) (by omega)
-        exact ⟨v, by rw [vs_w D.hl (a := 565) (by decide)]; exact hv⟩
+        exact ⟨v, by rw [vs_w D.hl (a := 617) (by decide)]; exact hv⟩
       · obtain ⟨v, hv⟩ := D.hpool (vsKept i) (by
           simp only [List.mem_cons, List.not_mem_nil, or_false]; omega)
         exact ⟨v, by rw [vs_w D.hl (a := 6) (by decide)]; exact hv⟩
     obtain ⟨v, hv⟩ := hex
     exact vs_ld_new (vs_goodS D.hl hs) (vsLamT_notS i hi) hv
 
-theorem vsSPz_notS : ∀ k < 19, Atom.load (.n (1893 + k)) (.n 254) k ∉ vsSL := by decide +kernel
+theorem vsSPz_notS : ∀ k < 19, Atom.load (.n ((val% «verify_sub» "s79.u0.s0#0") + k)) (.n (val% «verify_sub» "zeta")) k ∉ vsSL := by decide +kernel
 
-theorem vsSPal_notS : ∀ k < 4, Atom.load (.n (1912 + k)) (.n 553) k ∉ vsSL := by decide +kernel
+theorem vsSPal_notS : ∀ k < 4, Atom.load (.n ((val% «verify_sub» "s80.u0.s0#0") + k)) (.n (val% «verify_sub» "bc_point")) k ∉ vsSL := by decide +kernel
 
 theorem vsSPz_holds (D : VsSecData rd w args) :
     ∀ a ∈ vsSPz, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
@@ -427,8 +453,8 @@ theorem vsSPal_holds (D : VsSecData rd w args) :
     (by rw [vs_w D.hl (by decide)]; exact vs_rdg D.hal (by have := D.hall; omega))
 
 theorem vs_zv (D : VsSecData rd w args) {k : ℕ} (hk : k < 19) :
-    ς (.n (1893 + k)) = D.zs.getD k 0 := by
-  have hm : Stmt.atom (.load (.n (1893 + k)) (.n 254) k) ∈ vsTailP := by
+    ς (.n (1997 + k)) = D.zs.getD k 0 := by
+  have hm : Stmt.atom (.load (.n (1997 + k)) (.n (val% «verify_sub» "zeta")) k) ∈ vsTailP := by
     rw [vsTailP]
     exact List.mem_append_left _ (List.mem_append_left _ (List.mem_append_right _
       (List.mem_flatMap.2 ⟨k, List.mem_range.2 hk, List.mem_cons_self⟩)))
@@ -436,15 +462,15 @@ theorem vs_zv (D : VsSecData rd w args) {k : ℕ} (hk : k < 19) :
     (by rw [vs_w D.hl (by decide)]; exact vs_rdg D.hz (by have := D.hzl; omega))
 
 theorem vs_alv (D : VsSecData rd w args) {k : ℕ} (hk : k < 4) :
-    ς (.n (1912 + k)) = D.al.getD k 0 := by
-  have hm : Stmt.atom (.load (.n (1912 + k)) (.n 553) k) ∈ vsTailP := by
+    ς (.n (2016 + k)) = D.al.getD k 0 := by
+  have hm : Stmt.atom (.load (.n (2016 + k)) (.n (val% «verify_sub» "bc_point")) k) ∈ vsTailP := by
     rw [vsTailP]
     exact List.mem_append_left _ (List.mem_append_right _
       (List.mem_flatMap.2 ⟨k, List.mem_range.2 hk, List.mem_cons_self⟩))
   exact vsg_read (vsTailP_good D.hl _ hm) (vsSPal_notS k hk)
     (by rw [vs_w D.hl (by decide)]; exact vs_rdg D.hal (by have := D.hall; omega))
 
-theorem vs_outLen (D : VsSecData rd w args) : (D.zs.take 19 ++ D.al ++ [w 563]).length = 24 := by
+theorem vs_outLen (D : VsSecData rd w args) : (D.zs.take 19 ++ D.al ++ [w 615]).length = 24 := by
   have := D.hzl; have := D.hall
   simp; omega
 
@@ -469,7 +495,7 @@ theorem vsSPout_holds (D : VsSecData rd w args) :
     rwa [List.getD_append _ _ _ _ (by rw [List.length_append, List.length_take]; omega),
       List.getD_append_right _ _ _ _ (by rw [List.length_take]; omega),
       show 19 + k - (D.zs.take 19).length = k by rw [List.length_take]; omega] at hr
-  · refine vs_ld_store (vs_w D.hl (a := 563) (by decide)) ?_
+  · refine vs_ld_store (vs_w D.hl (a := 615) (by decide)) ?_
     have hr := vs_rdg D.hout (k := 23) (by rw [vs_outLen]; omega)
     rw [h5]
     rwa [List.getD_append_right _ _ _ _ (by rw [List.length_append, List.length_take]; omega),
@@ -477,13 +503,35 @@ theorem vsSPout_holds (D : VsSecData rd w args) :
         rw [List.length_append, List.length_take]; omega] at hr
 
 /-- **Every atom needing a side condition holds.** -/
+theorem vsSPg1_holds (D : VsSecData rd w args) :
+    ∀ a ∈ vsSPg1, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
+  intro a ha _
+  have c1 := (vs_ood (rd := rd) (w := w) D.hl D.hws).2.1
+  have H := gcInlineO_holds_of_good (C := fun _ _ _ ↦ True) (kret := fun _ ↦ True) (by decide)
+    (by decide) (by decide) (vsOodGrind_good D.hl) (by decide +kernel)
+    (gcRc_of_lowDef (by have := D.hκ; omega) D.hlow) (by rw [vs_param4 (rd := rd) (w := w) D.hl]; exact D.hwt)
+    (fun j hj ↦ by rw [c1]; exact D.hgw1 j hj) (by rw [c1]; exact D.hpow1) (next := True) trivial
+  exact ((holdsList_atoms (C := fun _ _ _ ↦ True) (rd := rd) (σ := ς)
+    (gcInlineOT_atoms 15 301 winTabAt _ _) True (fun _ ↦ True)).1 H).1 a (vs_mem_atomsOf ha)
+
+theorem vsSPg2_holds (D : VsSecData rd w args) :
+    ∀ a ∈ vsSPg2, Stmt.atom a ∈ vsCPre → a.Holds rd ς := by
+  intro a ha _
+  have c1 := (vs_maps (rd := rd) (w := w) (args := args) D.hl D.hnonce).2.1
+  have H := gcInlineO_holds_of_good (C := fun _ _ _ ↦ True) (kret := fun _ ↦ True) (by decide)
+    (by decide) (by decide) (vsRingGrind_good D.hl) (by decide +kernel)
+    (gcRc_of_lowDef (by have := D.hκ; omega) D.hlow) (by rw [vs_param4 (rd := rd) (w := w) D.hl]; exact D.hwt)
+    (fun j hj ↦ by rw [c1]; exact D.hgw2 j hj) (by rw [c1]; exact D.hpow2) (next := True) trivial
+  exact ((holdsList_atoms (C := fun _ _ _ ↦ True) (rd := rd) (σ := ς)
+    (gcInlineOT_atoms 13 653 winTabAt _ _) True (fun _ ↦ True)).1 H).1 a (vs_mem_atomsOf ha)
+
 theorem vs_sideHolds (D : VsSecData rd w args) :
     ∀ a, Stmt.atom a ∈ vsCPre → needsSide a = true → a.Holds rd ς := by
   intro a hs hn
   obtain ⟨l, hl, ha⟩ := List.mem_flatten.1 (vs_side_mem hs hn)
   simp only [List.mem_cons, List.not_mem_nil, or_false] at hl
   rcases hl with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl |
-    rfl | rfl | rfl
+    rfl | rfl | rfl | rfl | rfl
   · exact vsSPw_holds D a ha hs
   · exact vsSProws_holds D a ha hs
   · exact vsSPquot_holds D a ha hs
@@ -500,6 +548,8 @@ theorem vs_sideHolds (D : VsSecData rd w args) :
   · exact vsSPal_holds D a ha hs
   · exact vsSPout_holds D a (List.mem_append_left _ (List.mem_append_right _ ha)) hs
   · exact vsSPout_holds D a (List.mem_append_right _ ha) hs
+  · exact vsSPg1_holds D a ha hs
+  · exact vsSPg2_holds D a ha hs
 
 /-! ## The dispatches -/
 
@@ -508,7 +558,7 @@ def vsDispOf : Stmt → Option (V × ℕ)
   | .dispatch x fs _ _ => some (x, fs.length)
   | _ => none
 
-theorem vs_disps : vsCPre.filterMap vsDispOf = [(.n 278, 11), (.n 321, 14), (.n 278, 11)] := by
+theorem vs_disps : vsCPre.filterMap vsDispOf = [(.n (val% «verify_sub» "size_sel"), 11), (.n (val% «verify_sub» "bus_grind"), 14), (.n (val% «verify_sub» "size_sel"), 11)] := by
   decide +kernel
 
 /-- **The dispatches' indices**: `g^(m - 20)` (twice) and `g^(d - 20)`. -/

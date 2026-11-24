@@ -96,6 +96,7 @@ impl FnLower<'_> {
             let base = Abi::arg(shapes.iter().copied(), i);
             match shapes.get(i).copied().unwrap_or(Shape::Scalar) {
                 Shape::StackBuf(n) => {
+                    self.check_bound(a);
                     let (src, len) = self.stack_of(a).unwrap_or_else(|| {
                         self.fail(format!(
                             "`{callee}` parameter {i} is a StackBuf({n}); pass one, got `{a:?}`"
@@ -126,23 +127,11 @@ impl FnLower<'_> {
             let one = self.one();
             self.set(entry, KVal::Entry(callee.to_string()));
             for &(off, ao) in &arg_offs {
-                self.emit(LOp::MulNextFrame { a: ao, b: one, c: off });
+                self.copy_next_frame(ao, one, off);
             }
-            self.emit(LOp::MulNextFrame {
-                a: nfp,
-                b: one,
-                c: Abi::end(callee_arg_cells, 0),
-            });
-            self.emit(LOp::MulNextFrame {
-                a: 1,
-                b: one,
-                c: Abi::RET_FP,
-            });
-            self.emit(LOp::MulNextFrame {
-                a: 0,
-                b: one,
-                c: Abi::RET_PC,
-            });
+            self.copy_next_frame(nfp, one, Abi::end(callee_arg_cells, 0));
+            self.copy_next_frame(1, one, Abi::RET_FP);
+            self.copy_next_frame(0, one, Abi::RET_PC);
             self.emit(LOp::Jump { oc, od: entry, of: nfp });
             return;
         }
@@ -163,17 +152,16 @@ impl FnLower<'_> {
                     start,
                 },
             };
-            self.pending.push(Hint::AllocLoopFrames {
+            let callee = callee.to_string();
+            self.reserve(Hint::AllocLoopFrames {
                 ptr: nfp,
-                callee: callee.to_string(),
+                callee,
                 count,
                 tail: Abi::end(callee_arg_cells, 0) + 1,
             });
         } else {
-            self.pending.push(Hint::AllocFrame {
-                ptr: nfp,
-                callee: callee.to_string(),
-            });
+            let callee = callee.to_string();
+            self.reserve(Hint::AllocFrame { ptr: nfp, callee });
         }
         for &(off, ao) in &arg_offs {
             self.deref(nfp, off, ao, DerefMode::Cell);
@@ -232,15 +220,13 @@ impl FnLower<'_> {
         let n_args = rt_args.len() as u32;
         // The join below reads one return cell per bound name, so every callee has
         // to declare exactly that many. Unchecked, a name past a callee's arity
-        // `DEREF`s a frame offset nothing on that path writes, and since the shared
-        // frame is sized to the LARGEST callee the offset exists: the surplus name
+        // `DEREF`s a frame offset nothing on that path writes: the surplus name
         // binds a prover-chosen word. The non-fused path enforces this
         // ([`Self::call_into`]), so leaving it out here means one source is rejected
         // by one lowering of `match` and silently miscompiled by the other.
         for callee in callees {
-            // Arguments for the same reason as returns below: the shared frame
-            // is sized to the largest callee, so a callee expecting more than
-            // the arms supply reads a cell that exists and nothing writes.
+            // Arguments for the same reason as returns below: a callee expecting
+            // more than the arms supply reads a cell nothing writes.
             let Some(def) = self.callee_def(callee) else {
                 continue;
             };
@@ -275,10 +261,12 @@ impl FnLower<'_> {
         let one = self.one();
 
         let nfp = self.fresh();
-        self.pending.push(Hint::AllocFrameMax {
+        let arm = Hint::AllocArm {
             ptr: nfp,
+            sel: xo,
             callees: callees.to_vec(),
-        });
+        };
+        self.reserve(arm);
         for (i, &ao) in arg_offs.iter().enumerate() {
             self.deref(
                 nfp,
@@ -348,6 +336,7 @@ impl FnLower<'_> {
             }
             // A declared run is checked as a real call checks it ([`Self::lower_call`]).
             if let Shape::StackBuf(n) = p.shape() {
+                self.check_bound(a);
                 match self.stack_of(a) {
                     Some((_, len)) if len == n => {}
                     Some((_, len)) => self.fail(format!(
@@ -452,6 +441,7 @@ impl FnLower<'_> {
             ret += shape.cells();
         }
         let one = self.one();
+        self.returns.push(self.code.len());
         self.emit(LOp::Jump { oc: one, od: 0, of: 1 });
     }
 

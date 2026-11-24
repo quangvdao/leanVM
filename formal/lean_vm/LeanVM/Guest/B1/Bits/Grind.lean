@@ -7,17 +7,22 @@
 module
 
 public import LeanVM.Guest.B1.Bits.GrindData
+public import LeanVM.Guest.B1.Sig.Frame
 
 /-!
 # `grind_check` (TRIAGE #21)
 
-`grind_check__L{b}` is `gcBodyT b` (`grind_check_found`). Soundness: each window is `g^e` with
+On `gcPre b`, `grind_check`'s expansion (`holds_gcPre`). Soundness: each window is `g^e` with
 `e` below its width (`rc_sound`, the range check on a memory image of `2^κ ≥ 2^11` words), the
 table reads it as `E(e)` (`winTab_read`), and Horner's rule in `x^11` does not reduce, so the
 running value after step `i` is `E(V)` with `V < 2^(top + 11 i)` (`gc_acc`); shifted by `x^b` it
 is `E(2^b·N)`, and the final split (`split_iff`) makes it the word's low limb. Completeness: the
 windows of the low limb above bit `b` (`gcVals`), the range checks' complements and touched words
 chosen (`rcWit`).
+
+Inlined (`gcInlineT b o w tabs`, `holds_gcInlineT`): `gcInline_sound`, the word passes the proof of
+work; `gcInline_complete_of`, the expansion holds on every valuation that is the honest one
+(`gcVals`) on its own values `o ..< o + gcLen b - 2`, wherever the windows' range checks pass.
 -/
 
 namespace LeanVM.Guest.B1
@@ -107,14 +112,24 @@ def GcTailOk (σ : Val) (W b : ℕ) : Prop :=
     σ (.n (10 * W + 15)) = σ (.n (10 * W + 8)) * σ (.n (10 * W + 14)) ∧
     IsInK (σ (.n (10 * W + 13))) ∧ IsInK (σ (.n (10 * W + 15)))
 
-theorem holds_gcBodyT {C : CallRel} {rd : Reader} {σ : Val} (b : ℕ) (rets : List E) :
-    Stmt.HoldsList C rd σ (gcBodyT b) False (fun rs => rs = rets) ↔
+theorem holds_gcPre {C : CallRel} {rd : Reader} {σ : Val} (b : ℕ) (next : Prop)
+    (kret : List E → Prop) :
+    Stmt.HoldsList C rd σ (gcPre b) next kret ↔
       GcHeadOk rd σ (gcW b) (gcTop b) ∧
-        (∀ i < gcW b, GcIterOk rd σ (gcW b) (i + 1)) ∧ GcTailOk σ (gcW b) b ∧ [] = rets := by
-  rw [gcBodyT, holdsList_append, holdsList_append,
+        (∀ i < gcW b, GcIterOk rd σ (gcW b) (i + 1)) ∧ GcTailOk σ (gcW b) b ∧ next := by
+  rw [gcPre, holdsList_append, holdsList_append,
     holdsList_range_flatten _ _ (fun i => rfl)]
-  simp only [gcHead, gcTail, GcHeadOk, GcTailOk, holds_gcIterAt, Stmt.HoldsList, Stmt.Holds,
-    Atom.Holds, List.map_nil, true_and, and_true, and_assoc]
+  simp only [gcHead, gcTailPre, GcHeadOk, GcTailOk, holds_gcIterAt, Stmt.HoldsList, Stmt.Holds,
+    Atom.Holds, true_and, and_true, and_assoc]
+
+/-- **Inlined**: the expansion's blocks on the caller's valuation through the renaming. -/
+theorem holds_gcInlineT {C : CallRel} {rd : Reader} {σ : Val} (b o : ℕ) (w tabs : V) (next : Prop)
+    (kret : List E → Prop) :
+    Stmt.HoldsList C rd σ (gcInlineT b o w tabs) next kret ↔
+      GcHeadOk rd (σ ∘ gcRen o w tabs) (gcW b) (gcTop b) ∧
+        (∀ i < gcW b, GcIterOk rd (σ ∘ gcRen o w tabs) (gcW b) (i + 1)) ∧
+          GcTailOk (σ ∘ gcRen o w tabs) (gcW b) b ∧ next := by
+  rw [gcInlineT, Stmt.holdsList_rename, holds_gcPre]
 
 /-! ## Soundness -/
 
@@ -209,7 +224,7 @@ noncomputable def gcIterVal (rd : Reader) (b : ℕ) (w tabs : E) (i r : ℕ) : E
   | 7 => eOfNat (gcV b w i % 2 ^ 11)
   | _ => eOfNat (gcV b w i)
 
-/-- The tail's honest values, by offset. -/
+/-- The tail's honest values, by offset, and `0` past the expansion (`gcVals_len`). -/
 def gcTailVal (b : ℕ) (w : E) (r : ℕ) : E :=
   match r with
   | 0 => word (2 ^ b) 0
@@ -218,9 +233,10 @@ def gcTailVal (b : ℕ) (w : E) (r : ℕ) : E :=
   | 3 => word 2 1
   | 4 => (w + eOfNat (gcV b w (gcW b)) * word (2 ^ b) 0) * word 2 1
   | 5 => word (2 ^ b) 0
-  | _ => eOfNat (gcV b w (gcW b)) * word (2 ^ b) 0
+  | 6 => eOfNat (gcV b w (gcW b)) * word (2 ^ b) 0
+  | _ => 0
 
-/-- **The honest valuation of `grind_check__L{b}`** on the word `w` and the table `tabs`. -/
+/-- **The honest valuation of `grind_check` inlined at `b` bits** on the word `w` and the table `tabs`. -/
 noncomputable def gcVals (rd : Reader) (b : ℕ) (w tabs : E) (k : ℕ) : E :=
   if k = 0 then w
   else if k = 1 then tabs
@@ -259,6 +275,18 @@ theorem gv_tail {r : ℕ} : gcVals rd b w tabs (10 * gcW b + 9 + r) = gcTailVal 
     ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega),
     ite_eq_right (by omega), ite_eq_right (by omega), show 10 * gcW b + 9 + r - (10 * gcW b + 9) = r by omega]
 
+/-- The top window. -/
+theorem gv_top : gcVals rd b w tabs (gcW b + 2) = gen ^ gcV b w 0 := by
+  unfold gcVals
+  rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_left rfl]
+
+/-- The top window's table read's pointer. -/
+theorem gv_top_ptr : gcVals rd b w tabs (gcW b + 7) = tabs * gen ^ gcV b w 0 := by
+  unfold gcVals
+  rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega),
+    ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega),
+    ite_eq_left rfl]
+
 /-- The running value after step `i`. -/
 theorem gv_acc {i : ℕ} (h : i ≤ gcW b) :
     gcVals rd b w tabs (gcW b + 9 * i + 8) = eOfNat (gcV b w i) := by
@@ -269,6 +297,11 @@ theorem gv_acc {i : ℕ} (h : i ≤ gcW b) :
       ite_eq_left (by omega)]
   · rw [gv_iter hi h (by omega)]
     rfl
+
+/-- The honest valuation is `0` at the first value past the expansion. -/
+theorem gcVals_len : gcVals rd b w tabs (gcLen b) = 0 := by
+  rw [gcLen, show 10 * gcW b + 16 = 10 * gcW b + 9 + 7 by ring, gv_tail]
+  rfl
 
 end Eval
 
@@ -282,6 +315,12 @@ theorem gcV_pred {b : ℕ} (w : E) {i : ℕ} (h1 : 1 ≤ i) (h2 : i ≤ gcW b) :
 
 theorem gcV_lt {b : ℕ} (w : E) (i : ℕ) : gcV b w i < 2 ^ 64 :=
   lt_of_le_of_lt (Nat.div_le_self _ _) (kToNat_lt _)
+
+/-- The top window fits its width. -/
+theorem gcV_zero_lt {b : ℕ} (hsum : b + 11 * gcW b + gcTop b = 64) (w : E) : gcV b w 0 < 2 ^ gcTop b := by
+  unfold gcV
+  rw [Nat.div_lt_iff_lt_mul (by positivity), ← pow_add, Nat.sub_zero, show gcTop b + (b + 11 * gcW b) = 64 by omega]
+  exact kToNat_lt _
 
 /-- **`grind_check` is complete** on any memory where the windows' range checks pass: the honest
 valuation meets every block. -/
@@ -297,18 +336,12 @@ theorem gc_complete_of {rd : Reader}
   obtain ⟨hT1, hT, hsum⟩ := hs
   have ev : ∀ k, σ (.n k) = gcVals rd b w tabs k := fun _ => rfl
   have hlow' : kToNat (w.limb 0) % 2 ^ b = 0 := hlow
-  have hV0 : gcV b w 0 < 2 ^ gcTop b := by
-    unfold gcV
-    rw [Nat.div_lt_iff_lt_mul (by positivity), ← pow_add, Nat.sub_zero,
-      show gcTop b + (b + 11 * gcW b) = 64 by omega]
-    exact kToNat_lt _
+  have hV0 := gcV_zero_lt hsum w
   have hV0' : gcV b w 0 < 2 ^ 11 := lt_of_lt_of_le hV0 (Nat.pow_le_pow_right (by decide) hT)
   refine ⟨?_, fun i hi => ?_, ?_⟩
   · obtain ⟨y, t1, t2, r1, r2, r3⟩ := hrc _ hT _ hV0
     have hrc := rcWit_spec (rd := rd) ⟨y, t1, t2, r1, r2, r3⟩
-    have e2 : σ (.n (gcW b + 2)) = gen ^ gcV b w 0 := by
-      rw [ev]; unfold gcVals
-      rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_left rfl]
+    have e2 : σ (.n (gcW b + 2)) = gen ^ gcV b w 0 := gv_top
     have e3 : σ (.n (gcW b + 3)) = wBound (gcTop b) := by
       rw [ev]; unfold gcVals
       rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_left rfl]
@@ -324,10 +357,7 @@ theorem gc_complete_of {rd : Reader}
       rw [ev]; unfold gcVals
       rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega),
         ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_left rfl]
-    have e7 : σ (.n (gcW b + 7)) = tabs * gen ^ gcV b w 0 := by
-      rw [ev]; unfold gcVals
-      rw [ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega),
-        ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_right (by omega), ite_eq_left rfl]
+    have e7 : σ (.n (gcW b + 7)) = tabs * gen ^ gcV b w 0 := gv_top_ptr
     have e8 : σ (.n (gcW b + 8)) = eOfNat (gcV b w 0) := by
       rw [ev, show gcW b + 8 = gcW b + 9 * 0 + 8 by ring]; exact gv_acc (i := 0) (by omega)
     have e1 : σ (.n 1) = tabs := by rw [ev]; unfold gcVals; rw [ite_eq_right (by omega), ite_eq_left rfl]
@@ -384,41 +414,80 @@ theorem gc_complete_of {rd : Reader}
     · show IsInK (eOfNat (gcV b w (gcW b)) * word (2 ^ b) 0)
       rw [hL]; exact hsp.1
 
-/-- **`grind_check` is complete** on a memory image of `2^κ ≥ 2^11` words. -/
-theorem gc_complete {κ : ℕ} (hκ : κ ≤ 32) (hκ11 : 11 ≤ κ) (L : MemoryImage κ) {b : ℕ}
-    (hs : 1 ≤ gcTop b ∧ gcTop b ≤ 11 ∧ b + 11 * gcW b + gcTop b = 64) (hW : 1 ≤ gcW b)
-    {w tabs : E} (ht : WinTabs L.read tabs) (hlow : ((w.limb 0).lane.toNat % 2 ^ b = 0)) :
-    let σ : Val := fun v => gcVals L.read b w tabs v.idx
-    GcHeadOk L.read σ (gcW b) (gcTop b) ∧ (∀ i < gcW b, GcIterOk L.read σ (gcW b) (i + 1)) ∧
-      GcTailOk σ (gcW b) b :=
-  gc_complete_of (fun _ hv _ he => rc_complete hκ L hv (by omega) he) hs hW ht hlow
+/-! ## Inlined -/
 
-/-! ## The meaning -/
+theorem gcRen_word (o : ℕ) (w tabs : V) : gcRen o w tabs (.n 0) = w := rfl
 
-/-- **`grind_check__L{b}`'s core IR is its meaning**, for every deployed grind. -/
-theorem grind_check_holds : grind_check_all_Spec := by
-  intro b hb κ hκ hκ11 L w tabs ht rets
-  obtain ⟨fn, hfind, hpar, hbody⟩ := grind_check_found b hb
-  have hs := gc_shape b hb
-  have hW : 1 ≤ gcW b := by
-    simp only [grindBitsDeployed, List.mem_cons, List.not_mem_nil, or_false] at hb
-    rcases hb with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl |
-      rfl | rfl | rfl | rfl | rfl | rfl <;> decide
-  rw [rel_iff_sem hfind, hpar, hbody]
-  simp only [holds_gcBodyT, List.map_cons, List.map_nil, MeaningGrindCheck]
-  constructor
-  · rintro ⟨σ, hp, hh, hi, htl, hr⟩
-    simp only [List.cons.injEq, and_true] at hp
-    obtain ⟨h0, h1⟩ := hp
-    refine ⟨hr.symm, ?_⟩
-    rw [← h0]
-    exact gc_sound hκ hκ11 L hs (by rw [h1]; exact ht) hh hi htl
-  · rintro ⟨hr, hlow⟩
-    obtain ⟨hh, hi, htl⟩ := gc_complete hκ hκ11 L hs hW ht hlow
-    refine ⟨fun v => gcVals L.read b w tabs v.idx, ?_, hh, hi, htl, hr.symm⟩
-    show [gcVals L.read b w tabs 0, gcVals L.read b w tabs 1] = [w, tabs]
-    unfold gcVals
-    simp
+theorem gcRen_tabs (o : ℕ) (w tabs : V) : gcRen o w tabs (.n 1) = tabs := rfl
+
+theorem gcRen_own (o : ℕ) (w tabs : V) {k : ℕ} (hk : 2 ≤ k) : gcRen o w tabs (.n k) = .n (o + k - 2) := by
+  show (if k = 0 then w else if k = 1 then tabs else .n (o + k - 2)) = _
+  simp only [show ¬ k = 0 by omega, show ¬ k = 1 by omega, ↓reduceIte]
+
+/-- A valuation holding the honest values on the expansion's own values holds them on all its values, renamed. -/
+theorem gcRen_vals {rd : Reader} {b o : ℕ} {w tabs : V} {σ : Val}
+    (hσ : ∀ k, 2 ≤ k → k < gcLen b → σ (.n (o + k - 2)) = gcVals rd b (σ w) (σ tabs) k) :
+    ∀ k < gcLen b, σ (gcRen o w tabs (.n k)) = gcVals rd b (σ w) (σ tabs) k := by
+  intro k hk
+  rcases Nat.lt_or_ge k 2 with h2 | h2
+  · rcases (show k = 0 ∨ k = 1 by omega) with rfl | rfl
+    · rw [gcRen_word]; unfold gcVals; simp
+    · rw [gcRen_tabs]; unfold gcVals; simp
+  · rw [gcRen_own o w tabs h2]; exact hσ _ h2 hk
+
+/-- **`grind_check` inlined is sound**: on a memory image of `2^κ ≥ 2^11` words whose `tabs` holds
+the windows, the word passes the proof of work. -/
+theorem gcInline_sound {C : CallRel} {κ : ℕ} (hκ : κ ≤ 32) (hκ11 : 11 ≤ κ) (L : MemoryImage κ)
+    {σ : Val} {b o : ℕ} (hb : b ∈ grindBitsDeployed) {w tabs : V} (ht : WinTabs L.read (σ tabs))
+    {next : Prop} {kret : List E → Prop}
+    (h : Stmt.HoldsList C L.read σ (gcInlineT b o w tabs) next kret) :
+    ((σ w).limb 0).lane.toNat % 2 ^ b = 0 ∧ next := by
+  obtain ⟨hh, hi, htl, hn⟩ := (holds_gcInlineT b o w tabs next kret).mp h
+  exact ⟨gc_sound hκ hκ11 L (gc_shape b hb) ht hh hi htl, hn⟩
+
+/-- **`grind_check` inlined is sound on a reader**: wherever the tables are at `tabs`, the word
+passes the proof of work. -/
+def GcSoundOn (rd : Reader) (b : ℕ) : Prop :=
+  ∀ {C : CallRel} {σ : Val} {o : ℕ} {w tabs : V} {next : Prop} {kret : List E → Prop},
+    WinTabs rd (σ tabs) → Stmt.HoldsList C rd σ (gcInlineT b o w tabs) next kret →
+      ((σ w).limb 0).lane.toNat % 2 ^ b = 0 ∧ next
+
+theorem gcSoundOn_image {κ : ℕ} (hκ : κ ≤ 32) (hκ11 : 11 ≤ κ) (L : MemoryImage κ) {b : ℕ}
+    (hb : b ∈ grindBitsDeployed) : GcSoundOn L.read b :=
+  fun ht h => gcInline_sound hκ hκ11 L hb ht h
+
+/-- **The expansion is complete** wherever the windows' range checks pass: on a valuation holding
+the honest values on its values, it holds. -/
+theorem gcPre_complete_of {C : CallRel} {rd : Reader}
+    (hrc : ∀ v ≤ 11, ∀ e < 2 ^ v, ∃ y t1 t2 : E, LoadHolds rd (gen ^ e) 0 t1 ∧
+      wBound v = gen ^ e * y ∧ LoadHolds rd y 0 t2)
+    {b : ℕ} (hb : b ∈ grindBitsDeployed) {w tabs : E} (ht : WinTabs rd tabs)
+    (hlow : ((w.limb 0).lane.toNat % 2 ^ b = 0)) {σ : Val}
+    (hσ : ∀ k < gcLen b, σ (.n k) = gcVals rd b w tabs k) {next : Prop} (hn : next)
+    {kret : List E → Prop} : Stmt.HoldsList C rd σ (gcPre b) next kret := by
+  have hv : ∀ v ∈ Stmt.valsList (gcPre b), σ v = gcVals rd b w tabs v.idx := by
+    intro v hv
+    obtain ⟨hve, hlt⟩ := of_decide_eq_true (List.all_eq_true.mp (gcPre_vals b hb) v hv)
+    rw [hve]
+    exact hσ _ hlt
+  rw [Sig.holdsList_congr (σ' := fun v => gcVals rd b w tabs v.idx) (gcPre b) hv next kret,
+    holds_gcPre]
+  obtain ⟨hh, hi, htl⟩ := gc_complete_of hrc (gc_shape b hb) (gcW_pos b hb) ht hlow
+  exact ⟨hh, hi, htl, hn⟩
+
+/-- **`grind_check` inlined is complete** wherever the windows' range checks pass: on a valuation
+holding the honest values on the expansion's own values, it holds. -/
+theorem gcInline_complete_of {C : CallRel} {rd : Reader}
+    (hrc : ∀ v ≤ 11, ∀ e < 2 ^ v, ∃ y t1 t2 : E, LoadHolds rd (gen ^ e) 0 t1 ∧
+      wBound v = gen ^ e * y ∧ LoadHolds rd y 0 t2)
+    {b o : ℕ} (hb : b ∈ grindBitsDeployed) {w tabs : V} {σ : Val} (ht : WinTabs rd (σ tabs))
+    (hlow : ((σ w).limb 0).lane.toNat % 2 ^ b = 0)
+    (hσ : ∀ k, 2 ≤ k → k < gcLen b → σ (.n (o + k - 2)) = gcVals rd b (σ w) (σ tabs) k)
+    {next : Prop} (hn : next) {kret : List E → Prop} :
+    Stmt.HoldsList C rd σ (gcInlineT b o w tabs) next kret := by
+  rw [gcInlineT, Stmt.holdsList_rename]
+  exact gcPre_complete_of hrc hb ht hlow (gcRen_vals hσ) hn
+
 
 end
 end LeanVM.Guest.B1

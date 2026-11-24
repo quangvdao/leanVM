@@ -8,14 +8,16 @@
 module
 
 public import LeanVM.Guest.B1.VerifySub.Front
-public import LeanVM.Guest.B1.Bits.Grind
+public import LeanVM.Guest.B1.VerifySub.GrindOff
 public import LeanVM.Guest.B1.Common.Run
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_sub»
 
 /-!
 # The ring map's challenges and `c_table`
 
 * `vsMapsT_holds`: the ring grind's nonce absorbed over the full queue `verify_keccak` leaves,
-  `grind_check__L13` on the permutation's cell `1`, the ground challenge and fifteen squeezes,
+  the inlined `grind_check` on the permutation's cell `1`, the ground challenge and fifteen squeezes,
   stored in `map_challenges`: from the sponge `s`, `ringSwitch` reads the nonce and returns the
   target and weight of these sixteen challenges.
 * `vsCtabT_holds`: `c_table[8p + b] = f_p · g_b^(2^(8p))`, by eight squarings per block, is
@@ -38,8 +40,8 @@ theorem vsRun5_map (b : ℕ) :
 /-! ## The ring map's challenges -/
 
 /-- `vsSqzT_holds` with the capacity left as a run. -/
-theorem vsSqzT_holds' {capb o : ℕ} (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0)
-    (h10 : σ (.n 10) = 0) (h11 : σ (.n 11) = 0)
+theorem vsSqzT_holds' {capb o : ℕ} (h8 : σ (.n (val% «verify_sub» "s3#0[1]")) = 0) (h9 : σ (.n (val% «verify_sub» "s3#0[2]")) = 0)
+    (h10 : σ (.n (val% «verify_sub» "s3#0[3]")) = 0) (h11 : σ (.n (val% «verify_sub» "s3#0[4]")) = 0)
     (h : Stmt.HoldsList C rd σ (vsSqzT capb o) next kret) :
     (⟨(vsRun capb 5).map σ, []⟩ : Fs).squeeze = (σ (.n (o + 13)), ⟨(vsRun (o + 8) 5).map σ, []⟩) ∧
       next := by
@@ -48,11 +50,11 @@ theorem vsSqzT_holds' {capb o : ℕ} (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0)
 
 /-- The block of the ring map's squeeze `i`. -/
 def vsMapSqz (i : ℕ) : List Stmt :=
-  vsSqzT (vsChCap i) (604 + 14 * i)
+  vsSqzT (vsChCap i) (708 + 14 * i)
 
 /-- **The fifteen squeezes** from the capacity at `vsChCap j`. -/
-theorem maps_chain (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0) (h10 : σ (.n 10) = 0)
-    (h11 : σ (.n 11) = 0) : ∀ (k j : ℕ) {nx : Prop},
+theorem maps_chain (h8 : σ (.n (val% «verify_sub» "s3#0[1]")) = 0) (h9 : σ (.n (val% «verify_sub» "s3#0[2]")) = 0) (h10 : σ (.n (val% «verify_sub» "s3#0[3]")) = 0)
+    (h11 : σ (.n (val% «verify_sub» "s3#0[4]")) = 0) : ∀ (k j : ℕ) {nx : Prop},
       Stmt.HoldsList C rd σ ((List.range' j k).flatMap vsMapSqz) nx kret →
       (⟨(vsRun (vsChCap j) 5).map σ, []⟩ : Fs).squeezeN k =
           ((List.range' j k).map fun i ↦ σ (.n (vsCh (i + 1))),
@@ -63,11 +65,11 @@ theorem maps_chain (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0) (h10 : σ (.n 10) =
     obtain ⟨e, h⟩ := vsSqzT_holds' h8 h9 h10 h11 h
     obtain ⟨ih, hn⟩ := maps_chain h8 h9 h10 h11 k (j + 1) h
     refine ⟨?_, hn⟩
-    have e1 : vsChCap (j + 1) = 604 + 14 * j + 8 := by simp only [vsChCap]; split <;> omega
+    have e1 : vsChCap (j + 1) = 708 + 14 * j + 8 := by simp only [vsChCap]; split <;> omega
     rw [Fs.squeezeN, e]
     dsimp only
     rw [← e1, ih, List.range'_succ, List.map_cons, show j + 1 + k = j + (k + 1) by omega,
-      show 604 + 14 * j + 13 = vsCh (j + 1) by simp only [vsCh]; omega]
+      show 708 + 14 * j + 13 = vsCh (j + 1) by simp only [vsCh]; omega]
 
 theorem loads_map {p : ℕ} (f : ℕ → ℕ) : ∀ (l : List ℕ) {nx : Prop},
     Stmt.HoldsList C rd σ (l.map fun i ↦ vsLd (f i) p i) nx kret →
@@ -81,9 +83,6 @@ theorem loads_map {p : ℕ} (f : ℕ → ℕ) : ∀ (l : List ℕ) {nx : Prop},
       · exact li
       · exact hl x hx, hn⟩
 
-theorem maps_winTabs_of {q tabs : E} (hwin : ExpWinTab rd q) (h : tabs = q * gen ^ winTabAt) :
-    WinTabs rd tabs := fun n hn ↦ by rw [h, loadHolds_mul_gen_pow]; exact hwin n hn
-
 /-- The sixteen challenges, from the sponge's ground challenge. -/
 theorem runsFromG_sample16 (cap : List E) (c : E) :
     RunsFromG (VerifierProgram.sampleChallenges 16) cap c [] (c :: ((⟨cap, []⟩ : Fs).squeezeN 15).1)
@@ -95,21 +94,21 @@ theorem runsFromG_sample16 (cap : List E) (c : E) :
       (runsTo_ret _ _))
 
 /-- **The ring map's challenges**: from the sponge `s` with a full queue, the
-nonce at the cursor `σ 578`, `ringSwitch` returns the target and weight of the sixteen challenges
+nonce at the cursor `σ 630`, `ringSwitch` returns the target and weight of the sixteen challenges
 stored at `map_challenges`. -/
 theorem vsMapsT_holds {κ : ℕ} (hκ : κ ≤ 32) (hκw : winTabBits ≤ κ) (L : MemoryImage κ)
-    (hC : CallRel.Le C (coreProgram.Rel L.read)) (hwin : ExpWinTab L.read (σ (.n 4)))
-    (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0) (h10 : σ (.n 10) = 0) (h11 : σ (.n 11) = 0)
+    (hwin : ExpWinTab L.read (σ (.n (val% «verify_sub» "g_squares"))))
+    (h8 : σ (.n (val% «verify_sub» "s3#0[1]")) = 0) (h9 : σ (.n (val% «verify_sub» "s3#0[2]")) = 0) (h10 : σ (.n (val% «verify_sub» "s3#0[3]")) = 0) (h11 : σ (.n (val% «verify_sub» "s3#0[4]")) = 0)
     {s : Fs} (hs : s.pend.length = 4)
-    (hcap : [σ (.n 573), σ (.n 574), σ (.n 575), σ (.n 576), σ (.n 577)] = capOf s.perm)
+    (hcap : [σ (.n (val% «verify_sub» "fs0@5")), σ (.n (val% «verify_sub» "fs1@5")), σ (.n (val% «verify_sub» "fs2@5")), σ (.n (val% «verify_sub» "fs3@5")), σ (.n (val% «verify_sub» "fs4@5"))] = capOf s.perm)
     (h : Stmt.HoldsList C L.read σ vsMapsT next kret) :
     ∃ chs : List E, chs.length = 16 ∧ (∀ i < 16, σ (.n (vsCh i)) = chs.getD i 0) ∧
-      ReadsAt L.read (σ (.n 814)) chs ∧ LoadHolds L.read (σ (.n 578)) 0 (σ (.n 585)) ∧
-      (∀ point sl : List E, RunsTo (ringSwitch point sl) s [σ (.n 585)]
+      ReadsAt L.read (σ (.n (val% «verify_sub» "map_challenges"))) chs ∧ LoadHolds L.read (σ (.n (val% «verify_sub» "cursor@4"))) 0 (σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))) ∧
+      (∀ point sl : List E, RunsTo (ringSwitch point sl) s [σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))]
         (ringTarget sl (chs.take ringMapWidth) (chs.drop ringMapWidth),
           fun r ↦ ringWeight point r
             (ringCoefficients (chs.take ringMapWidth) (chs.drop ringMapWidth)))
-        ⟨[σ (.n 808), σ (.n 809), σ (.n 810), σ (.n 811), σ (.n 812)], []⟩) ∧ next := by
+        ⟨[σ (.n (val% «verify_sub» "nxt[8]@35")), σ (.n (val% «verify_sub» "nxt[9]@35")), σ (.n (val% «verify_sub» "nxt[10]@35")), σ (.n (val% «verify_sub» "nxt[11]@35")), σ (.n (val% «verify_sub» "nxt[12]@35"))], []⟩) ∧ next := by
   simp only [vsMapsT, holdsList_append] at h
   rw [show List.range 5 = [0, 1, 2, 3, 4] from rfl] at h
   simp only [List.map_cons, List.map_nil] at h
@@ -117,42 +116,38 @@ theorem vsMapsT_holds {κ : ℕ} (hκ : κ ≤ 32) (hκw : winTabBits ≤ κ) (L
   simp only [Atom.Holds] at c0 c1 c2 c3 c4
   obtain ⟨⟨ln, pk⟩, h⟩ := (holds_fsNonceT _ _ _ _ _).1 h
   obtain ⟨hk, h⟩ := holds_atom1.1 h
-  obtain ⟨h619, h⟩ := vsTabsT_holds h
-  obtain ⟨hg, c603, h⟩ := h
+  obtain ⟨hpow, h⟩ := gcInlineO_sound hκ hκw L (by decide) (winTabs_of_expWinTab hwin) h
+  obtain ⟨c603, h⟩ := h
   simp only [Atom.Holds] at c603
   rw [List.range_eq_range'] at h
   obtain ⟨hsq, h⟩ := maps_chain h8 h9 h10 h11 15 0 h
   obtain ⟨-, h⟩ := h
   obtain ⟨hl, hn⟩ := loads_map vsCh (List.range 16) h
   -- the nonce's permutation
-  set S := s.nonceState (σ (.n 585)) with hS
-  have habs : s.absorb (σ (.n 585)) dsPowNonce = ⟨capOf s.perm, [(σ (.n 585), dsPowNonce)]⟩ := by
+  set S := s.nonceState (σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))) with hS
+  have habs : s.absorb (σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))) dsPowNonce = ⟨capOf s.perm, [(σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0")), dsPowNonce)]⟩ := by
     simp [Fs.absorb, hs, rateScalars]
-  have hcells : cells13 ((vsRun 588 13).map σ) = cellsOfState S false := by
+  have hcells : cells13 ((vsRun 640 13).map σ) = cellsOfState S false := by
     rw [hS, Fs.nonceState, habs]
     refine keccakA_fs hk (by simp) ?_
     have hp := fsPackT_cells pk
     simp only [List.map_cons, List.map_nil, h8, h9, h10, h11, c0, c1, c2, c3, c4]
-    rw [show [σ (.n 573), σ (.n 574), σ (.n 575), σ (.n 576), σ (.n 577)] = capOf s.perm from hcap]
+    rw [show [σ (.n (val% «verify_sub» "fs0@5")), σ (.n (val% «verify_sub» "fs1@5")), σ (.n (val% «verify_sub» "fs2@5")), σ (.n (val% «verify_sub» "fs3@5")), σ (.n (val% «verify_sub» "fs4@5"))] = capOf s.perm from hcap]
     simp only [pendCells, List.flatMap_cons, List.flatMap_nil, List.append_nil, ← hp,
       List.length_cons, List.length_nil]
     rfl
-  have hc : ∀ c : Fin 13, σ (.n (588 + c.val)) = cellsOfState S false c := fun c ↦ by
+  have hc : ∀ c : Fin 13, σ (.n (640 + c.val)) = cellsOfState S false c := fun c ↦ by
     have := congrFun hcells c
     simpa [cells13, vsRun, c.isLt] using this
-  have hc0 : σ (.n 588) = cellsOfState S false 0 := hc 0
-  have hc1 : σ (.n 589) = cellsOfState S false 1 := hc 1
+  have hc0 : σ (.n (val% «verify_sub» "nxt[0]@20")) = cellsOfState S false 0 := hc 0
+  have hc1 : σ (.n (val% «verify_sub» "nxt[1]@20")) = cellsOfState S false 1 := hc 1
   -- the grind
-  simp only [List.map_cons, List.map_nil] at hg
-  have hW : WinTabs L.read (σ (.n 602)) := maps_winTabs_of hwin h619
-  have hgm := (grind_check_holds 13 (by decide) hκ hκw L _ _ hW []).1 (hC _ _ _ hg)
-  simp only [MeaningGrindCheck] at hgm
   have hb : _root_.LeanVM.Parameters.Whir.batchGrindingBits ≠ 0 := by decide
-  have hok : s.GrindOk _root_.LeanVM.Parameters.Whir.batchGrindingBits (σ (.n 585)) := by
+  have hok : s.GrindOk _root_.LeanVM.Parameters.Whir.batchGrindingBits (σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))) := by
     refine (grindOk_iff hb _).2 ?_
     rw [← hS, ← hc1]
-    exact hgm.2
-  have g := runsToG_grind hb s (σ (.n 585)) (hok.resolve_left hb)
+    exact hpow
+  have g := runsToG_grind hb s (σ (.n (val% «verify_sub» "s63.i0:fs_grind_squeeze.s0.e.s0.e.s0#0"))) (hok.resolve_left hb)
   -- the challenges
   have hcap0 : capOf S = (vsRun (vsChCap 0) 5).map σ := by
     simp only [capOf, vsChCap, ↓reduceIte, vsRun5_map]
@@ -168,7 +163,7 @@ theorem vsMapsT_holds {κ : ℕ} (hκ : κ ≤ 32) (hκw : winTabBits ≤ κ) (L
       List.range_eq_range']
     rfl
   have hend : ((⟨capOf S, []⟩ : Fs).squeezeN 15).2 =
-      ⟨[σ (.n 808), σ (.n 809), σ (.n 810), σ (.n 811), σ (.n 812)], []⟩ := by
+      ⟨[σ (.n (val% «verify_sub» "nxt[8]@35")), σ (.n (val% «verify_sub» "nxt[9]@35")), σ (.n (val% «verify_sub» "nxt[10]@35")), σ (.n (val% «verify_sub» "nxt[11]@35")), σ (.n (val% «verify_sub» "nxt[12]@35"))], []⟩ := by
     rw [hcap0, hsq]
     rfl
   refine ⟨chs, by simp [chs], fun i hi ↦ by simp [chs, List.getD_eq_getElem?_getD, hi], fun k hk ↦ ?_,
@@ -210,8 +205,8 @@ theorem ctab_chain {b s : ℕ} : ∀ (k j : ℕ) {nx : Prop},
       σ (.n (vsCh (8 + b))) ^ 2 ^ (8 * j) →
     Stmt.HoldsList C rd σ ((List.range' j k).flatMap fun q ↦
       vsSqT b s q ++ [vsMul (s + 1 + 9 * q + 8) (vsCh (q + 1)) (s + 1 + 9 * q + 7),
-        vsLd (s + 1 + 9 * q + 8) 815 (8 * (q + 1) + b)]) nx kret →
-    (∀ q, j ≤ q → q < j + k → LoadHolds rd (σ (.n 815)) (8 * (q + 1) + b)
+        vsLd (s + 1 + 9 * q + 8) 919 (8 * (q + 1) + b)]) nx kret →
+    (∀ q, j ≤ q → q < j + k → LoadHolds rd (σ (.n (val% «verify_sub» "c_table"))) (8 * (q + 1) + b)
       (σ (.n (vsCh (q + 1))) * σ (.n (vsCh (8 + b))) ^ 2 ^ (8 * (q + 1)))) ∧ nx
   | 0, j, _, _, h => ⟨fun q h1 h2 ↦ absurd h2 (by omega), h⟩
   | k + 1, j, _, ha, h => by
@@ -235,13 +230,13 @@ theorem ctab_chain {b s : ℕ} : ∀ (k j : ℕ) {nx : Prop},
 
 /-- **Block `b` of `c_table`**: `c[8p + b] = f_p · g_b^(2^(8p))`. -/
 theorem ctab_block {b : ℕ} {nx : Prop} (h : Stmt.HoldsList C rd σ (vsCtabBlock b) nx kret) :
-    (∀ p < 8, LoadHolds rd (σ (.n 815)) (8 * p + b)
+    (∀ p < 8, LoadHolds rd (σ (.n (val% «verify_sub» "c_table"))) (8 * p + b)
       (σ (.n (vsCh p)) * σ (.n (vsCh (8 + b))) ^ 2 ^ (8 * p))) ∧ nx := by
   simp only [vsCtabBlock, holdsList_append] at h
   obtain ⟨m0, l0, h⟩ := h
   simp only [Atom.Holds] at m0 l0
   rw [List.range_eq_range'] at h
-  obtain ⟨hc, hn⟩ := ctab_chain (b := b) (s := 816 + 64 * b) 7 0 (by simp) h
+  obtain ⟨hc, hn⟩ := ctab_chain (b := b) (s := 920 + 64 * b) 7 0 (by simp) h
   refine ⟨fun p hp ↦ ?_, hn⟩
   rcases p with _ | q
   · rw [m0] at l0
@@ -250,7 +245,7 @@ theorem ctab_block {b : ℕ} {nx : Prop} (h : Stmt.HoldsList C rd σ (vsCtabBloc
 
 theorem ctab_blocks : ∀ (l : List ℕ) {nx : Prop},
     Stmt.HoldsList C rd σ (l.flatMap vsCtabBlock) nx kret →
-      (∀ b ∈ l, ∀ p < 8, LoadHolds rd (σ (.n 815)) (8 * p + b)
+      (∀ b ∈ l, ∀ p < 8, LoadHolds rd (σ (.n (val% «verify_sub» "c_table"))) (8 * p + b)
         (σ (.n (vsCh p)) * σ (.n (vsCh (8 + b))) ^ 2 ^ (8 * p))) ∧ nx
   | [], _, h => ⟨fun _ h ↦ absurd h (by simp), h⟩
   | b :: l, _, h => by
@@ -317,8 +312,8 @@ call of `ring_switch_target`. -/
 theorem vsCtabT_holds {chs : List E} (hl : chs.length = 16)
     (hch : ∀ i < 16, σ (.n (vsCh i)) = chs.getD i 0)
     (h : Stmt.HoldsList C rd σ vsCtabT next kret) :
-    ReadsAt rd (σ (.n 815)) (ringCoefficients (chs.take ringMapWidth) (chs.drop ringMapWidth)) ∧
-      C "ring_switch_target" [σ (.n 568), σ (.n 814)] [σ (.n 1328)] ∧ next := by
+    ReadsAt rd (σ (.n (val% «verify_sub» "c_table"))) (ringCoefficients (chs.take ringMapWidth) (chs.drop ringMapWidth)) ∧
+      C "ring_switch_target" [σ (.n (val% «verify_sub» "slices")), σ (.n (val% «verify_sub» "map_challenges"))] [σ (.n (val% «verify_sub» "target_in"))] ∧ next := by
   simp only [vsCtabT, holdsList_append] at h
   obtain ⟨-, h⟩ := h
   obtain ⟨hb, h⟩ := ctab_blocks (List.range 8) h

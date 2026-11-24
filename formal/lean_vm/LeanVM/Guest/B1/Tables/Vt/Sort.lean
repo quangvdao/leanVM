@@ -11,6 +11,8 @@ public import LeanVM.Guest.B1.Tables.Vt.SortT
 public import LeanVM.Guest.B1.Tables.GroupCert
 public import LeanVM.Guest.B1.Tables.Interface
 public import LeanVM.Guest.CoreData
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_tables»
 
 /-!
 # A side's block offsets
@@ -82,10 +84,10 @@ and size read; the running offset; and, past the first rank, the previous key `g
 this one. -/
 def VtRankFacts (rd : Reader) (σ : Val) (v0 s r : ℕ) : Prop :=
   (∃ e < 24, σ (.n (vtRv v0 r)) = gen ^ e) ∧
-    LoadHolds rd (σ (.n 12) * σ (.n (vtRv v0 r))) 212 (word s 0) ∧
-    LoadHolds rd (σ (.n 33) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtRv v0 r + 8))) ∧
-    LoadHolds rd (σ (.n 35) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtGin v0 r))) ∧
-    LoadHolds rd (σ (.n 34) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtSz v0 r))) ∧
+    LoadHolds rd (σ (.n (val% «verify_tables» "g_squares")) * σ (.n (vtRv v0 r))) 212 (word s 0) ∧
+    LoadHolds rd (σ (.n (val% «verify_tables» "group_key")) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtRv v0 r + 8))) ∧
+    LoadHolds rd (σ (.n (val% «verify_tables» "group_base")) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtGin v0 r))) ∧
+    LoadHolds rd (σ (.n (val% «verify_tables» "group_size")) * σ (.n (vtRv v0 r))) 0 (σ (.n (vtSz v0 r))) ∧
     σ (.n (vtGout v0 r)) = σ (.n (vtGin v0 r)) * σ (.n (vtSz v0 r)) ∧
     (r = 0 → σ (.n (vtGin v0 r)) = 1) ∧
     (1 ≤ r → ∃ d < 8398, σ (.n (vtRv v0 (r - 1) + 8)) = gen ^ (d + 1) * σ (.n (vtRv v0 r + 8)))
@@ -154,16 +156,16 @@ block its `stackOffsets` offset. -/
 theorem vt_side_cert {rd : Reader} {σ : Val} {n m G0 base v0 s : ℕ} (κs : List ℕ)
     (hlen : κs.length = n) (st kg grp bv : ℕ → ℕ) (hn : base + n ≤ 153)
     (hfacts : ∀ r < m, VtRankFacts rd σ v0 s r)
-    (hside : ∀ e < 24, LoadHolds rd (σ (.n 12)) (212 + e) (word (vtGroupSide e) 0))
+    (hside : ∀ e < 24, LoadHolds rd (σ (.n (val% «verify_tables» "g_squares"))) (212 + e) (word (vtGroupSide e) 0))
     (hsideS : ∀ e < 24, vtGroupSide e = s → G0 ≤ e ∧ e < G0 + m) (hs : s < 3)
-    (hkey : ∀ j < m, ∃ key, LoadHolds rd (σ (.n 33)) (G0 + j) key ∧
+    (hkey : ∀ j < m, ∃ key, LoadHolds rd (σ (.n (val% «verify_tables» "group_key"))) (G0 + j) key ∧
       key * gen ^ (base + st j) = gen ^ (kg j * 247))
-    (hsz : ∀ j < m, LoadHolds rd (σ (.n 34)) (G0 + j) (gen ^ ((st (j + 1) - st j) * 2 ^ kg j)))
+    (hsz : ∀ j < m, LoadHolds rd (σ (.n (val% «verify_tables» "group_size"))) (G0 + j) (gen ^ ((st (j + 1) - st j) * 2 ^ kg j)))
     (hkg : ∀ j < m, kg j < 34) (hrun : ∀ j < m, st j < st (j + 1))
     (hgrp : ∀ x < n, grp x < m ∧ st (grp x) ≤ x ∧ x < st (grp x + 1))
     (hgrp' : ∀ j < m, ∀ x, st j ≤ x → x < st (j + 1) → x < n ∧ grp x = j)
     (hκ : ∀ x < n, κs.getD x 0 = kg (grp x))
-    (hb0 : ∀ j < m, LoadHolds rd (σ (.n 35)) (G0 + j) (σ (.n (bv (st j)))))
+    (hb0 : ∀ j < m, LoadHolds rd (σ (.n (val% «verify_tables» "group_base"))) (G0 + j) (σ (.n (bv (st j)))))
     (hstep : ∀ x < n, st (grp x) < x →
       σ (.n (bv x)) = σ (.n (bv (x - 1))) * gen ^ 2 ^ kg (grp x)) :
     ∀ x < n, σ (.n (bv x)) = gen ^ (stackOffsets κs).1.getD x 0 := by
@@ -276,6 +278,86 @@ theorem vt_kap_lt (lm : ℕ) (τ : ℕ → ℕ) (hlm : lm ≤ 32) (hτ : ∀ t <
   · rw [vtKap, h0]; have := hle (blockKappaSrc.getD b 0); omega
   · rw [vtKap, h19, hs0]; simp
 
+/-- **A side's block offsets**, `vt_sort`'s two sides, the groups' facts as hypotheses: from
+its ranks' facts, the groups' keys and sizes, the bases and steps, every block's offset is
+`stackOffsets`'s. -/
+theorem vt_side_offsets {rd : Reader} {σ : Val} {lm : ℕ} {τ : ℕ → ℕ}
+    (hκ34 : ∀ k < 15, vtKap lm τ (vtB0 k) < 34)
+    (hG : ∀ k < 15, (∃ key, LoadHolds rd (σ (.n (val% «verify_tables» "group_key"))) (vtGi k) key ∧
+      key * gen ^ vtB0 k = gen ^ (vtKap lm τ (vtB0 k) * 247)) ∧
+      LoadHolds rd (σ (.n (val% «verify_tables» "group_size"))) (vtGi k) (gen ^ (vtLen k * 2 ^ vtKap lm τ (vtB0 k))))
+    (hB : ∀ k < 15, LoadHolds rd (σ (.n (val% «verify_tables» "group_base"))) (vtGi k)
+        (σ (.n (vtBoffData.getD k default).2.2.2)) ∧
+      σ (.n ((vtBoffData.getD k default).2.2.2 - 1)) = gen ^ 2 ^ vtKap lm τ (vtB0 k) ∧
+      ∀ i < vtLen k - 1, σ (.n ((vtBoffData.getD k default).2.2.2 + 1 + i)) =
+        σ (.n ((vtBoffData.getD k default).2.2.2 + i)) *
+          σ (.n ((vtBoffData.getD k default).2.2.2 - 1)))
+    (hsideT : ∀ e < 24, LoadHolds rd (σ (.n (val% «verify_tables» "g_squares"))) (212 + e) (word (vtGroupSide e) 0)) :
+    ∀ (base G0 kOff m n v0 s : ℕ), base + n ≤ 153 → s < 3 →
+    (∀ r < m, VtRankFacts rd σ v0 s r) →
+    (∀ e < 24, vtGroupSide e = s → G0 ≤ e ∧ e < G0 + m) →
+    (∀ j < m, kOff + j < 15 ∧ vtGi (kOff + j) = G0 + j ∧
+      vtB0 (kOff + j) = base + (blockGroupStart.getD (G0 + j) 0 - base) ∧
+      vtLen (kOff + j) = (blockGroupStart.getD (G0 + (j + 1)) 0 - base) -
+        (blockGroupStart.getD (G0 + j) 0 - base) ∧
+      blockGroupStart.getD (G0 + j) 0 - base < blockGroupStart.getD (G0 + (j + 1)) 0 - base ∧
+      blockGroupStart.getD (G0 + (j + 1)) 0 - base ≤ n ∧
+      vtBoffV (base + (blockGroupStart.getD (G0 + j) 0 - base)) =
+        (vtBoffData.getD (kOff + j) default).2.2.2) →
+    (∀ x < n, vtBk (base + x) - kOff < m ∧
+      blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base ≤ x ∧
+      x < blockGroupStart.getD (G0 + (vtBk (base + x) - kOff + 1)) 0 - base ∧
+      blockKappaSrc.getD (base + x) 0 = blockKappaSrc.getD (vtB0 (vtBk (base + x))) 0 ∧
+      blockKappaAdj (base + x) = blockKappaAdj (vtB0 (vtBk (base + x))) ∧
+      kOff + (vtBk (base + x) - kOff) = vtBk (base + x) ∧
+      (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base < x →
+        vtBoffV (base + x) = (vtBoffData.getD (vtBk (base + x)) default).2.2.2 + 1 +
+          (x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base)) ∧
+        vtBoffV (base + (x - 1)) = (vtBoffData.getD (vtBk (base + x)) default).2.2.2 +
+          (x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base)) ∧
+        x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base) <
+          vtLen (vtBk (base + x)) - 1)) →
+    (∀ j < m, ∀ x < n, blockGroupStart.getD (G0 + j) 0 - base ≤ x →
+      x < blockGroupStart.getD (G0 + (j + 1)) 0 - base → vtBk (base + x) - kOff = j) →
+    ∀ x < n, σ (.n (vtBoffV (base + x))) =
+      gen ^ (stackOffsets ((List.range n).map fun c ↦ vtKap lm τ (base + c))).1.getD x 0 := by
+  intro base G0 kOff m n v0 s hn hs hfacts hsideS D1 D2 D3
+  have hκs : ∀ x < n, ((List.range n).map fun c ↦ vtKap lm τ (base + c)).getD x 0 =
+      vtKap lm τ (base + x) := fun x hx => by
+    rw [List.getD_eq_getElem _ _ (by simp; exact hx)]; simp
+  refine vt_side_cert (G0 := G0) (base := base) _ (by simp)
+    (fun j ↦ blockGroupStart.getD (G0 + j) 0 - base)
+    (fun j ↦ vtKap lm τ (base + (blockGroupStart.getD (G0 + j) 0 - base)))
+    (fun x ↦ vtBk (base + x) - kOff) (fun x ↦ vtBoffV (base + x)) hn hfacts hsideT hsideS hs
+    (fun j hj ↦ ?_) (fun j hj ↦ ?_) (fun j hj ↦ ?_) (fun j hj ↦ (D1 j hj).2.2.2.2.1)
+    (fun x hx ↦ ⟨(D2 x hx).1, (D2 x hx).2.1, (D2 x hx).2.2.1⟩)
+    (fun j hj x h1 h2 ↦ ⟨by have := (D1 j hj).2.2.2.2.2.1; omega, D3 j hj x
+      (by have := (D1 j hj).2.2.2.2.2.1; omega) h1 h2⟩)
+    (fun x hx ↦ ?_) (fun j hj ↦ ?_) (fun x hx hlt ↦ ?_)
+  · obtain ⟨hk, hgi, hb0, -⟩ := D1 j hj
+    obtain ⟨⟨key, h1, h2⟩, -⟩ := hG _ hk
+    exact ⟨key, by rw [← hgi]; exact h1, by rw [← hb0, h2]⟩
+  · obtain ⟨hk, hgi, hb0, hl, -⟩ := D1 j hj
+    have := (hG _ hk).2
+    rwa [hgi, hl, hb0] at this
+  · obtain ⟨hk, -, hb0, -⟩ := D1 j hj
+    rw [← hb0]; exact hκ34 _ hk
+  · obtain ⟨-, -, -, hsrc', hadj', hkk, -⟩ := D2 x hx
+    have hj := (D2 x hx).1
+    obtain ⟨-, -, hb0, -⟩ := D1 _ hj
+    rw [hκs x hx, ← hb0, hkk, vtKap, vtKap, hsrc', hadj']
+  · obtain ⟨hk, hgi, -, -, -, -, hbv⟩ := D1 j hj
+    have := (hB _ hk).1
+    rw [hgi, ← hbv] at this
+    exact this
+  · obtain ⟨-, -, -, -, -, hkk, hstep⟩ := D2 x hx
+    have hj := (D2 x hx).1
+    obtain ⟨hk, -, hb0, -⟩ := D1 _ hj
+    obtain ⟨e1, e2, e3⟩ := hstep hlt
+    obtain ⟨-, hst, hch⟩ := hB _ hk
+    rw [hkk] at hst hch hb0
+    rw [e1, e2, hch _ e3, hst, hb0]
+
 section
 variable {μ : ℕ} (hμ : μ ≤ 32) (Lm : MemoryImage μ)
 include hμ
@@ -285,8 +367,8 @@ and the tables' heights and the exponent tables in place, the push side's `54` b
 count side's `45` hold `g^` the `stackOffsets` offsets of their side's log-sizes in `block_off`. -/
 theorem vt_sort {σ : Val} (h : VtH Lm.read σ) {lm : ℕ} {τ : ℕ → ℕ} (hlm : lm ≤ 32)
     (hτ : ∀ t < 6, τ t < 33)
-    (hkb : ∀ i < 8, σ (.n (25 + i)) = gen ^ ([0, lm] ++ vtTauList τ).getD i 0)
-    (hE : ExpTablesAt Lm.read (σ (.n 12))) :
+    (hkb : ∀ i < 8, σ (.n ((val% «verify_tables» "kb[0]") + i)) = gen ^ ([0, lm] ++ vtTauList τ).getD i 0)
+    (hE : ExpTablesAt Lm.read (σ (.n (val% «verify_tables» "g_squares")))) :
     (∀ x < 54, σ (.n (vtBoffV x)) =
       gen ^ (stackOffsets ((List.range 54).map (vtKap lm τ))).1.getD x 0) ∧
     (∀ x < 45, σ (.n (vtBoffV (108 + x))) =
@@ -300,9 +382,9 @@ theorem vt_sort {σ : Val} (h : VtH Lm.read σ) {lm : ℕ} {τ : ℕ → ℕ} (h
     vt_kap_lt lm τ hlm hτ (by have : ∀ k < 15, vtB0 k < 153 := by decide +kernel
                               exact this k hk)
   -- the groups' keys and sizes
-  have hG : ∀ k < 15, (∃ key, LoadHolds Lm.read (σ (.n 33)) (vtGi k) key ∧
+  have hG : ∀ k < 15, (∃ key, LoadHolds Lm.read (σ (.n (val% «verify_tables» "group_key"))) (vtGi k) key ∧
       key * gen ^ vtB0 k = gen ^ (vtKap lm τ (vtB0 k) * 247)) ∧
-      LoadHolds Lm.read (σ (.n 34)) (vtGi k) (gen ^ (vtLen k * 2 ^ vtKap lm τ (vtB0 k))) := by
+      LoadHolds Lm.read (σ (.n (val% «verify_tables» "group_size"))) (vtGi k) (gen ^ (vtLen k * 2 ^ vtKap lm τ (vtB0 k))) := by
     intro k hk
     obtain ⟨key, rk, sz, sq, hk1, hrk1, hke, hsz1, hsq1, hszv⟩ := vt_grps h k hk
     rw [hkx k hk, tb_loadHolds_mul_gen_pow] at hrk1 hsq1
@@ -317,7 +399,7 @@ theorem vt_sort {σ : Val} (h : VtH Lm.read σ) {lm : ℕ} {τ : ℕ → ℕ} (h
     refine ⟨⟨key, hk1, by rw [hke, e1]⟩, ?_⟩
     rwa [hszv, e2, ← pow_mul, mul_comm] at hsz1
   -- the groups' block offsets
-  have hB : ∀ k < 15, LoadHolds Lm.read (σ (.n 35)) (vtGi k)
+  have hB : ∀ k < 15, LoadHolds Lm.read (σ (.n (val% «verify_tables» "group_base"))) (vtGi k)
         (σ (.n (vtBoffData.getD k default).2.2.2)) ∧
       σ (.n ((vtBoffData.getD k default).2.2.2 - 1)) = gen ^ 2 ^ vtKap lm τ (vtB0 k) ∧
       ∀ i < vtLen k - 1, σ (.n ((vtBoffData.getD k default).2.2.2 + 1 + i)) =
@@ -332,92 +414,29 @@ theorem vt_sort {σ : Val} (h : VtH Lm.read σ) {lm : ℕ} {τ : ℕ → ℕ} (h
     obtain ⟨m0, l1, l2⟩ := h1
     refine ⟨l2, ?_, fun i hi => by simpa [Atom.Holds] using hst i hi⟩
     rw [m0, hkv, hoff] at l1
-    have l1' : LoadHolds Lm.read (σ (.n 12) * (σ (.n (vtKv k)) * gen ^ vtAdj k)) 0
+    have l1' : LoadHolds Lm.read (σ (.n (val% «verify_tables» "g_squares")) * (σ (.n (vtKv k)) * gen ^ vtAdj k)) 0
         (σ (.n ((vtBoffData.getD k default).2.2.2 - 1))) := by
       rw [← mul_assoc, tb_loadHolds_mul_gen_pow, Nat.add_zero]; exact l1
     rw [hkx k hk, tb_loadHolds_mul_gen_pow, Nat.add_zero] at l1'
     have s1 := hsq _ (by simp [gSquaresList]; exact hκ34 k hk)
     rw [tb_loadHolds_unique l1' s1]
     simp [gSquaresList]
-  have hsideT : ∀ e < 24, LoadHolds Lm.read (σ (.n 12)) (212 + e) (word (vtGroupSide e) 0) :=
+  have hsideT : ∀ e < 24, LoadHolds Lm.read (σ (.n (val% «verify_tables» "g_squares"))) (212 + e) (word (vtGroupSide e) 0) :=
     fun e he => by
       have := hsd e (by simp [sideTabList]; exact he)
       rw [tb_loadHolds_mul_gen_pow] at this
       rw [← vt_sideTab_getD e he, List.getD_eq_getElem _ _ (by simp [sideTabList]; exact he)]
       exact this
   -- one side, from its group and block layout (all checked by evaluation)
-  have side : ∀ (base G0 kOff m n v0 s : ℕ), base + n ≤ 153 → s < 3 →
-      (∀ r < m, VtRankFacts Lm.read σ v0 s r) →
-      (∀ e < 24, vtGroupSide e = s → G0 ≤ e ∧ e < G0 + m) →
-      (∀ j < m, kOff + j < 15 ∧ vtGi (kOff + j) = G0 + j ∧
-        vtB0 (kOff + j) = base + (blockGroupStart.getD (G0 + j) 0 - base) ∧
-        vtLen (kOff + j) = (blockGroupStart.getD (G0 + (j + 1)) 0 - base) -
-          (blockGroupStart.getD (G0 + j) 0 - base) ∧
-        blockGroupStart.getD (G0 + j) 0 - base < blockGroupStart.getD (G0 + (j + 1)) 0 - base ∧
-        blockGroupStart.getD (G0 + (j + 1)) 0 - base ≤ n ∧
-        vtBoffV (base + (blockGroupStart.getD (G0 + j) 0 - base)) =
-          (vtBoffData.getD (kOff + j) default).2.2.2) →
-      (∀ x < n, vtBk (base + x) - kOff < m ∧
-        blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base ≤ x ∧
-        x < blockGroupStart.getD (G0 + (vtBk (base + x) - kOff + 1)) 0 - base ∧
-        blockKappaSrc.getD (base + x) 0 = blockKappaSrc.getD (vtB0 (vtBk (base + x))) 0 ∧
-        blockKappaAdj (base + x) = blockKappaAdj (vtB0 (vtBk (base + x))) ∧
-        kOff + (vtBk (base + x) - kOff) = vtBk (base + x) ∧
-        (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base < x →
-          vtBoffV (base + x) = (vtBoffData.getD (vtBk (base + x)) default).2.2.2 + 1 +
-            (x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base)) ∧
-          vtBoffV (base + (x - 1)) = (vtBoffData.getD (vtBk (base + x)) default).2.2.2 +
-            (x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base)) ∧
-          x - 1 - (blockGroupStart.getD (G0 + (vtBk (base + x) - kOff)) 0 - base) <
-            vtLen (vtBk (base + x)) - 1)) →
-      (∀ j < m, ∀ x < n, blockGroupStart.getD (G0 + j) 0 - base ≤ x →
-        x < blockGroupStart.getD (G0 + (j + 1)) 0 - base → vtBk (base + x) - kOff = j) →
-      ∀ x < n, σ (.n (vtBoffV (base + x))) =
-        gen ^ (stackOffsets ((List.range n).map fun c ↦ vtKap lm τ (base + c))).1.getD x 0 := by
-    intro base G0 kOff m n v0 s hn hs hfacts hsideS D1 D2 D3
-    have hκs : ∀ x < n, ((List.range n).map fun c ↦ vtKap lm τ (base + c)).getD x 0 =
-        vtKap lm τ (base + x) := fun x hx => by
-      rw [List.getD_eq_getElem _ _ (by simp; exact hx)]; simp
-    refine vt_side_cert (G0 := G0) (base := base) _ (by simp)
-      (fun j ↦ blockGroupStart.getD (G0 + j) 0 - base)
-      (fun j ↦ vtKap lm τ (base + (blockGroupStart.getD (G0 + j) 0 - base)))
-      (fun x ↦ vtBk (base + x) - kOff) (fun x ↦ vtBoffV (base + x)) hn hfacts hsideT hsideS hs
-      (fun j hj ↦ ?_) (fun j hj ↦ ?_) (fun j hj ↦ ?_) (fun j hj ↦ (D1 j hj).2.2.2.2.1)
-      (fun x hx ↦ ⟨(D2 x hx).1, (D2 x hx).2.1, (D2 x hx).2.2.1⟩)
-      (fun j hj x h1 h2 ↦ ⟨by have := (D1 j hj).2.2.2.2.2.1; omega, D3 j hj x
-        (by have := (D1 j hj).2.2.2.2.2.1; omega) h1 h2⟩)
-      (fun x hx ↦ ?_) (fun j hj ↦ ?_) (fun x hx hlt ↦ ?_)
-    · obtain ⟨hk, hgi, hb0, -⟩ := D1 j hj
-      obtain ⟨⟨key, h1, h2⟩, -⟩ := hG _ hk
-      exact ⟨key, by rw [← hgi]; exact h1, by rw [← hb0, h2]⟩
-    · obtain ⟨hk, hgi, hb0, hl, -⟩ := D1 j hj
-      have := (hG _ hk).2
-      rwa [hgi, hl, hb0] at this
-    · obtain ⟨hk, -, hb0, -⟩ := D1 j hj
-      rw [← hb0]; exact hκ34 _ hk
-    · obtain ⟨-, -, -, hsrc', hadj', hkk, -⟩ := D2 x hx
-      have hj := (D2 x hx).1
-      obtain ⟨-, -, hb0, -⟩ := D1 _ hj
-      rw [hκs x hx, ← hb0, hkk, vtKap, vtKap, hsrc', hadj']
-    · obtain ⟨hk, hgi, -, -, -, -, hbv⟩ := D1 j hj
-      have := (hB _ hk).1
-      rw [hgi, ← hbv] at this
-      exact this
-    · obtain ⟨-, -, -, -, -, hkk, hstep⟩ := D2 x hx
-      have hj := (D2 x hx).1
-      obtain ⟨hk, -, hb0, -⟩ := D1 _ hj
-      obtain ⟨e1, e2, e3⟩ := hstep hlt
-      obtain ⟨-, hst, hch⟩ := hB _ hk
-      rw [hkk] at hst hch hb0
-      rw [e1, e2, hch _ e3, hst, hb0]
-  have hP := side 0 0 0 9 54 111 0 (by norm_num) (by norm_num) (fun r hr => by
+  have side := vt_side_offsets hκ34 hG hB hsideT
+  have hP := side 0 0 0 9 54 112 0 (by norm_num) (by norm_num) (fun r hr => by
       rcases Nat.eq_zero_or_pos r with rfl | hr0
       · obtain ⟨k, hs⟩ := h.sliceAt 110 _ vtPush0_check
         exact vt_rank0 hμ Lm hs
       · obtain ⟨k, hs⟩ := h.sliceAt _ _ (vtPush_check r hr hr0)
         exact vt_rank hμ Lm hr0 hs)
     (by decide +kernel) (by decide +kernel) (by decide +kernel) (by decide +kernel)
-  have hC := side 108 18 9 6 45 408 2 (by norm_num) (by norm_num) (fun r hr => by
+  have hC := side 108 18 9 6 45 409 2 (by norm_num) (by norm_num) (fun r hr => by
       rcases Nat.eq_zero_or_pos r with rfl | hr0
       · obtain ⟨k, hs⟩ := h.sliceAt 403 _ vtCount0_check
         exact vt_rank0 hμ Lm hs

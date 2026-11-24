@@ -9,6 +9,7 @@ module
 
 public import LeanVM.Guest.B2C.Static
 public import LeanVM.Guest.Value.Tower
+public import LeanVM.Guest.Memory.HonestX
 import Mathlib.Data.List.GetD
 
 /-!
@@ -18,7 +19,7 @@ import Mathlib.Data.List.GetD
 value's word (`cand_val`): a temporary's only if the value is that temporary, a frame run's or a
 named value's by the sharing check (`shareOk_path`), a fixed constant cell's by the same, no fixed
 frame pointer cell, call site or table target being a value's cell (`valOk`, `apartOk`). So the
-honest memory reads each named value at its cell (`read_val`).
+honest memory, and any memory covering its writes (`Covers`), reads each named value at its cell (`read_valL`).
 -/
 
 namespace LeanVM.Guest.B2C
@@ -229,42 +230,63 @@ theorem mem_siteE {j : ℕ} {I : Inst} {es : List Ev} {x : ℕ × E} (h : x ∈ 
         have : Nat.beq s.tgt 0 = false := Bool.eq_false_iff.mpr fun hb ↦ ht (nbeq_iff.mp hb)
         simp [this]
 
-/-- A value's cell, from its window's check. -/
+/-- A value's cell from a window's check, under the tail call `ta`. -/
+theorem valOk_cell {j : ℕ} {nx : List ℕ} {loc : Loc} (hl : ∀ v c, loc.get? v.idx = some c → cellJ j v = c) {v : V}
+    (h : valOk loc (byCell (plumbOf j).tmps) (tmpCells (plumbOf j)) (fpgCells (plumbOf j)) (fsN j) nx v = true) :
+    v = V.n v.idx ∧ (cellJ j v < fsN j ∨ cellJ j v ∈ nx) ∧
+      bitN (fpgCells (plumbOf j)) (cellJ j v) = false ∧
+      (bitN (tmpCells (plumbOf j)) (cellJ j v) = false ∨ (v.idx, cellJ j v) ∈ (plumbOf j).tmps) := by
+  obtain ⟨h1, -, h3, h4, h5⟩ := valOk_spec h
+  have hc : loc.cell v = cellJ j v := (fitV_of hl (vs := [v]) (fun u hu ↦ by
+    rw [List.mem_singleton.mp hu]; exact h) v List.mem_cons_self).2
+  rw [hc] at h3 h4 h5
+  refine ⟨h1, h3, h4, ?_⟩
+  rcases h5 with h5 | h5
+  · exact Or.inl h5
+  · exact Or.inr (listedT_spec h5).2
+
+/-- **A value's cell**, from its window's check: in the frame, or a tail call's argument at the
+next frame's parameter cell. -/
 theorem valOk_global {j : ℕ} {G : Glob} {f : CompiledFunction} {main : Bool} (hS : ShareOk j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G f (coreOf j) (certOf j) main i = true) {v : V}
     (hv : v ∈ (coreOf j).params ++ Stmt.usesList (coreOf j).body ++ Stmt.tmpsList (coreOf j).body) :
-    v = V.n v.idx ∧ cellJ j v < fsN j ∧ bitN (fpgCells (plumbOf j)) (cellJ j v) = false ∧
+    v = V.n v.idx ∧
+      (cellJ j v < fsN j ∨ cellJ j v ∈ nextCells (certOf j).locs (fsN j) (tailArgs (coreOf j))) ∧
+      bitN (fpgCells (plumbOf j)) (cellJ j v) = false ∧
       (bitN (tmpCells (plumbOf j)) (cellJ j v) = false ∨ (v.idx, cellJ j v) ∈ (plumbOf j).tmps) := by
   have hcont := cont_of hchk
   obtain ⟨-, hsn, -, hpv⟩ := shareStatic_spec hS.1
   have hA : ∀ i ≤ (snapsOf j).length, ∀ v c, (locW (certOf j) (winW (snapsOf j) i)).get? v.idx = some c →
       cellJ j v = c := fun i hi v c h ↦
     locW_get hcont (winW_le hsn hi) (checkWin_parts (hchk _ (winW_le hsn hi))).2 rfl (shareWin_spec (hS.2 i hi)).1 h
-  -- the window's check, at the window's cells
-  have glob : ∀ (loc : Loc), (∀ v c, loc.get? v.idx = some c → cellJ j v = c) →
-      valOk loc (byCell (plumbOf j).tmps) (tmpCells (plumbOf j)) (fpgCells (plumbOf j)) (fsN j) v = true →
-      v = V.n v.idx ∧ cellJ j v < fsN j ∧ bitN (fpgCells (plumbOf j)) (cellJ j v) = false ∧
-        (bitN (tmpCells (plumbOf j)) (cellJ j v) = false ∨ (v.idx, cellJ j v) ∈ (plumbOf j).tmps) := by
-    intro loc hl h
-    obtain ⟨h1, h2, h3, h4, h5⟩ := valOk_spec h
-    have hc : loc.cell v = cellJ j v := (fitV_of hl (vs := [v]) (fun u hu ↦ by
-      rw [List.mem_singleton.mp hu]; exact h) v List.mem_cons_self).2
-    rw [hc] at h3 h4 h5
-    refine ⟨h1, h3, h4, ?_⟩
-    rcases h5 with h5 | h5
-    · exact Or.inl h5
-    · exact Or.inr (listedT_spec h5).2
   rcases List.mem_append.mp hv with hv | hv
   · rcases List.mem_append.mp hv with hv | hv
-    · exact glob _ (hA 0 (Nat.zero_le _)) (hpv v hv)
+    · obtain ⟨h1, h3, h4, h5⟩ := valOk_cell (hA 0 (Nat.zero_le _)) (hpv v hv)
+      refine ⟨h1, ?_, h4, h5⟩
+      rcases h3 with h3 | h3
+      · exact .inl h3
+      · simp at h3
     · obtain ⟨i, hi, hw⟩ := mem_windows Stmt.usesList usesList_append hS _ 0 (Nat.zero_add _)
         (by rw [fromW_zero]; exact hv)
       obtain ⟨-, hval, -⟩ := shareWin_spec (hS.2 i hi)
-      exact glob _ (hA i hi) (hval v (List.mem_append_left _ hw))
+      exact valOk_cell (hA i hi) (hval v (List.mem_append_left _ hw))
   · obtain ⟨i, hi, hw⟩ := mem_windows Stmt.tmpsList tmpsList_append hS _ 0 (Nat.zero_add _)
       (by rw [fromW_zero]; exact hv)
     obtain ⟨-, hval, -⟩ := shareWin_spec (hS.2 i hi)
-    exact glob _ (hA i hi) (hval v (List.mem_append_right _ hw))
+    exact valOk_cell (hA i hi) (hval v (List.mem_append_right _ hw))
+
+/-- **A parameter's cell is in the frame**, by the first window's check. -/
+theorem valOk_param {j : ℕ} {G : Glob} {f : CompiledFunction} {main : Bool} (hS : ShareOk j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G f (coreOf j) (certOf j) main i = true) {v : V}
+    (hv : v ∈ (coreOf j).params) : cellJ j v < fsN j := by
+  have hcont := cont_of hchk
+  obtain ⟨-, hsn, -, hpv⟩ := shareStatic_spec hS.1
+  have hA : ∀ v c, (locW (certOf j) (winW (snapsOf j) 0)).get? v.idx = some c → cellJ j v = c := fun v c h ↦
+    locW_get hcont (winW_le hsn (Nat.zero_le _)) (checkWin_parts (hchk _ (winW_le hsn (Nat.zero_le _)))).2 rfl
+      (shareWin_spec (hS.2 0 (Nat.zero_le _))).1 h
+  rcases (valOk_cell hA (hpv v hv)).2.1 with h | h
+  · exact h
+  · simp at h
 
 end Cand
 
@@ -386,15 +408,16 @@ theorem cand_val (hS : ShareOk j) (hC : ChainApart j)
       omega
     · cases hx
 
-/-- **The honest memory reads each named value at its cell.** -/
-theorem read_val {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
-    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+/-- **A memory covering the honest writes reads each named value at its cell.** -/
+theorem read_valL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
     {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
     (hw : walk σ (coreOf j).body = .ret es vs) (he : ∀ e ∈ es, e.Holds rd σ)
     {v : V} (hv : v ∈ namedOf (coreOf j).params es vs) (h2 : 2 ≤ cellJ j v) (hn : cellJ j v < fsN j) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + cellJ j v)) = some (σ v) := by
+    L.read (addressOfIndex (I.fp + cellJ j v)) = some (σ v) := by
   obtain ⟨Ψ, hΨ, hst⟩ := shareOk_path hS hchk hw he
   obtain ⟨i, rfl, -, -, -, -, hfs, hcert, -⟩ := fn_of_idx hj
   have hmem : (cellJ (i + 1) v, σ v) ∈ C I := by
@@ -406,7 +429,18 @@ theorem read_val {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
     simp only [nodeE, List.mem_append, valE, List.mem_map, hev, hvs]
     exact Or.inl (Or.inl (Or.inl (Or.inl (Or.inr ⟨v, hv, rfl⟩))))
   rw [addressOfIndex, pow_add]
-  exact h.read_C hI hmem
+  exact hL.read_C h hI hmem
+
+/-- **The honest memory reads each named value at its cell.** -/
+theorem read_val {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
+    {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
+    (hw : walk σ (coreOf j).body = .ret es vs) (he : ∀ e ∈ es, e.Holds rd σ)
+    {v : V} (hv : v ∈ namedOf (coreOf j).params es vs) (h2 : 2 ≤ cellJ j v) (hn : cellJ j v < fsN j) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + cellJ j v)) = some (σ v) := by
+  apply read_valL h h.covers <;> assumption
 
 end Val
 
@@ -437,15 +471,16 @@ theorem cellJ_tmp_listed {u : V} {c : ℕ} (htc : bitN (tmpCells (plumbOf j)) c 
     rw [bitN_eq, this] at htc; cases htc
   · exact htc
 
-/-- **The honest memory reads each fixed cell's word.** -/
-theorem read_stat {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
-    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+/-- **A memory covering the honest writes reads each fixed cell's word.** -/
+theorem read_statL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
     {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
     (hw : walk σ (coreOf j).body = .ret es vs) (he : ∀ e ∈ es, e.Holds rd σ)
     {q : ℕ × PC} (hq : q ∈ (plumbOf j).stat) (h2 : 2 ≤ q.1) (hn : q.1 < fsN j) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + q.1)) = some (q.2.word
+    L.read (addressOfIndex (I.fp + q.1)) = some (q.2.word
         I.fp) := by
   obtain ⟨Ψ, hΨ, hst⟩ := shareOk_path hS hchk hw he
   have hΨ' : ∀ u ∈ namedOf (coreOf j).params es vs, 2 ≤ cellJ j u → σ u = Ψ (cellJ j u) :=
@@ -501,17 +536,30 @@ theorem read_stat {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
         omega
       · cases hx
   rw [addressOfIndex, pow_add]
-  exact h.read_C hI hmem
+  exact hL.read_C h hI hmem
 
-/-- **The honest memory reads each temporary of the path at its cell.** -/
-theorem read_tmp {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+/-- **The honest memory reads each fixed cell's word.** -/
+theorem read_stat {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
     (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
+    {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
+    (hw : walk σ (coreOf j).body = .ret es vs) (he : ∀ e ∈ es, e.Holds rd σ)
+    {q : ℕ × PC} (hq : q ∈ (plumbOf j).stat) (h2 : 2 ≤ q.1) (hn : q.1 < fsN j) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + q.1)) = some (q.2.word
+        I.fp) := by
+  apply read_statL h h.covers <;> assumption
+
+/-- **A memory covering the honest writes reads each temporary of the path at its cell.** -/
+theorem read_tmpL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
     {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
     (hw : walk σ (coreOf j).body = .ret es vs) {t : V} (htm : t ∈ coreProgram.temps f)
     (h2 : 2 ≤ cellJ j t) (hn : cellJ j t < fsN j) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + cellJ j t)) = some (σ t) := by
+    L.read (addressOfIndex (I.fp + cellJ j t)) = some (σ t) := by
   have FS := fnStatic hS hchk
   have AP := apart_j hS
   obtain ⟨i, rfl, -, -, -, -, hfs, hcert, -⟩ := fn_of_idx hj
@@ -567,17 +615,29 @@ theorem read_tmp {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
         omega
       · cases hx
   rw [addressOfIndex, pow_add]
-  exact h.read_C hI hmem
+  exact hL.read_C h hI hmem
 
-/-- **The honest memory reads each table jump's target.** -/
-theorem read_arm {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+/-- **The honest memory reads each temporary of the path at its cell.** -/
+theorem read_tmp {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
     (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
+    {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
+    (hw : walk σ (coreOf j).body = .ret es vs) {t : V} (htm : t ∈ coreProgram.temps f)
+    (h2 : 2 ≤ cellJ j t) (hn : cellJ j t < fsN j) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + cellJ j t)) = some (σ t) := by
+  apply read_tmpL h h.covers <;> assumption
+
+/-- **A memory covering the honest writes reads each table jump's target.** -/
+theorem read_armL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
     {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
     (hw : walk σ (coreOf j).body = .ret es vs)
     {a : ℕ × ℕ × ℕ} (ha : a ∈ (plumbOf j).arms) (h2 : 2 ≤ a.2.1) (hn : a.2.1 < fsN j) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + a.2.1)) = some (armWord σ a.1
+    L.read (addressOfIndex (I.fp + a.2.1)) = some (armWord σ a.1
         a.2.2) := by
   have FS := fnStatic hS hchk
   have AP := apart_j hS
@@ -623,19 +683,32 @@ theorem read_arm {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
         omega
       · cases hx
   rw [addressOfIndex, pow_add]
-  exact h.read_C hI hmem
+  exact hL.read_C h hI hmem
 
-/-- **The honest memory reads a chained `match`'s target**, on the arm the path takes, as the
-next table's word at the next selector. -/
-theorem read_chain {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+/-- **The honest memory reads each table jump's target.** -/
+theorem read_arm {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
     (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
+    {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
+    (hw : walk σ (coreOf j).body = .ret es vs)
+    {a : ℕ × ℕ × ℕ} (ha : a ∈ (plumbOf j).arms) (h2 : 2 ≤ a.2.1) (hn : a.2.1 < fsN j) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + a.2.1)) = some (armWord σ a.1
+        a.2.2) := by
+  apply read_armL h h.covers <;> assumption
+
+/-- **A memory covering the honest writes reads a chained `match`'s target**, on the arm the path takes, as the
+next table's word at the next selector. -/
+theorem read_chainL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
     {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
     (hw : walk σ (coreOf j).body = .ret es vs)
     {ch : ℕ × ℕ × List ℕ × ℕ × ℕ} (hch : ch ∈ (plumbOf j).chains) {k t : ℕ} (hkt : ch.2.2.1[k]? = some t)
     (hσk : σ (V.n ch.2.1) = ofK (addressOfIndex k)) (h2 : 2 ≤ t) (hn : t < fsN j) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + t)) =
+    L.read (addressOfIndex (I.fp + t)) =
       some (armWord σ ch.2.2.2.1 ch.2.2.2.2) := by
   have FS := fnStatic hS hchk
   obtain ⟨i, rfl, -, -, -, -, hfs, hcert, -⟩ := fn_of_idx hj
@@ -679,7 +752,21 @@ theorem read_chain {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
       · rw [hC.main h1] at hch; cases hch
       · cases hx
   rw [addressOfIndex, pow_add]
-  exact h.read_C hI hmem
+  exact hL.read_C h hI hmem
+
+/-- **The honest memory reads a chained `match`'s target**, on the arm the path takes, as the
+next table's word at the next selector. -/
+theorem read_chain {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {I : Inst} (hI : I ∈ honestInsts coreProgram fs H hdr T) {f : String} {σ : Val} {bufs : List ℕ}
+    {kids : List Tree} (ht : I.t = .node f σ bufs kids) (hj : idxOf f = some j) {es : List Ev} {vs : List V}
+    (hw : walk σ (coreOf j).body = .ret es vs)
+    {ch : ℕ × ℕ × List ℕ × ℕ × ℕ} (hch : ch ∈ (plumbOf j).chains) {k t : ℕ} (hkt : ch.2.2.1[k]? = some t)
+    (hσk : σ (V.n ch.2.1) = ofK (addressOfIndex k)) (h2 : 2 ≤ t) (hn : t < fsN j) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (I.fp + t)) =
+      some (armWord σ ch.2.2.2.1 ch.2.2.2.2) := by
+  apply read_chainL h h.covers <;> assumption
 
 end Others
 
@@ -710,34 +797,37 @@ theorem checkWin_params {G : Glob} {f : CompiledFunction} {cf : Core.Fn} {C : Ch
 
 variable {j : ℕ} {G : Glob} {fc : CompiledFunction} {main : Bool}
 
-/-- **A callee's frame holds its arguments** at cells `2 + k`, whether it runs or not. -/
-theorem read_args {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
-    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+/-- **A callee's frame holds its arguments** at cells `2 + k`, whether it runs or not, on a memory
+covering the honest writes. -/
+theorem read_argsL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
     (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
     {J : Inst} (hJ : J ∈ honestInsts coreProgram fs H hdr T) {g : String} (hj : idxOf g = some j)
     (hgood : (∃ σ bufs kids es vs, J.t = .node g σ bufs kids ∧
       walk σ (coreOf j).body = .ret es vs ∧ ∀ e ∈ es, e.Holds rd σ) ∨ ∃ σ, J.t = .phantom g σ)
     (k : ℕ) (hk : k < (coreOf j).params.length) :
-    (honest coreProgram fs H C hdr T).read (addressOfIndex (J.fp + (2 + k))) = some (J.t.val (coreOf j).params[k]) := by
+    L.read (addressOfIndex (J.fp + (2 + k))) = some (J.t.val (coreOf j).params[k]) := by
   have hcont := cont_of hchk
   have hpc := checkWin_params (hchk 0 (Nat.zero_le _)) hcont k hk
   have hpk : (coreOf j).params[k] ∈ (coreOf j).params ++ Stmt.usesList (coreOf j).body ++
       Stmt.tmpsList (coreOf j).body := List.mem_append_left _ (List.mem_append_left _ (List.getElem_mem hk))
-  obtain ⟨hvn, hlt, hfc, -⟩ := valOk_global hS hchk hpk
+  obtain ⟨hvn, -, hfc, -⟩ := valOk_global hS hchk hpk
+  have hlt := valOk_param hS hchk (List.getElem_mem hk)
   rw [show cellJ j (coreOf j).params[k] = 2 + k from hpc] at hlt hfc
   rcases hgood with ⟨σ, bufs, kids, es, vs, ht, hw, he⟩ | ⟨σ, ht⟩
-  · have := read_val h hS hC hchk hJ ht hj hw he (v := (coreOf j).params[k])
+  · have := read_valL h hL hS hC hchk hJ ht hj hw he (v := (coreOf j).params[k])
       (by simp only [namedOf, List.mem_append]; exact Or.inl (Or.inl (List.getElem_mem hk)))
       (by rw [show cellJ j (coreOf j).params[k] = 2 + k from hpc]; omega)
       (by rw [show cellJ j (coreOf j).params[k] = 2 + k from hpc]; exact hlt)
     rw [show cellJ j (coreOf j).params[k] = 2 + k from hpc] at this
     rw [ht]; exact this
-  · obtain ⟨i, rfl, -, -, -, -, hfs, hcert, -⟩ := fn_of_idx hj
+  · obtain ⟨i, rfl, -, -, -, -, -, hcert, -⟩ := fn_of_idx hj
     have AP := apart_j hS
     have hmem : (2 + k, σ (coreOf (i + 1)).params[k]) ∈ C J := by
-      rw [C_phantom ht hj, hfs]
+      rw [C_phantom ht hj, fs_tailKey hj]
       refine frameE_cell ⟨(cert g (coreOf (i + 1)).params[k], σ (coreOf (i + 1)).params[k]), ?_, ?_⟩
-        (by omega) hlt fun x hx hxc ↦ ?_
+        (by omega) (param_lt_tailN hk hlt) fun x hx hxc ↦ ?_
       · simp only [phantomE, List.mem_append, valE, List.mem_map]
         exact Or.inl ⟨_, List.getElem_mem hk, rfl⟩
       · rw [hcert]; exact hpc
@@ -753,7 +843,18 @@ theorem read_args {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
         have : (fpgCells (plumbOf (i + 1))).testBit p.1 = true := mem_bitsOf (List.mem_filterMap.mpr ⟨_, hst, rfl⟩)
         rw [bitN_eq, ← hxc, this] at hfc; cases hfc
     rw [addressOfIndex, pow_add, ht]
-    exact h.read_C hJ hmem
+    exact hL.read_C h hJ hmem
+
+/-- **A callee's frame holds its arguments** at cells `2 + k`, whether it runs or not. -/
+theorem read_args {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {J : Inst} (hJ : J ∈ honestInsts coreProgram fs H hdr T) {g : String} (hj : idxOf g = some j)
+    (hgood : (∃ σ bufs kids es vs, J.t = .node g σ bufs kids ∧
+      walk σ (coreOf j).body = .ret es vs ∧ ∀ e ∈ es, e.Holds rd σ) ∨ ∃ σ, J.t = .phantom g σ)
+    (k : ℕ) (hk : k < (coreOf j).params.length) :
+    (honest coreProgram fs H C hdr T).read (addressOfIndex (J.fp + (2 + k))) = some (J.t.val (coreOf j).params[k]) := by
+  apply read_argsL h h.covers <;> assumption
 
 /-- The fixed cells lie in the frame. -/
 theorem stat_in (hS : ShareOk j) {q : ℕ × PC} (hq : q ∈ (plumbOf j).stat) : 2 ≤ q.1 ∧ q.1 < fsN j := by
@@ -762,6 +863,42 @@ theorem stat_in (hS : ShareOk j) {q : ℕ × PC} (hq : q ∈ (plumbOf j).stat) :
   have := (hlists.1.1.1.1.1 q hq).1
   simp only [Nat.ble_eq, Nat.blt_eq] at this
   exact this
+
+/-- **A callee's frame holds its frame pointer** in its entry environment's cells, on a memory
+covering the honest writes, whether it runs or not. -/
+theorem read_selfL {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
+    (h : Honest coreProgram fs H C hdr T rd args rets) {κ : ℕ} {L : MemoryImage κ}
+    (hL : Covers coreProgram fs H C hdr T L) (hS : ShareOk j) (hC : ChainApart j)
+    (hchk : ∀ i ≤ (certOf j).cuts.length, checkWin G fc (coreOf j) (certOf j) main i = true)
+    {J : Inst} (hJ : J ∈ honestInsts coreProgram fs H hdr T) {g : String} (hj : idxOf g = some j)
+    (hgood : (∃ σ bufs kids es vs, J.t = .node g σ bufs kids ∧
+      walk σ (coreOf j).body = .ret es vs ∧ ∀ e ∈ es, e.Holds rd σ) ∨ ∃ σ, J.t = .phantom g σ)
+    {o : ℕ} (ho : o ∈ (certOf j).facts.env.map Prod.fst) :
+    L.read (addressOfIndex (J.fp + o)) = some (ofK (addressOfIndex
+        J.fp)) := by
+  have AP := apart_j hS
+  obtain ⟨p, hp, rfl⟩ := List.mem_map.mp ho
+  have hst := AP.env p hp
+  obtain ⟨h2, hn⟩ := stat_in hS hst
+  rcases hgood with ⟨σ, bufs, kids, es, vs, ht, hw, he⟩ | ⟨σ, ht⟩
+  · have := read_statL h hL hS hC hchk hJ ht hj hw he hst h2 hn
+    simpa [PC.word] using this
+  · obtain ⟨i, rfl, -, -, -, -, -, hcert, -⟩ := fn_of_idx hj
+    have hmem : (p.1, ofK (addressOfIndex J.fp)) ∈ C J := by
+      rw [C_phantom ht hj, fs_tailKey hj]
+      refine frameE_cell ⟨(p.1, ofK (addressOfIndex J.fp)), ?_, rfl⟩ h2 (env_lt_tailN hp hn) fun x hx hxc ↦ ?_
+      · simp only [phantomE, List.mem_append, List.mem_map]
+        exact Or.inr ⟨p, hp, rfl⟩
+      simp only [phantomE, List.mem_append, valE, List.mem_map] at hx
+      rcases hx with ⟨u, hu, rfl⟩ | ⟨p', -, rfl⟩
+      · simp only [hcert] at hxc
+        obtain ⟨-, -, hfc, -⟩ := valOk_global hS hchk (v := u)
+          (List.mem_append_left _ (List.mem_append_left _ hu))
+        have : (fpgCells (plumbOf (i + 1))).testBit p.1 = true := mem_bitsOf (List.mem_filterMap.mpr ⟨_, hst, rfl⟩)
+        rw [bitN_eq, show cellJ (i + 1) u = p.1 from hxc, this] at hfc; cases hfc
+      · rfl
+    rw [addressOfIndex, pow_add]
+    exact hL.read_C h hJ hmem
 
 /-- **A callee's frame holds its frame pointer** in its entry environment's cells, whether it runs
 or not. -/
@@ -774,29 +911,7 @@ theorem read_self {hdr : E × E} {T : Tree} {rd : Reader} {args rets : List E}
     {o : ℕ} (ho : o ∈ (certOf j).facts.env.map Prod.fst) :
     (honest coreProgram fs H C hdr T).read (addressOfIndex (J.fp + o)) = some (ofK (addressOfIndex
         J.fp)) := by
-  have AP := apart_j hS
-  obtain ⟨p, hp, rfl⟩ := List.mem_map.mp ho
-  have hst := AP.env p hp
-  obtain ⟨h2, hn⟩ := stat_in hS hst
-  rcases hgood with ⟨σ, bufs, kids, es, vs, ht, hw, he⟩ | ⟨σ, ht⟩
-  · have := read_stat h hS hC hchk hJ ht hj hw he hst h2 hn
-    simpa [PC.word] using this
-  · obtain ⟨i, rfl, -, -, -, -, hfs, hcert, -⟩ := fn_of_idx hj
-    have hmem : (p.1, ofK (addressOfIndex J.fp)) ∈ C J := by
-      rw [C_phantom ht hj, hfs]
-      refine frameE_cell ⟨(p.1, ofK (addressOfIndex J.fp)), ?_, rfl⟩ h2 hn fun x hx hxc ↦ ?_
-      · simp only [phantomE, List.mem_append, List.mem_map]
-        exact Or.inr ⟨p, hp, rfl⟩
-      simp only [phantomE, List.mem_append, valE, List.mem_map] at hx
-      rcases hx with ⟨u, hu, rfl⟩ | ⟨p', -, rfl⟩
-      · simp only [hcert] at hxc
-        obtain ⟨-, -, hfc, -⟩ := valOk_global hS hchk (v := u)
-          (List.mem_append_left _ (List.mem_append_left _ hu))
-        have : (fpgCells (plumbOf (i + 1))).testBit p.1 = true := mem_bitsOf (List.mem_filterMap.mpr ⟨_, hst, rfl⟩)
-        rw [bitN_eq, show cellJ (i + 1) u = p.1 from hxc, this] at hfc; cases hfc
-      · rfl
-    rw [addressOfIndex, pow_add]
-    exact h.read_C hJ hmem
+  apply read_selfL h h.covers <;> assumption
 
 end Args
 
@@ -832,7 +947,7 @@ theorem frame_len {hdr : E × E} {T : Tree} {I : Inst} (hI : I ∈ honestInsts c
     {rd : Reader} {f : String} {σ : Val} {bufs : List ℕ} {kids : List Tree} (ht : I.t = .node f σ bufs kids)
     {es : List Ev} (hk : Tree.KidsValid coreProgram rd σ (calls es) kids) :
     I.kidFps.length = (calls es).length := by
-  rw [honest_kidFps hI, length_kidPos, List.length_map, ht]
+  rw [honest_kidFps hI, List.length_map, length_kidPos, List.length_map, ht]
   exact kidsValid_length hk
 
 /-- **The frame addresses** are the runs' addresses in the frame. -/
@@ -858,7 +973,7 @@ theorem frame_tail {hdr : E × E} {T : Tree} {I : Inst} (hI : I ∈ honestInsts 
   have hne : I.t.kids ≠ [] := by
     intro he
     have hlen := congrArg List.length (honest_kidFps hI)
-    rw [length_kidPos, List.length_map, he] at hlen
+    rw [List.length_map, length_kidPos, List.length_map, he] at hlen
     rw [List.length_eq_zero_iff.mp hlen] at hk
     cases hk
   rw [honest_kidFps_getLast? hI hlp hne] at hk
@@ -1003,20 +1118,20 @@ theorem H_K {I : Inst} (hl : coreProgram.loop I.t.name = false) (i : ℕ) : KHdr
 
 mutual
 /-- Every instance's header is its tree's, or of `K`. -/
-theorem insts_hdr : ∀ (t : Tree) (fp : ℕ) (h : E × E), ∀ J ∈ t.insts fs coreProgram.loop H fp h,
+theorem insts_hdr : ∀ (t : Tree) (pos : ℕ × ℕ) (h : E × E), ∀ J ∈ t.insts fs coreProgram.loop H pos h,
     J.hdr = h ∨ KHdr J.hdr
-  | .node f σ bufs kids, fp, h, J, hJ => by
+  | .node f σ bufs kids, pos, h, J, hJ => by
       rw [insts_node, List.mem_cons] at hJ
       rcases hJ with rfl | hJ
       · exact Or.inl rfl
       · rcases instsKids_hdr kids _ _ 0 J hJ with he | hk
         · exact Or.inl he
         · exact Or.inr hk
-  | .phantom .., fp, h, J, hJ => by
+  | .phantom .., pos, h, J, hJ => by
       rw [insts_phantom, List.mem_singleton] at hJ
       subst hJ; exact Or.inl rfl
 
-theorem instsKids_hdr : ∀ (ks : List Tree) (ps : List ℕ) (I : Inst) (i : ℕ),
+theorem instsKids_hdr : ∀ (ks : List Tree) (ps : List (ℕ × ℕ)) (I : Inst) (i : ℕ),
     ∀ J ∈ Tree.instsKids fs coreProgram.loop H I i ps ks, J.hdr = I.hdr ∨ KHdr J.hdr
   | [], _, _, _, J, hJ => by rw [instsKids_nil] at hJ; exact absurd hJ List.not_mem_nil
   | _ :: _, [], _, _, J, hJ => by rw [instsKids_nil_left] at hJ; exact absurd hJ List.not_mem_nil
@@ -1029,7 +1144,8 @@ theorem instsKids_hdr : ∀ (ks : List Tree) (ps : List ℕ) (I : Inst) (i : ℕ
       · exact instsKids_hdr ks ps I (i + 1) J hJ
 end
 
-theorem instsKids_hdrK {I : Inst} (hI : ∀ i, KHdr (H I i)) : ∀ (ks : List Tree) (ps : List ℕ) (i : ℕ),
+theorem instsKids_hdrK {I : Inst} (hI : ∀ i, KHdr (H I i)) :
+    ∀ (ks : List Tree) (ps : List (ℕ × ℕ)) (i : ℕ),
     ∀ J ∈ Tree.instsKids fs coreProgram.loop H I i ps ks, KHdr J.hdr
   | [], _, _, J, hJ => by rw [instsKids_nil] at hJ; exact absurd hJ List.not_mem_nil
   | _ :: _, [], _, J, hJ => by rw [instsKids_nil_left] at hJ; exact absurd hJ List.not_mem_nil

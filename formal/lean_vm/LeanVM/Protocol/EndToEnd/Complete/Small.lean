@@ -7,13 +7,17 @@
 
 module
 
-public import LeanVM.Protocol.EndToEnd.Completeness
+import LeanVM.Protocol.EndToEnd.Completeness
 public import Statement.LeanVm
-public import LeanVM.Facts.Verifier
-public import Statement.Fast.Keccak
-public import Statement.Fast.QuadExt
-public import Statement.Fast.FieldWords
-public import LeanVM.Protocol.WithHash
+import LeanVM.Facts.Verifier
+import Statement.Fast.Keccak
+import Statement.Fast.QuadExt
+import Statement.Fast.FieldWords
+import LeanVM.Protocol.WithHash
+public import LeanVM.Protocol.EndToEnd.Complete.Theorem
+import LeanVM.Protocol.LeanIsa.Complete
+import LeanVM.Arithmetization.Completeness.Theorem
+import LeanVM.Protocol.EndToEnd.Sound.Moves
 
 /-!
 # Completeness for executions within the budget
@@ -196,9 +200,9 @@ theorem honestProofOf_isSome {prog : LeanIsaProgram} {input : PublicInput} {t : 
     {ρ : ℕ}
     (hv : ValidExecution prog input t) (hbudget : t.committedSize ≤ 2 ^ completeMu)
     (hρ : validRate ρ) (H : Bytes → Digest) (F : KeccakState → KeccakState) (fuel : ℕ)
-    (hpow : ∀ hist bits k sp,
+    (hpow : ∀ hist bits k sp o,
       (leanVmVerifierProgram (bytecodeWords prog) (publicInputDigest input)).after hist =
-          some (.grind bits k) → findNonce F bits sp fuel ≠ none) :
+          some (.grind bits k) → findNonce F bits o sp fuel ≠ none) :
     (honestProofOf H F prog input t ρ fuel).isSome := by
   obtain ⟨w, s, hw, hrep, hs, hadm⟩ := exists_admissible_witness hv hbudget
   have hex : ∃ w s, HonestFor prog input t ρ w s := ⟨w, s, hρ, hw, hs, hadm, hrep⟩
@@ -213,9 +217,9 @@ theorem complete_of_budget {prog : LeanIsaProgram} {input : PublicInput} {t : Ex
     {ρ : ℕ}
     (hv : ValidExecution prog input t) (hbudget : t.committedSize ≤ 2 ^ completeMu)
     (hρ : validRate ρ) (H : Bytes → Digest) (F : KeccakState → KeccakState) (fuel : ℕ)
-    (hpow : ∀ hist bits k sp,
+    (hpow : ∀ hist bits k sp o,
       (leanVmVerifierProgram (bytecodeWords prog) (publicInputDigest input)).after hist =
-          some (.grind bits k) → findNonce F bits sp fuel ≠ none) :
+          some (.grind bits k) → findNonce F bits o sp fuel ≠ none) :
     ∃ proof, honestProofOf H F prog input t ρ fuel = some proof ∧
       verifyWithHash (m := Id) H F (bytecodeWords prog) (publicInputDigest input) proof = true := by
   obtain ⟨proof, h⟩ := Option.isSome_iff_exists.mp

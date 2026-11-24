@@ -9,8 +9,10 @@
 
 module
 
-public import LeanVM.Protocol.Extraction.Extractor
+import LeanVM.Protocol.Extraction.Extractor
 public import LeanVM.Protocol.RunWithHash
+public import Statement.LeanVm
+public import CompPoly.Univariate.Basic
 
 /-!
 # The verifier, the prover and the experiments with a hash of their own
@@ -86,7 +88,7 @@ def runFromWithHash (fuel : ℕ) {α β : Type} :
     let r ← squeeze F sp
     runFromWithHash fuel (k r.1) (Script.afterSample r.1 S) r.2 cs
   | .grind bits k, S, sp, cs => do
-    match ← findNonceM F bits sp fuel with
+    match ← findNonceM F bits (Script.outsideKOf S) sp fuel with
     | none => pure none
     | some n => do
       let r ← absorbNonce F sp n

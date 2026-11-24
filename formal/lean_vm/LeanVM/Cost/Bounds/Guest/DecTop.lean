@@ -9,7 +9,10 @@ public import LeanVM.Cost.Bounds.Decoder.EntryArray
 public import LeanVM.Cost.Prices
 public import LeanVM.Guest.GuestConst
 -- Private: `guest_const%` inserts literals, so importers need not see the guest's source.
-import LeanVM.Guest.Data.Source
+import LeanVM.Guest.Data.Consts
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_sub»
+import LeanVM.Guest.Data.ValNames.«main»
 
 /-!
 # Bounds on the guest decoder's prices: the top
@@ -225,10 +228,10 @@ theorem sphincsAtFrameT_cost (hP : Includes P Decoder.sphincsAtFrameTC.costDeps)
     machineCost P Decoder.sphincsAtFrameTC.costIdx [encodeValue Rt, encodeValue table, rdV, σV,
       encodeValue p] ≤ 2 * S + 4 * F + 1507 * (R + 1551) + 351525 := by
   rw [Decoder.sphincsAtFrameTC.costEq P hP Rt table rd rdV hrd σ σV hσ p]
-  have := hS (.n 47)
-  have := hFp (fn_idx% verify_sig_lean_sphincs) [p, σ (.n 47)] [] (by norm_num) (by simp)
+  have := hS (.n (val% «main» "byte_bits"))
+  have := hFp (fn_idx% verify_sig_lean_sphincs) [p, σ (.n (val% «main» "byte_bits"))] [] (by norm_num) (by simp)
   have := sphincsAtFp_cost P hrd hR table hFp (by includes) Rt hRt
-    (Decoder.frameFpA table (fn_idx% verify_sig_lean_sphincs) [p, σ (.n 47)] [])
+    (Decoder.frameFpA table (fn_idx% verify_sig_lean_sphincs) [p, σ (.n (val% «main» "byte_bits"))] [])
   omega
 
 omit hR hFp in
@@ -356,8 +359,8 @@ theorem frameWit_cost (D : DiscreteLogTables) (hP : Includes P Decoder.decWitNC.
       [encodeValue D, encodeValue p, encodeValue q] ≤ C)
     {Kc N X : ℕ} (hc : CountsWithin D σ Kc N X) (L : ℕ) (hL32 : L ≤ 2 ^ 32)
     (hLk : ∀ c < Decoder.nKidsD D σ,
-      Decoder.cursorLength D (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 25))
-        (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n 1885)) ≤ L) :
+      Decoder.cursorLength D (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n (val% «verify_sub» "stream")))
+        (Decoder.frameAtA table rd (fn_idx% verify_sub) (Decoder.subArgsK rd σ c) [] (.n (val% «verify_sub» "sumcheck_target~2"))) ≤ L) :
     machineCost P Decoder.decWitNC.costIdx [encodeValue D, encodeValue Tb, σV, rdV,
       .closure Decoder.decTopFramesC.lam0.costIdx [rdV, encodeValue table],
       .closure Decoder.decTopFramesC.lam1.costIdx [encodeValue Tb, rdV, encodeValue table],

@@ -7,6 +7,8 @@
 module
 
 public import LeanVM.Guest.B1.VerifySub.Lanes
+import LeanVM.Guest.ValRef
+import LeanVM.Guest.Data.ValNames.«verify_sub»
 
 /-!
 # The batching
@@ -68,9 +70,9 @@ theorem lam_dot_range (lam : E) (W : ℕ → E) : ∀ (k j : ℕ),
 
 /-- **Claim `j`'s value where `vsClaimAt` reads it.** -/
 theorem claim_load {claims : List ColumnClaim} (hcl : claims.length = 159)
-    (hpool : ReadsAt rd (σ (.n 6)) ((claims.take 4).map (·.value)))
-    (hcew : ReadsAt rd (σ (.n 565)) (((claims.drop 4).take 153).map (·.value)))
-    (hpi : ReadsAt rd (σ (.n 6) * gen ^ 157) ((claims.drop 157).map (·.value))) :
+    (hpool : ReadsAt rd (σ (.n (val% «verify_sub» "claim_pool"))) ((claims.take 4).map (·.value)))
+    (hcew : ReadsAt rd (σ (.n (val% «verify_sub» "col_eval_words"))) (((claims.drop 4).take 153).map (·.value)))
+    (hpi : ReadsAt rd (σ (.n (val% «verify_sub» "claim_pool")) * gen ^ 157) ((claims.drop 157).map (·.value))) :
     ∀ j < 159, LoadHolds rd (σ (.n (vsClaimAt j).1)) (vsClaimAt j).2
       ((claims.map (·.value)).getD j 0) := by
   intro j hj
@@ -96,7 +98,7 @@ theorem claim_load {claims : List ColumnClaim} (hcl : claims.length = 159)
 /-- The batching's steps from claim `j`. -/
 theorem lam_chain {lam : E} {W : ℕ → E}
     (hW : ∀ i < 134, LoadHolds rd (σ (.n (vsClaimAt (vsKept i)).1)) (vsClaimAt (vsKept i)).2 (W i))
-    (hl : σ (.n 1329) = lam) :
+    (hl : σ (.n (val% «verify_sub» "nxt[0]@36")) = lam) :
     ∀ (k j : ℕ) {nx : Prop} {T : E}, j + k ≤ 134 → σ (.n (vsTg j)) = T →
       σ (.n (vsPw j)) = lam ^ (j + 1) →
       Stmt.HoldsList C rd σ ((List.range' j k).flatMap vsLamStep) nx kret →
@@ -109,10 +111,10 @@ theorem lam_chain {lam : E} {W : ℕ → E}
     simp only [Atom.Holds] at l0 m1 a2 m3
     have hv := loadHolds_unique l0 (hW j (by omega))
     have hT' : σ (.n (vsTg (j + 1))) = T + lam ^ (j + 1) * W j := by
-      rw [show vsTg (j + 1) = 1344 + 4 * j by simp only [vsTg, Nat.add_one_ne_zero, ↓reduceIte]; omega,
+      rw [show vsTg (j + 1) = 1448 + 4 * j by simp only [vsTg, Nat.add_one_ne_zero, ↓reduceIte]; omega,
         a2, m1, hT, hP, hv]
     have hP' : σ (.n (vsPw (j + 1))) = lam ^ (j + 1 + 1) := by
-      rw [show vsPw (j + 1) = 1345 + 4 * j by simp only [vsPw, Nat.add_one_ne_zero, ↓reduceIte]; omega, m3, hP, hl, ← pow_succ]
+      rw [show vsPw (j + 1) = 1449 + 4 * j by simp only [vsPw, Nat.add_one_ne_zero, ↓reduceIte]; omega, m3, hP, hl, ← pow_succ]
     obtain ⟨e1, e2, hn⟩ := lam_chain hW hl k (j + 1) (by omega) hT' hP' h
     refine ⟨?_, ?_, hn⟩
     · rw [show j + (k + 1) = j + 1 + k by omega, e1, List.range'_succ, List.map_cons, List.sum_cons,
@@ -122,31 +124,31 @@ theorem lam_chain {lam : E} {W : ℕ → E}
 /-- **The batching challenge and the target**: `λ` squeezed, and the target
 `dot (powers λ 137)` of the ring switch's target, the claims kept (not an output lane's), the
 Keccak reduction's word and the out-of-domain value. -/
-theorem vsLamT_holds (h8 : σ (.n 8) = 0) (h9 : σ (.n 9) = 0) (h10 : σ (.n 10) = 0)
-    (h11 : σ (.n 11) = 0) {claims : List ColumnClaim} (hcl : claims.length = 159)
+theorem vsLamT_holds (h8 : σ (.n (val% «verify_sub» "s3#0[1]")) = 0) (h9 : σ (.n (val% «verify_sub» "s3#0[2]")) = 0) (h10 : σ (.n (val% «verify_sub» "s3#0[3]")) = 0)
+    (h11 : σ (.n (val% «verify_sub» "s3#0[4]")) = 0) {claims : List ColumnClaim} (hcl : claims.length = 159)
     (hcol : claims.map (·.column) = Tables.claimColumns)
-    (hpool : ReadsAt rd (σ (.n 6)) ((claims.take 4).map (·.value)))
-    (hcew : ReadsAt rd (σ (.n 565)) (((claims.drop 4).take 153).map (·.value)))
-    (hpi : ReadsAt rd (σ (.n 6) * gen ^ 157) ((claims.drop 157).map (·.value)))
-    {v : E} (hv : ReadsAt rd (σ (.n 309)) [v])
+    (hpool : ReadsAt rd (σ (.n (val% «verify_sub» "claim_pool"))) ((claims.take 4).map (·.value)))
+    (hcew : ReadsAt rd (σ (.n (val% «verify_sub» "col_eval_words"))) (((claims.drop 4).take 153).map (·.value)))
+    (hpi : ReadsAt rd (σ (.n (val% «verify_sub» "claim_pool")) * gen ^ 157) ((claims.drop 157).map (·.value)))
+    {v : E} (hv : ReadsAt rd (σ (.n (val% «verify_sub» "ood_value"))) [v])
     (h : Stmt.HoldsList C rd σ vsLamT next kret) :
-    (⟨[σ (.n 808), σ (.n 809), σ (.n 810), σ (.n 811), σ (.n 812)], []⟩ : Fs).squeeze =
-        (σ (.n 1329), ⟨[σ (.n 1337), σ (.n 1338), σ (.n 1339), σ (.n 1340), σ (.n 1341)], []⟩) ∧
-      σ (.n 1883) = dot (powers (σ (.n 1329)) 137)
-        (σ (.n 1328) :: ((claims.filter (fun c ↦ c.column ∉ keccakOutputColumns)).map (·.value) ++
-          [σ (.n 579), v])) ∧ next := by
+    (⟨[σ (.n (val% «verify_sub» "nxt[8]@35")), σ (.n (val% «verify_sub» "nxt[9]@35")), σ (.n (val% «verify_sub» "nxt[10]@35")), σ (.n (val% «verify_sub» "nxt[11]@35")), σ (.n (val% «verify_sub» "nxt[12]@35"))], []⟩ : Fs).squeeze =
+        (σ (.n (val% «verify_sub» "nxt[0]@36")), ⟨[σ (.n (val% «verify_sub» "nxt[8]@36")), σ (.n (val% «verify_sub» "nxt[9]@36")), σ (.n (val% «verify_sub» "nxt[10]@36")), σ (.n (val% «verify_sub» "nxt[11]@36")), σ (.n (val% «verify_sub» "nxt[12]@36"))], []⟩) ∧
+      σ (.n (val% «verify_sub» "target@136")) = dot (powers (σ (.n (val% «verify_sub» "nxt[0]@36"))) 137)
+        (σ (.n (val% «verify_sub» "target_in")) :: ((claims.filter (fun c ↦ c.column ∉ keccakOutputColumns)).map (·.value) ++
+          [σ (.n (val% «verify_sub» "keccak_word")), v])) ∧ next := by
   rw [vsLamT, holdsList_append, holds_cons1] at h
   obtain ⟨hsq, h⟩ := vsPermT_holds h8 h9 h10 h11 h
-  set lam := σ (.n 1329) with hlam
+  set lam := σ (.n (val% «verify_sub» "nxt[0]@36")) with hlam
   set W : ℕ → E := fun i ↦ (claims.map (·.value)).getD (vsKept i) 0 with hWdef
   have hW : ∀ i < 134, LoadHolds rd (σ (.n (vsClaimAt (vsKept i)).1)) (vsClaimAt (vsKept i)).2
       (W i) := fun i hi ↦
     claim_load hcl hpool hcew hpi (vsKept i) (by simp only [vsKept]; split <;> omega)
   rw [List.range_eq_range'] at h
-  obtain ⟨e1, e2, h⟩ := lam_chain hW rfl 134 0 (T := σ (.n 1328)) (by omega) rfl
+  obtain ⟨e1, e2, h⟩ := lam_chain hW rfl 134 0 (T := σ (.n (val% «verify_sub» "target_in"))) (by omega) rfl
     (by simp [vsPw]) h
-  rw [show vsTg (0 + 134) = 1876 from rfl] at e1
-  rw [show vsPw (0 + 134) = 1877 from rfl] at e2
+  rw [show vsTg (0 + 134) = 1980 from rfl] at e1
+  rw [show vsPw (0 + 134) = 1981 from rfl] at e2
   obtain ⟨m12, a13, m14, l15, m16, a17, hn⟩ := h
   simp only [Atom.Holds] at m12 a13 m14 l15 m16 a17
   have h15 := loadHolds_unique l15 (hv 0 (by simp))

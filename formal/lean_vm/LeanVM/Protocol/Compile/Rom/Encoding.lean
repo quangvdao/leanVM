@@ -9,13 +9,14 @@
 module
 
 public import Statement.LeanVmVerifier
-public import LeanVM.Facts.Verifier
-public import Statement.Fast.Keccak
-public import Statement.Fast.QuadExt
-public import Statement.Fast.FieldWords
+import LeanVM.Facts.Verifier
+import Statement.Fast.Keccak
+import Statement.Fast.QuadExt
+import Statement.Fast.FieldWords
 public import LeanVM.Protocol.Compile.Prog
-public import LeanVM.Protocol.KeccakHash
+import LeanVM.Protocol.KeccakHash
 public import LeanVM.Parameters.Field
+import LeanVM.Protocol.Field
 
 /-!
 # Encodings and uniformity for the random-oracle theorem
@@ -389,6 +390,26 @@ theorem sum_challengeOf_div (f : E → ℝ≥0∞) :
   have := sum_fst_div challengeEquiv f
   simp only [challengeEquiv_fst] at this
   exact this
+
+/-- **A uniform challenge lies in `K`, its second limb zero, with probability `2^-64`.** -/
+theorem sum_limb_one_eq_zero_div :
+    (∑ c : E, ind (c.limb 1 = 0)) / Fintype.card E = 2⁻¹ ^ 64 := by
+  let e : E ≃ UInt64 × UInt64 := lanesEquiv.symm.trans (piFinTwoEquiv fun _ ↦ UInt64)
+  have h := sum_snd_div e fun w ↦ ind (w = 0)
+  have h0 : (0 : K).lane = 0 := by decide
+  have he : ∀ c : E, ind ((e c).2 = 0) = ind (c.limb 1 = 0) := fun c ↦ by
+    have hiff : (c.limb 1).lane = 0 ↔ c.limb 1 = 0 :=
+      ⟨fun h ↦ K.lane_injective (h.trans h0.symm), fun h ↦ h ▸ h0⟩
+    show ind ((c.limb 1).lane = 0) = _
+    unfold ind
+    by_cases hc : c.limb 1 = 0
+    · simp only [hc, h0, ↓reduceIte]
+    · simp only [mt hiff.mp hc, hc, ↓reduceIte]
+  simp only [he] at h
+  have h1 : ∑ w : UInt64, ind (w = 0) = 1 := by
+    rw [Fintype.sum_eq_single 0 fun w hw ↦ by simp [ind, hw]]
+    simp [ind]
+  rw [h, h1, card_uint64, Nat.cast_pow, Nat.cast_ofNat, one_div, ENNReal.inv_pow]
 
 /-- Three lanes as a challenge (lanes `0, 1`) and a proof of work (lane `2`). -/
 def powLanesEquiv : (Fin 3 → UInt64) ≃ E × UInt64 where
