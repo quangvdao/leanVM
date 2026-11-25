@@ -29,8 +29,9 @@ const TASK: usize = 1 << 12;
 const MEMORY_SLOTS: usize = 256;
 
 /// Indices each worker holds back while it scatters instructions: more than for memory, since a loop's
-/// instructions recur only once per pass through it and every worker runs the same hot loops.
-const PROGRAM_SLOTS: usize = 4096;
+/// instructions recur only once per pass through it and every worker runs the same hot loops. With too few, the
+/// workers' evictions keep adding to the same entries, and the scatter stops scaling with the workers.
+const PROGRAM_SLOTS: usize = 1 << 16;
 
 /// A pointer column's words: the column's own in the stack, or a test's changed copy.
 enum Words<'a> {
@@ -319,12 +320,23 @@ fn tabulate_powers_in<W>(
 
 /// `f(j)` for `j < n`, in parallel.
 fn tabulate(n: usize, f: impl Fn(usize) -> F128 + Sync) -> Vec<F128> {
+    tabulate_in(n, |_| (), |(), j| f(j))
+}
+
+/// [`tabulate`] with `window` made once per task from its entries' range, for `f` to read from.
+fn tabulate_in<W>(
+    n: usize,
+    window: impl Fn(std::ops::Range<usize>) -> W + Sync,
+    f: impl Fn(&W, usize) -> F128 + Sync,
+) -> Vec<F128> {
     // SAFETY: every entry is written.
     unsafe {
         primitives::filled_vec(n, |out| {
             parallel::chunks_mut(out, TASK, |task, chunk| {
+                let start = task * TASK;
+                let w = window(start..start + chunk.len());
                 for (k, o) in chunk.iter_mut().enumerate() {
-                    *o = f(task * TASK + k);
+                    *o = f(&w, start + k);
                 }
             })
         })
@@ -558,11 +570,19 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
                         scale * omega[u]
                     });
                 }
-                let (bc, at) = pointer(plan.links.bytecode.pointer);
-                w_bc.add_repeated_words::<PROGRAM_SLOTS>(&chunks, bc.col(), &at, 0, |u| omega[u]);
-                let fp = cols[plan.links.state.fp];
-                w_fp.add_repeated_words::<PROGRAM_SLOTS>(&chunks, bc.col(), &at, 0, |u| omega[u].mul_base(fp[u]));
             }
+            // Every table's instructions in one pass, `ω` to the instruction's entry and `ω·fp` to its frame's.
+            let pcs: Vec<_> = (0..tables::N_TABLES)
+                .map(|t| pointer(t, plans[t].links.bytecode.pointer))
+                .collect();
+            let pc_words: Vec<(Col<u64>, &[u32])> = pcs.iter().map(|(w, at)| (w.col(), &at[..])).collect();
+            let fps: Vec<Col> = (0..tables::N_TABLES)
+                .map(|t| local(t)[plans[t].links.state.fp])
+                .collect();
+            Scatter::add_repeated_words_to::<2, PROGRAM_SLOTS>(&chunks, &pc_words, [w_bc, w_fp], |t, u| {
+                let w = omegas[t][u];
+                [w, w.mul_base(fps[t][u])]
+            });
             arrays
         };
         // Sized for an honest execution's indices: cycles and their successors, memory cells and bytecode
@@ -597,16 +617,15 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[Col], prog
         let (mem_len, bc_len) = (reach(1 << log_mem, w_mem.len()), reach(bytecode_size, w_bc.len()));
         let gm = ch.gamma_mem;
         let mem = &columns[MEMORY_0..=MEMORY_1];
-        // The word table, `lo + y·hi` per cell: the two memory columns' limbs as they are.
-        let words = {
-            let (m0, m1) = (mem[0].window(0, 1 << log_mem), mem[1].window(0, 1 << log_mem));
-            tabulate(1 << log_mem, |j| F128::new(m0[j].0, m1[j].0))
-        };
         // Each task reads its memory cells as one run of each column.
         let cells = |r: std::ops::Range<usize>| {
             let (start, end) = (r.start.min(1 << log_mem), r.end.min(1 << log_mem));
             (start, mem[0].window(start, end), mem[1].window(start, end))
         };
+        // The word table, `lo + y·hi` per cell: the two memory columns' limbs as they are.
+        let words = tabulate_in(1 << log_mem, cells, |(start, m0, m1), j| {
+            F128::new(m0[j - start].0, m1[j - start].0)
+        });
         // Each entry's mixed products are summed unreduced and reduced once.
         let y_mem = tabulate_powers_in(mem_len, cells, |(start, m0, m1), j, g_j| {
             let y = gm[0].mul_base_unreduced(g_j);

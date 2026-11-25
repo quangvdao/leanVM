@@ -15,7 +15,7 @@ use primitives::field::{F64, F128};
 /// A column smaller than its lane group is split ([`verifier::stack_offsets`]): its
 /// rows `j·2^piece_vars..` then sit at `offset + j·2^lane`, a lane down per piece. The ring
 /// switch reads it piece by piece, and a point claim at one striped stack point
-/// ([`Placement::claim`]).
+/// (`Placement::claim`).
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
     pub n_vars: usize,

@@ -1878,15 +1878,15 @@ impl<'a> State<'a> {
         &self,
         setup: &RoundSetup,
         column: usize,
+        pairs: std::ops::Range<usize>,
         chunks: &Chunks,
         points: &RowPoints,
         derive: bool,
     ) -> Poly {
         let c = &self.columns[column];
         let n = 1 << self.bound.len();
-        let below = setup.pairs.min(self.whole());
         let mut sums = KeyWeights::new(REPEAT_SAMPLE);
-        for k in 0..below {
+        for k in pairs {
             if let Some(key) = c.pair_key(n, k) {
                 sums.add(key, at(&self.omega, 2 * k) + at(&self.omega, 2 * k + 1));
             }
@@ -2620,9 +2620,18 @@ pub fn prove(
                         .map(move |(c, _)| (t, c))
                 })
                 .collect();
-            let terms = parallel::map_collect(repeated.len(), |j| {
-                let (t, c) = repeated[j];
-                states[t].repeated_terms(setups[t].as_ref().unwrap(), c, chunks, points, derive)
+            // Each column's pairs below `whole` in a few ranges per worker, each range summing its own distinct
+            // pairs: the terms are linear in the weights, so the ranges' polynomials add up to the column's.
+            let jobs: Vec<(usize, usize, std::ops::Range<usize>)> = (repeated.iter())
+                .flat_map(|&(t, c)| {
+                    let below = setups[t].as_ref().unwrap().pairs.min(states[t].whole());
+                    let parts = (below / REPEAT_SAMPLE).clamp(1, 4 * parallel::num_threads());
+                    (0..parts).map(move |p| (t, c, p * below / parts..(p + 1) * below / parts))
+                })
+                .collect();
+            let terms = parallel::map_collect(jobs.len(), |j| {
+                let (t, c, ref pairs) = jobs[j];
+                states[t].repeated_terms(setups[t].as_ref().unwrap(), c, pairs.clone(), chunks, points, derive)
             });
             for p in &terms {
                 add_into(&mut poly, p);

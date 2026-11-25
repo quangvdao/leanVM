@@ -573,7 +573,7 @@ impl Scatter {
 
     /// [`Scatter::add_words`] for words that repeat, such as instructions and memory cells: with several workers,
     /// each sums the adds to an index that rows hit again soon after, holding back up to `SLOTS` indices
-    /// ([`Combine`]).
+    /// (`Combine`).
     pub fn add_repeated_words<const SLOTS: usize>(
         &self,
         chunks: &Chunks,
@@ -618,9 +618,10 @@ impl Scatter {
             assert_eq!(index.len(), rows, "an index per word");
         }
         let top = 1usize << chunks.width;
-        parallel::for_each_chunk(rows.div_ceil(TASK_PAIRS), |start, end| {
-            let mut combine = adder();
-            for task in start..end {
+        per_worker(
+            rows.div_ceil(TASK_PAIRS),
+            || [adder()],
+            |[combine], task| {
                 for u in task * TASK_PAIRS..rows.min((task + 1) * TASK_PAIRS) {
                     for (a, &(words, index, shift)) in accesses.iter().enumerate() {
                         if let Some(&j) = index.get(u + PREFETCH)
@@ -644,8 +645,64 @@ impl Scatter {
                         }
                     }
                 }
+            },
+        );
+    }
+
+    /// [`Scatter::add_repeated_words`] of several tables' words into several arrays in one pass: row `u` of table
+    /// `t` adds `weights(t, u)[a]` at its index in `targets[a]`, each worker holding back up to `SLOTS` indices
+    /// per array (`Combine`).
+    pub fn add_repeated_words_to<const K: usize, const SLOTS: usize>(
+        chunks: &Chunks,
+        tables: &[(Col<u64>, &[u32])],
+        targets: [&Scatter; K],
+        weights: impl Fn(usize, usize) -> [F128; K] + Sync,
+    ) {
+        for &(words, index) in tables {
+            assert_eq!(index.len(), words.len(), "an index per word");
+        }
+        let top = 1usize << chunks.width;
+        // Every table's tasks in one dispatch.
+        let mut first = vec![0];
+        for &(words, _) in tables {
+            first.push(first.last().unwrap() + words.len().div_ceil(TASK_PAIRS));
+        }
+        // One worker contends with no one, so it adds each row straight in.
+        let alone = targets.iter().any(|a| a.alone);
+        let make = || {
+            targets.map(|a| {
+                if alone {
+                    Either::Direct(Direct(a))
+                } else {
+                    Either::Combine(Combine::<SLOTS>::new(a))
+                }
+            })
+        };
+        per_worker(*first.last().unwrap(), make, |adders, task| {
+            let t = first.partition_point(|&f| f <= task) - 1;
+            let (words, index) = tables[t];
+            let start = (task - first[t]) * TASK_PAIRS;
+            for u in start..words.len().min(start + TASK_PAIRS) {
+                if let Some(&j) = index.get(u + PREFETCH)
+                    && j != NO_INDEX
+                {
+                    targets.iter().for_each(|a| a.prefetch(j as usize));
+                }
+                let w = weights(t, u);
+                let mut add = |j: usize| {
+                    if j < top {
+                        for (adder, &v) in adders.iter_mut().zip(&w) {
+                            if !v.is_zero() {
+                                Adder::add(adder, j, v);
+                            }
+                        }
+                    }
+                };
+                match index[u] {
+                    NO_INDEX => chunks.indices(words[u], &mut add),
+                    j => add(j as usize),
+                }
             }
-            combine.flush();
         });
     }
 
@@ -674,10 +731,60 @@ impl Scatter {
     }
 }
 
+/// Run `body` on each task in `0..n_tasks`, in parallel, each worker with its own adders, made once by `make`
+/// rather than once per claim, then flush every worker's adders.
+fn per_worker<A: Adder, const K: usize>(
+    n_tasks: usize,
+    make: impl Fn() -> [A; K] + Sync,
+    body: impl Fn(&mut [A; K], usize) + Sync,
+) {
+    let adders: Vec<[A; K]> = parallel::map_reduce_with_state(
+        n_tasks,
+        || (),
+        Vec::new,
+        |(), adders: &mut Vec<[A; K]>, task| {
+            if adders.is_empty() {
+                adders.push(make());
+            }
+            body(&mut adders[0], task);
+        },
+        |mut a, mut b| {
+            a.append(&mut b);
+            a
+        },
+    );
+    // Then every worker's held-back adds, in parallel.
+    parallel::for_each(adders.len() * K, |i| adders[i / K][i % K].flush());
+}
+
 /// Where a worker of [`Scatter::add_words_with`] sends its adds.
-trait Adder {
+trait Adder: Send + Sync {
     fn add(&mut self, j: usize, value: F128);
-    fn flush(self);
+    /// Add what is held back.
+    fn flush(&self);
+}
+
+/// [`Direct`] alone, [`Combine`] with other workers.
+enum Either<'a, const N: usize> {
+    Direct(Direct<'a>),
+    Combine(Combine<'a, N>),
+}
+
+impl<const N: usize> Adder for Either<'_, N> {
+    #[inline(always)]
+    fn add(&mut self, j: usize, value: F128) {
+        match self {
+            Self::Direct(a) => a.add(j, value),
+            Self::Combine(a) => a.add(j, value),
+        }
+    }
+
+    fn flush(&self) {
+        match self {
+            Self::Direct(a) => a.flush(),
+            Self::Combine(a) => a.flush(),
+        }
+    }
 }
 
 /// Each add straight into the [`Scatter`].
@@ -689,7 +796,7 @@ impl Adder for Direct<'_> {
         self.0.add(j, value);
     }
 
-    fn flush(self) {}
+    fn flush(&self) {}
 }
 
 /// The adds of one worker into a [`Scatter`], with the latest index at each of `N` slots (by its low bits) held
@@ -728,8 +835,7 @@ impl<const N: usize> Adder for Combine<'_, N> {
         self.values[slot] = value;
     }
 
-    /// Add what is held back.
-    fn flush(self) {
+    fn flush(&self) {
         for (&key, &value) in self.keys.iter().zip(self.values.iter()) {
             if key != u32::MAX {
                 self.scatter.add(key as usize, value);
