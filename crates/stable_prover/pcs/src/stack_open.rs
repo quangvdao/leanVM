@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn ood_value_is_the_padded_stack_evaluation() {
         let mut rng = Rng::new(0x919);
-        let (log_n, lane_vars) = (16, 10);
+        let (log_n, lane_vars) = (16, 16 - INITIAL_FOLDING_FACTOR);
         let stack: Vec<F64> = (0..13 << lane_vars).map(|_| F64(rng.next_u64())).collect();
         let mut ps = ProverState::new([1; 4], [2; 4]);
         let StackClaim { offset, low_point } = commit(&mut ps, &stack, log_n, 1).ood;

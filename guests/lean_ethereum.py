@@ -162,6 +162,17 @@ STK_GROUP_START = STK_GROUP_START_PLACEHOLDER  # a block group's first block, th
 STK_STRIDE = STK_STRIDE_PLACEHOLDER  # above twice the block count: a rank key's size step
 STK_KEY_BOUND = SIZE_BITS * STK_STRIDE  # above any step between two rank keys
 STK_MIN_LOG = STK_MIN_LOG_PLACEHOLDER
+# The stack's lanes (multilinear::stack_offsets): 2^LANE_FOLD of them (verifier::INITIAL_FOLDING_FACTOR), in lane
+# groups of at most 2^STRIPE_W (verifier::MAX_STRIPE_WIDTH). certify_stack names a lane count L's groups by id: id
+# j < LANE_LOW is the group of 2^j lanes for bit j of L, and id LANE_LOW + k the k-th group of 2^STRIPE_W lanes, one
+# per unit of L >> STRIPE_W, whose LANE_FULL_BITS bits are L's from STRIPE_W up.
+LANE_FOLD = LANE_FOLD_PLACEHOLDER
+STRIPE_W = STRIPE_W_PLACEHOLDER
+STRIPE_WIDTHS = STRIPE_WIDTHS_PLACEHOLDER  # STRIPE_W + 1, the lane-group widths 0..=STRIPE_W
+LANE_LOW = LANE_LOW_PLACEHOLDER
+LANE_FULL = LANE_FULL_PLACEHOLDER
+LANE_FULL_BITS = LANE_FULL_BITS_PLACEHOLDER
+N_LANE_GROUPS = LANE_LOW + LANE_FULL
 # Global maxima; StackBuf frame sizes are parse-time, so they must be baked.
 LIG_MAX_LEVELS = LIG_MAX_LEVELS_PLACEHOLDER
 # A rate's tables follow the previous rate's, every size and level of it.
@@ -201,7 +212,7 @@ SEL_TAB_NIBBLES = (SIZE_BITS + 3) // 4  # nibbles of a small exponent (assert_sm
 WIN_TAB_AT = SIZE_BITS + 16 * SEL_TAB_NIBBLES  # a bit window's pattern by its g-power: [g^n] = n
 WIN_TAB_BITS = 11
 WIN_TAB_LEN = 2 ** WIN_TAB_BITS
-TAKEN_AT = WIN_TAB_AT + WIN_TAB_LEN  # a block's taken log by its kappa: [g^k] = g^max(k, 5)
+TAKEN_AT = WIN_TAB_AT + WIN_TAB_LEN  # a block's taken log by its kappa: [g^k] = g^max(k, STRIPE_W)
 
 # The Hotwire link (verifier::link, verifier::layout::tables): the tables' non-pointer columns arrive
 # in one sent run, SENT_START per table; a form is TERM_COEF * a * b over that run, a missing factor
@@ -687,9 +698,9 @@ def exponent_tables():
     for n in unroll(0, WIN_TAB_LEN):
         g_squares[GEN ** (WIN_TAB_AT + n)] = const(n)
     # And a stack block's taken log, at least the widest lane group's.
-    for k in unroll(0, 5):
-        g_squares[GEN ** (TAKEN_AT + k)] = GEN ** 5
-    for k in unroll(5, SIZE_BITS):
+    for k in unroll(0, STRIPE_W):
+        g_squares[GEN ** (TAKEN_AT + k)] = GEN ** STRIPE_W
+    for k in unroll(STRIPE_W, SIZE_BITS):
         g_squares[GEN ** (TAKEN_AT + k)] = GEN ** k
     return g_squares
 
@@ -2410,12 +2421,12 @@ def ring_switch_target(slices, map_challenges):
 
 def certify_stack(kappa_base, g_squares):
     # Certify the binary stripe (multilinear::stack_offsets). Every block takes
-    # 2^max(kappa, 5) words, and the blocks go end to end, sorted by that size down,
+    # 2^max(kappa, STRIPE_W) words, and the blocks go end to end, sorted by that size down,
     # ring blocks first among equals, then by index. A block group is consecutive in
     # that order, so a hinted order of the groups, certified strictly descending in
     # its rank key, places every block at a running sum `at`. The lanes split into
     # groups of 2^w lanes, the powers of two in the lane count L, largest first, at
-    # most 32 lanes each. A block smaller than its group is cut into one piece per lane
+    # most 2^STRIPE_W lanes each. A block smaller than its group is cut into one piece per lane
     # of the group, at one in-lane offset: its Spot's offset is the group's first word
     # plus `into / 2^w`, where `into` is `at` less that first word.
     # Returns the stack's log and lane log, as g-powers, and per block its Spot's
@@ -2450,31 +2461,47 @@ def certify_stack(kappa_base, g_squares):
         prev_key = key
 
     gmv = log2_ceil_in_the_exponent(g_total, g_squares, STK_MIN_LOG, SIZE_BITS)
-    lane_g = gmv * INV_GEN ** 6
+    lane_g = gmv * INV_GEN ** LANE_FOLD
     # L, the lanes the blocks fill: 0 <= L 2^lane - total < 2^lane.
-    lane_bits = HeapBuf(7)
-    hint_witness(lane_bits[0:7], "stk_lane_bits")
+    lane_bits = HeapBuf(LANE_FOLD + 1)
+    hint_witness(lane_bits[0:LANE_FOLD + 1], "stk_lane_bits")
     g_lanes = GEN ** 0
-    for k in unroll(0, 7):
+    for k in unroll(0, LANE_FOLD + 1):
         b = lane_bits[GEN ** k]
         assert b * b == b
         g_lanes *= 1 + b * (1 + g_squares[lane_g * GEN ** k])
     assert log(g_lanes / g_total) < log(g_squares[lane_g])
-    # The lane groups: group j < 6 is 2^j lanes, there iff bit j of L is, after the
-    # higher bits' lanes; groups 6 and 7 are the two halves of a full stack.
-    grp_valid = HeapBuf(8)
-    grp_first = HeapBuf(8)  # g^(first lane 2^lane)
-    grp_w = HeapBuf(8)
-    b6 = lane_bits[GEN ** 6]
-    grp_valid[GEN ** 6] = b6
-    grp_first[GEN ** 6] = GEN ** 0
-    grp_w[GEN ** 6] = GEN ** 5
-    grp_valid[GEN ** 7] = b6
-    grp_first[GEN ** 7] = g_squares[lane_g * GEN ** 5]
-    grp_w[GEN ** 7] = GEN ** 5
-    first = 1 + b6 * (1 + g_squares[lane_g * GEN ** 6])
-    for jj in unroll(0, 6):
-        j = 5 - jj
+    # The lane groups (see N_LANE_GROUPS), each there or not, its first word g^(first
+    # lane 2^lane) and its g^w. Full group k is there iff k < L >> STRIPE_W: some bit i
+    # of L >> STRIPE_W is set where k's is clear, the bits above i agreeing. At most one
+    # such i exists, so the terms add.
+    grp_valid = HeapBuf(N_LANE_GROUPS)
+    grp_first = HeapBuf(N_LANE_GROUPS)
+    grp_w = HeapBuf(N_LANE_GROUPS)
+    full_step = g_squares[lane_g * GEN ** STRIPE_W]
+    full_first = GEN ** 0
+    for k in unroll(0, LANE_FULL):
+        there = 0
+        for i in unroll(0, LANE_FULL_BITS):
+            if const((k // 2 ** i) % 2 == 0):
+                term = lane_bits[GEN ** (STRIPE_W + i)]
+                for i2 in unroll(i + 1, LANE_FULL_BITS):
+                    if const((k // 2 ** i2) % 2 == 1):
+                        term = term * lane_bits[GEN ** (STRIPE_W + i2)]
+                    else:
+                        term = term * (1 + lane_bits[GEN ** (STRIPE_W + i2)])
+                there = there + term
+        grp_valid[GEN ** (LANE_LOW + k)] = there
+        grp_first[GEN ** (LANE_LOW + k)] = full_first
+        grp_w[GEN ** (LANE_LOW + k)] = GEN ** STRIPE_W
+        full_first *= full_step
+    # Group j < LANE_LOW starts after the full groups and the higher bits' lanes.
+    first = GEN ** 0
+    for i in unroll(0, LANE_FULL_BITS):
+        b = lane_bits[GEN ** (STRIPE_W + i)]
+        first *= 1 + b * (1 + g_squares[lane_g * GEN ** (STRIPE_W + i)])
+    for jj in unroll(0, LANE_LOW):
+        j = LANE_LOW - 1 - jj
         b = lane_bits[GEN ** j]
         grp_valid[GEN ** j] = b
         grp_first[GEN ** j] = first
@@ -2498,7 +2525,7 @@ def certify_stack(kappa_base, g_squares):
             whole = block_hint[GEN ** (4 * b + 1)]
             small = block_hint[GEN ** (4 * b + 2)]
             off_g = block_hint[GEN ** (4 * b + 3)]
-            assert log(j) < 8
+            assert log(j) < N_LANE_GROUPS
             assert grp_valid[j] == 1
             w_g = grp_w[j]
             first_g = grp_first[j]
@@ -2515,11 +2542,11 @@ def certify_stack(kappa_base, g_squares):
             e_neg = 1 / e_g
             assert log(e_neg + small * (e_g * INV_GEN + e_neg)) < SIZE_BITS
             kappa1 = kappa_g + small * (kappa_g + w_eff)
-            assert log(w_eff) < 6
+            assert log(w_eff) < STRIPE_WIDTHS
             # into = off 2^w_eff with off < 2^lane bounds into below 2^(lane + w_eff) <= 2^(lane + w)
             # (no wrap: lane + w < 64), without a range check as wide as the stack.
             assert log(off_g) < log(g_squares[lane_g])
-            spread = match(log(w_eff), range(0, 6), lambda w: pow_2w(off_g, w))
+            spread = match(log(w_eff), range(0, STRIPE_WIDTHS), lambda w: pow_2w(off_g, w))
             assert spread == into_g
             spot_off[GEN ** b] = first_g * off_g
             piece_log[GEN ** b] = kappa1 / w_eff
@@ -2869,12 +2896,12 @@ def stack_spread_selectors(spot_off, piece_log, kappa_base, point, point1, g_squ
     sel_eq = selector_tables(point, point1)
     sel_g = g_squares * GEN ** SIZE_BITS
     lane_eq = point1 * lane_g
-    lane_prod = HeapBuf(6)
-    lane_inv = HeapBuf(6)
+    lane_prod = HeapBuf(STRIPE_WIDTHS)
+    lane_inv = HeapBuf(STRIPE_WIDTHS)
     lane_prod[GEN ** 0] = 1
     lane_inv[GEN ** 0] = 1
     acc = 1
-    for i in unroll(1, 6):
+    for i in unroll(1, STRIPE_WIDTHS):
         acc = acc * lane_eq[GEN ** (i - 1)]
         lane_prod[GEN ** i] = acc
         lane_inv[GEN ** i] = 1 / acc
@@ -2887,7 +2914,7 @@ def stack_spread_selectors(spot_off, piece_log, kappa_base, point, point1, g_squ
         offset = spot_off[GEN ** b]
         piece_g = piece_log[GEN ** b]
         v_g = kb[STK_SRC[b]] * GEN ** STK_ADJ[b] / piece_g
-        assert log(v_g) < 6
+        assert log(v_g) < STRIPE_WIDTHS
         assert log(piece_g) < N_COLUMN_LOGS
         sel = match(log(piece_g), range(0, N_COLUMN_LOGS), lambda kappa: column_selector(offset, sel_eq, sel_g, kappa))
         sel_v[GEN ** b] = sel * lane_inv[v_g]
@@ -2908,8 +2935,8 @@ def ring_tail(row, zs, ps, scale, v: Const):
     # sum_k row_k scale^(2^k) prod_{i < v} (zs_i^(2^k) + ps_i): a ring piece's weight
     # (ring_switch::ring_weight) from its row's prefix product, the coordinates its
     # point puts on lane coordinates, and its scale.
-    zv = StackBuf(5 * BASE_FIELD_BITS)
-    a = StackBuf(6)
+    zv = StackBuf(STRIPE_W * BASE_FIELD_BITS)
+    a = StackBuf(STRIPE_WIDTHS)
     for i in unroll(0, v):
         zv[BASE_FIELD_BITS * i] = zs[GEN ** i]
         a[i] = ps[GEN ** i]
@@ -2929,8 +2956,8 @@ def ring_tail(row, zs, ps, scale, v: Const):
 
 def ring_tail_row(out, row, zs, ps, v: Const):
     # out_k = row_k prod_{i < v} (zs_i^(2^k) + ps_i): ring_tail before its scale.
-    zv = StackBuf(5 * BASE_FIELD_BITS)
-    a = StackBuf(6)
+    zv = StackBuf(STRIPE_W * BASE_FIELD_BITS)
+    a = StackBuf(STRIPE_WIDTHS)
     for i in unroll(0, v):
         zv[BASE_FIELD_BITS * i] = zs[GEN ** i]
         a[i] = ps[GEN ** i]
@@ -3007,8 +3034,8 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     sel2 = sel_v[GEN ** 2]
     row_k = rs_eq_run(in_point, point1, p2, c_table)
     a_k = in_point * p2
-    assert log(v2) < 6
-    w_kring = match(log(v2), range(0, 6), lambda v: ring_tail(row_k, a_k, lane1, 1, v))
+    assert log(v2) < STRIPE_WIDTHS
+    w_kring = match(log(v2), range(0, STRIPE_WIDTHS), lambda v: ring_tail(row_k, a_k, lane1, 1, v))
     w_total = w_kring * sel2
 
     # The pointer columns' ring claim, column q scaled by eq(q_point, q). A table's
@@ -3017,7 +3044,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     ring_rows(rchi, chi, point1, c_link, g_n)
     # A q_keccak slot's bits, for the sent columns and the pointer columns on slots.
     eq_prefix_chain(chain_chi, 1, chi, point1, g_n)
-    done = match(log(v2), range(0, 6), lambda w: slot_point(tpt, point, h5_g, lane_g, w))
+    done = match(log(v2), range(0, STRIPE_WIDTHS), lambda w: slot_point(tpt, point, h5_g, lane_g, w))
     eqtree(tpt, tq, QKECCAK_SLOT_LOG)
     # A pointer column on a slot is q_keccak at (chi[..h5], slot): its rows' product,
     # then the slot's bits, Boolean, so one eq factor for every Frobenius power.
@@ -3031,7 +3058,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
             row0 = rchi * p0 ** BASE_FIELD_BITS
             a0 = chi * p0
             trow = ptab * GEN ** (BASE_FIELD_BITS * t)
-            done = match(log(v0), range(0, 6), lambda v: ring_tail_row(trow, row0, a0, lane1, v))
+            done = match(log(v0), range(0, STRIPE_WIDTHS), lambda v: ring_tail_row(trow, row0, a0, lane1, v))
             for q in unroll(PTR_START[t], PTR_START[t + 1]):
                 b = PTR_BLOCK[q]
                 if const(b // N_STK_BLOCKS != 0):
@@ -3048,7 +3075,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
                         row = rchi * p_g ** BASE_FIELD_BITS
                         a_q = chi * p_g
                         scale = eq_q[GEN ** (EQ_Q_AT + q)]
-                        wq = match(log(v_g), range(0, 6), lambda v: ring_tail(row, a_q, lane1, scale, v))
+                        wq = match(log(v_g), range(0, STRIPE_WIDTHS), lambda v: ring_tail(row, a_q, lane1, scale, v))
                         pext[GEN ** q] = wq * sel_v[GEN ** b]
                 w_link = w_link + pext[GEN ** q]
             scl = eq_q * GEN ** (EQ_Q_AT + PTR_START[t])
@@ -3061,13 +3088,13 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     p_m0 = piece_log[GEN ** 0]
     v_m0 = spread[GEN ** 0]
     a_m0 = r_pt * p_m0
-    assert log(v_m0) < 6
-    er_m0 = match(log(v_m0), range(0, 6), lambda v: eq_run(a_m0, lane1, v))
+    assert log(v_m0) < STRIPE_WIDTHS
+    er_m0 = match(log(v_m0), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_m0, lane1, v))
     p_m1 = piece_log[GEN ** 1]
     v_m1 = spread[GEN ** 1]
     a_m1 = r_pt * p_m1
-    assert log(v_m1) < 6
-    er_m1 = match(log(v_m1), range(0, 6), lambda v: eq_run(a_m1, lane1, v))
+    assert log(v_m1) < STRIPE_WIDTHS
+    er_m1 = match(log(v_m1), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_m1, lane1, v))
     lam_pow = lam
     w_mem = gm1b * chain_r[p_m0] * er_m0 * sel_v[GEN ** 0] + gm2b * chain_r[p_m1] * er_m1 * sel_v[GEN ** 1]
     w_total = w_total + lam_pow * w_mem
@@ -3082,8 +3109,8 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
                 p_g = piece_log[GEN ** b]
                 v_g = spread[GEN ** b]
                 a_j = chi * p_g
-                assert log(v_g) < 6
-                er = match(log(v_g), range(0, 6), lambda v: eq_run(a_j, lane1, v))
+                assert log(v_g) < STRIPE_WIDTHS
+                er = match(log(v_g), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_j, lane1, v))
                 wgt = chain_chi[p_g] * er * sel_v[GEN ** b]
             else:
                 wgt = slot_eq * tq[GEN ** (2 ** QKECCAK_SLOT_LOG - 2 + SENT_TARGET[j] - N_STK_BLOCKS)]
@@ -3096,9 +3123,9 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
         pi_pt[GEN ** i] = 0
     eq_prefix_chain(chain_pi, 1, pi_pt, point1, g_log_mem)
     a_p0 = pi_pt * p_m0
-    ep0 = match(log(v_m0), range(0, 6), lambda v: eq_run(a_p0, lane1, v))
+    ep0 = match(log(v_m0), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_p0, lane1, v))
     a_p1 = pi_pt * p_m1
-    ep1 = match(log(v_m1), range(0, 6), lambda v: eq_run(a_p1, lane1, v))
+    ep1 = match(log(v_m1), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_p1, lane1, v))
     lam_pow = lam_pow * lam
     w_total = w_total + lam_pow * chain_pi[p_m0] * ep0 * sel_v[GEN ** 0]
     lam_pow = lam_pow * lam
@@ -3107,7 +3134,7 @@ def check_stack_terminal(g_squares, kappa_base, spot_off, piece_log, lane_g, gmv
     # The Keccak reduction's claim on the committed outputs, over the whole column.
     eq_prefix_chain(chain_out, 1, z_vals, point1, kq_g)
     a_o = z_vals * p2
-    eo = match(log(v2), range(0, 6), lambda v: eq_run(a_o, lane1, v))
+    eo = match(log(v2), range(0, STRIPE_WIDTHS), lambda v: eq_run(a_o, lane1, v))
     lam_pow = lam_pow * lam
     w_total = w_total + lam_pow * chain_out[p2] * eo * sel2
 

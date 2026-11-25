@@ -616,16 +616,14 @@ mod tests {
         let (kappas, pointer): (Vec<Option<usize>>, Vec<bool>) = columns.into_iter().unzip();
         let (placements, shape) = placements_of(&kappas, &pointer);
         let lane = shape.mu - crate::pcs::LOG_BATCH;
+        // The first lane group: the largest power of two in the lane count, at most the widest stripe.
+        let first_group = (shape.n_lanes.ilog2() as usize).min(verifier::MAX_STRIPE_WIDTH);
         for i in (0..kappas.len()).filter(|&i| kappas[i].is_some()) {
             let p = placements[i];
             let spread = p.n_vars - p.piece_vars;
             if p.n_vars >= 12 {
-                // These fill the first 32 lanes, a lane group of the widest stripe.
-                assert_eq!(
-                    spread,
-                    verifier::MAX_STRIPE_WIDTH,
-                    "column {i} has a piece per lane of its group"
-                );
+                // These fill the first lane group: 32 lanes at an initial fold of 6, 16 at 5.
+                assert_eq!(spread, first_group, "column {i} has a piece per lane of its group");
             }
             assert_eq!(
                 (p.offset >> lane) % (1 << spread),

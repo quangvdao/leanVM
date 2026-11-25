@@ -74,7 +74,11 @@ fn tampers_fail_their_check() {
     )
     .unwrap()
     .stack_log;
-    let (mut mu, mut k) = (stack_log - 6, 6); // the ladder: 6 lane variables, then 4 a level while over 5 remain
+    // The ladder: the initial fold's lane variables, then 4 a level while over 5 remain.
+    let (mut mu, mut k) = (
+        stack_log - verifier::INITIAL_FOLDING_FACTOR,
+        verifier::INITIAL_FOLDING_FACTOR,
+    );
     while mu > 5 {
         k = mu.min(4);
         mu -= k;

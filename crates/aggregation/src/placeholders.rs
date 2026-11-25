@@ -456,7 +456,7 @@ fn opening_placeholders(ph: &mut Placeholders, kbc: usize) {
     // The guest rotates the terminal point by the lane-fold count to index it by
     // witness coordinate, and the residual segment is what it rotates the last
     // lane challenges past, so the residual may never be longer than that fold
-    // (`RESIDUAL_MAX_LOG` < `INITIAL_FOLDING_FACTOR` keeps this true by a margin).
+    // (`RESIDUAL_MAX_LOG` <= `INITIAL_FOLDING_FACTOR` keeps this true).
     assert!(
         cands.iter().all(|c| c.yr_log_len() <= c.folds[0]),
         "residual longer than the lane fold: the guest's point rotation has no room"
@@ -578,6 +578,12 @@ fn stack_placeholders(ph: &mut Placeholders) {
     ph.list("STK_GROUP_START", starts.iter().copied().chain([blocks.len()]));
     ph.set("STK_STRIDE", 2 * blocks.len() + 1);
     ph.set("STK_MIN_LOG", verifier::layout::MIN_STACKED_LOG);
+    ph.set("LANE_FOLD", verifier::INITIAL_FOLDING_FACTOR);
+    ph.set("STRIPE_W", verifier::MAX_STRIPE_WIDTH);
+    ph.set("STRIPE_WIDTHS", verifier::MAX_STRIPE_WIDTH + 1);
+    ph.set("LANE_LOW", super::stripe::LANE_LOW);
+    ph.set("LANE_FULL", super::stripe::LANE_FULL);
+    ph.set("LANE_FULL_BITS", super::stripe::LANE_FULL_BITS);
 }
 
 /// The deferred claim on the split program, the batch's seed, and the statement's layout.

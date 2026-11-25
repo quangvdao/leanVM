@@ -338,7 +338,8 @@ mod tests {
     /// with an explicit zero tail: same proof, root included.
     #[test]
     fn truncated_lanes_match_an_explicit_zero_tail() {
-        for (log_n, lanes) in [(16usize, &[1usize, 5, 64][..]), (18, &[5, 64][..])] {
+        let all = 1usize << INITIAL_FOLDING_FACTOR;
+        for (log_n, lanes) in [(16usize, &[1usize, 5, all][..]), (18, &[5, all][..])] {
             let lane_vars = log_n - INITIAL_FOLDING_FACTOR;
             let lane_block = 1usize << lane_vars;
             for &n_lanes in lanes {

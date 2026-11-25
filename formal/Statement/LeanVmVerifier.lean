@@ -48,7 +48,7 @@ parameters instantiate (Annex B, `fig:protocol`, `doc/leanvm/body/b-polynomial-c
 and gives no numbers.
 
 An opening of a stack of `2^μ` elements of `K` at rate `2^-R` runs a *ladder* of levels. Level 0
-folds `initialFold = 6` variables; every later level folds `subsequentFold = 4`, or what remains,
+folds `initialFold = 5` variables; every later level folds `subsequentFold = 4`, or what remains,
 until at most `residualMaxLog = 5` variables remain, which the final level closes with a sumcheck.
 The rate exponent of a level is the previous one plus the previous fold minus a domain reduction,
 `initialReduction = 3` after level 0 and `subsequentReduction = 1` after every later level. Every
@@ -74,7 +74,7 @@ sizes.
 namespace LeanVM.Parameters.Whir
 
 /-- Variables folded at level 0: the lane fold (`INITIAL_FOLDING_FACTOR`, `whir.rs`). -/
-def initialFold : ℕ := 6
+def initialFold : ℕ := 5
 
 /-- Variables folded at every later level (`SUBSEQUENT_FOLDING_FACTOR`, `whir.rs`). -/
 def subsequentFold : ℕ := 4
@@ -150,22 +150,22 @@ def ladderShape (μ logInvRate : ℕ) : List (ℕ × ℕ) :=
 /-- The query counts `WHIR_QUERIES` of `whir.rs`, verbatim: row `R - 1` for the rate
 exponent `R`, entry `μ - 16` for the stack size `μ`, one count per level. -/
 def queryTable : List (List (List ℕ)) := [
-  [[230, 60, 42], [225, 58, 38], [222, 57, 35], [220, 56, 34], [219, 55, 33, 27],
-   [218, 55, 32, 25], [218, 55, 32, 24], [218, 55, 32, 23], [218, 55, 32, 23, 20],
-   [218, 55, 32, 23, 19], [218, 55, 32, 23, 18], [218, 55, 32, 23, 18], [218, 55, 32, 23, 18, 16],
-   [218, 55, 32, 23, 18, 15], [218, 55, 32, 23, 18, 15]],
-  [[112, 47, 35], [111, 46, 32], [110, 45, 31], [110, 45, 29], [109, 44, 29, 24],
-   [109, 44, 28, 23], [109, 44, 28, 22], [109, 44, 28, 21], [109, 44, 28, 21, 18],
-   [109, 44, 28, 21, 17], [109, 44, 28, 21, 17], [109, 44, 28, 21, 17], [109, 44, 28, 21, 17, 15],
-   [109, 44, 28, 21, 17, 15], [109, 44, 28, 21, 17, 15]],
-  [[74, 39, 30], [74, 38, 28], [73, 37, 27], [73, 37, 26], [73, 37, 25, 22],
-   [73, 37, 25, 20], [73, 37, 25, 20], [73, 37, 25, 19], [73, 37, 25, 19, 17], [73, 37, 25, 19, 16],
-   [73, 37, 25, 19, 16], [73, 37, 25, 19, 16], [73, 37, 25, 19, 16, 15], [73, 37, 25, 19, 16, 14],
-   [73, 37, 25, 19, 16, 15]],
-  [[56, 33, 27], [55, 32, 25], [55, 32, 24], [55, 32, 23], [55, 32, 23, 20],
-   [55, 32, 23, 19], [55, 32, 23, 18], [55, 32, 23, 18], [55, 32, 23, 18, 16], [55, 32, 23, 18, 15],
-   [55, 32, 23, 18, 15], [55, 32, 23, 18, 15], [55, 32, 23, 18, 15, 14], [55, 32, 23, 18, 16, 14],
-   [55, 32, 23, 18, 16, 14]]]
+  [[224, 78, 46], [222, 76, 42], [220, 75, 40], [219, 74, 39, 30], [218, 74, 38, 28],
+   [218, 73, 37, 27], [218, 73, 37, 26], [218, 73, 37, 25, 22], [218, 73, 37, 25, 20],
+   [218, 73, 37, 25, 20], [218, 73, 37, 25, 19], [218, 73, 37, 25, 19, 17],
+   [218, 73, 37, 25, 19, 16], [218, 73, 37, 25, 19, 16], [218, 73, 37, 25, 19, 16]],
+  [[111, 58, 38], [110, 57, 35], [110, 56, 34], [109, 55, 33, 27], [109, 55, 32, 25],
+   [109, 55, 32, 24], [109, 55, 32, 23], [109, 55, 32, 23, 20], [109, 55, 32, 23, 19],
+   [109, 55, 32, 23, 18], [109, 55, 32, 23, 18], [109, 55, 32, 23, 18, 16],
+   [109, 55, 32, 23, 18, 15], [109, 55, 32, 23, 18, 15], [109, 55, 32, 23, 18, 15]],
+  [[74, 46, 32], [73, 45, 31], [73, 45, 29], [73, 44, 29, 24], [73, 44, 28, 23], [73, 44, 28, 22],
+   [73, 44, 28, 21], [73, 44, 28, 21, 18], [73, 44, 28, 21, 17], [73, 44, 28, 21, 17],
+   [73, 44, 28, 21, 17], [73, 44, 28, 21, 17, 15], [73, 44, 28, 21, 17, 15],
+   [73, 44, 28, 21, 17, 15], [73, 44, 28, 21, 17, 15]],
+  [[55, 38, 28], [55, 37, 27], [55, 37, 26], [55, 37, 25, 22], [55, 37, 25, 20], [55, 37, 25, 20],
+   [55, 37, 25, 19], [55, 37, 25, 19, 17], [55, 37, 25, 19, 16], [55, 37, 25, 19, 16],
+   [55, 37, 25, 19, 16], [55, 37, 25, 19, 16, 15], [55, 37, 25, 19, 16, 14],
+   [55, 37, 25, 19, 16, 15], [55, 37, 25, 19, 16, 15]]]
 
 /-- The window the parameters are defined on: the stacking window and the rate range `1..4`
 (`whir_queries`, `whir.rs`; the rate also `lib.rs` and `whir_config.rs`). -/

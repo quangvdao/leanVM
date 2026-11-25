@@ -369,7 +369,7 @@ fn guest_stack_weights_match_native_stripe() {
         piece_g = piece_log[GEN ** b]
         chain = HeapBuf(EQ_CHAIN_ARMS)
         eq_prefix_chain(chain, 1, p, point1, piece_g)
-        high = match(log(spread[GEN ** b]), range(0, 6), lambda w: eq_run(p * piece_g, lane1, w))
+        high = match(log(spread[GEN ** b]), range(0, STRIPE_WIDTHS), lambda w: eq_run(p * piece_g, lane1, w))
         assert chain[piece_g] * high * sel_v[GEN ** b] == expected[GEN ** b]
     return
 "#
@@ -406,8 +406,13 @@ fn guest_stack_weights_match_native_stripe() {
             })
             .collect();
         let ring: Vec<bool> = blocks.iter().map(|block| block.ring).collect();
-        let (spots, log) = verifier::stack_offsets(&kappas, &ring, verifier::MIN_STACKED_LOG, 6);
-        let lane = log - 6;
+        let (spots, log) = verifier::stack_offsets(
+            &kappas,
+            &ring,
+            verifier::MIN_STACKED_LOG,
+            verifier::INITIAL_FOLDING_FACTOR,
+        );
+        let lane = log - verifier::INITIAL_FOLDING_FACTOR;
         let point: Vec<F128> = (0..sel_bits)
             .map(|k| if k < log { random() } else { F128::ZERO })
             .collect();
