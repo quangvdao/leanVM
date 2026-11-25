@@ -3322,7 +3322,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_squares, defer_out):
     # ---- the index side ----
     lt = match(log(g_w * INV_GEN ** BYTECODE_LOG), range(0, LINK_W_ARMS), lambda k: lt_cycles(zeta, cbits, k + BYTECODE_LOG))
     claim = eta_cover * lt + eta_start * (gs0 + gs1)
-    fs0, fs1, fs2, fs3, fs4, cursor, claim = link_rounds(fs0, fs1, fs2, fs3, fs4, cursor, claim, r_pt, g_w, tabs, 1, 0)
+    fs0, fs1, fs2, fs3, fs4, cursor, claim = link_rounds(fs0, fs1, fs2, fs3, fs4, cursor, claim, r_pt, g_w, tabs, 1, ROUND2_GRIND_BITS)
     plus, pw_unused, fs0, fs1, fs2, fs3, fs4, cursor = opening_message(fs0, fs1, fs2, fs3, fs4, cursor, vals3, 3, 0)
     w_plus = vals3[GEN ** 0]
     spine = vals3[GEN ** 1]
