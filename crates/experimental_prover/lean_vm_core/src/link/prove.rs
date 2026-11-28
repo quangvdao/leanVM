@@ -269,6 +269,84 @@ fn explicit_rows(columns: &[&[F64]], padrow: &[F64], rows: usize, log_rows: usiz
     (e + (e & 1)).min(1 << log_rows)
 }
 
+/// Build `y_mem[j] = gm[0]·g^j + [j < m0.len()]·(gm[1]·m0[j] + gm[2]·m1[j] + gm[3])` in parallel, eight cells at a
+/// time on AVX-512.
+fn tabulate_y_mem(n: usize, m0: &[F64], m1: &[F64], gm: [F128; 4]) -> Vec<F128> {
+    let mem_cells = m0.len();
+    // SAFETY: every entry is written.
+    unsafe {
+        primitives::filled_vec(n, |out| {
+            parallel::chunks_mut(out, TASK, |task, chunk| {
+                let start = task * TASK;
+                let mut g = primitives::field::g_pow(start);
+                let mut k = 0usize;
+                #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+                {
+                    use primitives::field::{F64x8, F128x8};
+                    let (gm0, gm1, gm2, gm3) = (
+                        F128x8::splat(gm[0]),
+                        F128x8::splat(gm[1]),
+                        F128x8::splat(gm[2]),
+                        F128x8::splat(gm[3]),
+                    );
+                    let in_end = mem_cells.saturating_sub(start).min(chunk.len());
+                    while k + 8 <= in_end {
+                        let g8 = std::array::from_fn(|_| {
+                            let cur = g;
+                            g = primitives::field::mul_by_g(g);
+                            cur
+                        });
+                        let j = start + k;
+                        let a0: &[F64; 8] = m0[j..j + 8].try_into().unwrap();
+                        let a1: &[F64; 8] = m1[j..j + 8].try_into().unwrap();
+                        let acc = gm0.mul_base_unreduced(F64x8::from_array(&g8))
+                            ^ gm1.mul_base_unreduced(F64x8::from_array(a0))
+                            ^ gm2.mul_base_unreduced(F64x8::from_array(a1));
+                        let vals = (acc.reduce_lanes() + gm3).to_array();
+                        for (o, v) in chunk[k..k + 8].iter_mut().zip(vals) {
+                            o.write(v);
+                        }
+                        k += 8;
+                    }
+                    while k < in_end {
+                        let j = start + k;
+                        let y = gm[0].mul_base_unreduced(g);
+                        let cell = gm[1].mul_base_unreduced(m0[j]) ^ gm[2].mul_base_unreduced(m1[j]);
+                        chunk[k].write((y ^ cell).reduce() + gm[3]);
+                        g = primitives::field::mul_by_g(g);
+                        k += 1;
+                    }
+                    while k + 8 <= chunk.len() {
+                        let g8 = std::array::from_fn(|_| {
+                            let cur = g;
+                            g = primitives::field::mul_by_g(g);
+                            cur
+                        });
+                        let vals = gm0.mul_base_unreduced(F64x8::from_array(&g8)).reduce_lanes().to_array();
+                        for (o, v) in chunk[k..k + 8].iter_mut().zip(vals) {
+                            o.write(v);
+                        }
+                        k += 8;
+                    }
+                }
+                while k < chunk.len() {
+                    let j = start + k;
+                    let y = gm[0].mul_base_unreduced(g);
+                    let v = if j < mem_cells {
+                        let cell = gm[1].mul_base_unreduced(m0[j]) ^ gm[2].mul_base_unreduced(m1[j]);
+                        (y ^ cell).reduce() + gm[3]
+                    } else {
+                        y.reduce()
+                    };
+                    chunk[k].write(v);
+                    g = primitives::field::mul_by_g(g);
+                    k += 1;
+                }
+            })
+        })
+    }
+}
+
 /// `f(j, g^j)` for `j < n`, in parallel: each task seeds `g^j` once and steps it by `g`.
 fn tabulate_powers(n: usize, f: impl Fn(usize, F64) -> F128 + Sync) -> Vec<F128> {
     tabulate_powers_in(n, |_| (), |(), j, g_j| f(j, g_j))
@@ -597,21 +675,7 @@ pub(crate) fn prove(ps: &mut ProverState, layout: &Layout, columns: &[&[F64]], p
             let (m0, m1) = (&mem[0][..1 << log_mem], &mem[1][..1 << log_mem]);
             tabulate(1 << log_mem, |j| F128::new(m0[j].0, m1[j].0))
         };
-        // Each task reads its memory cells as one run of each column.
-        let cells = |r: std::ops::Range<usize>| {
-            let (start, end) = (r.start.min(1 << log_mem), r.end.min(1 << log_mem));
-            (start, &mem[0][start..end], &mem[1][start..end])
-        };
-        // Each entry's mixed products are summed unreduced and reduced once.
-        let y_mem = tabulate_powers_in(mem_len, cells, |(start, m0, m1), j, g_j| {
-            let y = gm[0].mul_base_unreduced(g_j);
-            if j < 1 << log_mem {
-                let cell = gm[1].mul_base_unreduced(m0[j - start]) ^ gm[2].mul_base_unreduced(m1[j - start]);
-                (y ^ cell).reduce() + gm[3]
-            } else {
-                y.reduce()
-            }
-        });
+        let y_mem = tabulate_y_mem(mem_len, &mem[0][..1 << log_mem], &mem[1][..1 << log_mem], gm);
         // The program side's targets: `X_ω` under the rows' weight and `P_fp` under `ω·fp`, each weighing an
         // instruction's slots by its opcode.
         let a = &ch.alpha_bc;

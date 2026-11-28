@@ -107,7 +107,7 @@ def vector (output : String) : IO String := do
   let bytes := vectorProof.toBytes
   let decoded := (Proof.fromBytes (m := Id) permutation bytes).map plain
   let longer := Proof.fromBytes (m := Id) permutation (bytes ++ [0])
-  if bytes.length ≠ (4 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32 then
+  if bytes.length ≠ (4 + 1 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32 then
     return s!"vector-fails length {bytes.length}"
   if decoded ≠ some (plain vectorProof) then return "vector-fails round trip"
   if longer.isSome then return "vector-fails a byte more decodes"

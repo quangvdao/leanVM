@@ -53,11 +53,11 @@ fn report(label: &str, stats: &Stats, sig: &AggregateProof, prove_time: &Timing)
         crate::report::details(stats, aggregation::unified_guest().code_len())
     );
     crate::report::print_proof_size(sig.to_bytes().len());
-    let (scalars, vm_bytes) = sig.__vm_proof_shape();
+    let (scalars, stream_bytes, vm_bytes) = sig.__vm_proof_shape();
     println!(
         "  proof stream                : {scalars} F128 scalars ({:.1} KiB), Merkle openings {:.1} KiB",
-        (16 * scalars) as f64 / 1024.0,
-        (vm_bytes - 4 - 16 * scalars) as f64 / 1024.0
+        stream_bytes as f64 / 1024.0,
+        (vm_bytes - 8 - stream_bytes) as f64 / 1024.0
     );
     // The whole `aggregate` call, not just `cpu::prove`: for a node that also
     // covers replaying each child and batching the deferred claims, which are

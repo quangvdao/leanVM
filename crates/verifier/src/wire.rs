@@ -13,10 +13,20 @@ pub const MAX_QUERIES: usize = 256;
 pub const MAX_LEAF_WORDS: usize = 64;
 pub const MAX_HEIGHT: usize = 32;
 
+/// Exclusive upper bound on compact stream scalars (`c1 == 0 && c0 < COMPACT_LIMIT`), which travel as canonical
+/// unsigned LEB128 (1 to 8 bytes) rather than 16 raw bytes.
+const COMPACT_LIMIT: u64 = 1u64 << 56;
+
+fn is_compact(element: E) -> bool {
+    element.c1 == 0 && element.c0 < COMPACT_LIMIT
+}
+
 impl Proof {
     /// Every count and size is a little-endian `u32`, every word a little-endian `u64`.
     ///
-    /// - The stream: its length, then each element as its two words.
+    /// - The stream: its length `n`, a `ceil(n / 8)`-byte bitmask (LSB-first, trailing bits zero) marking compact
+    ///   scalars (`c1 == 0 && c0 < 2^56`), then each element in order: canonical unsigned LEB128 (1 to 8 bytes) when
+    ///   marked compact, or its two words `(c0, c1)` (16 bytes) otherwise.
     /// - The number of phases, then each phase pruned: its queries' count and positions, in the order the verifier
     ///   samples them; the tree's height, the leaf width, and the row width; the leaf at each distinct position,
     ///   ascending, as its last row-width words, the ones before being zero in every leaf of the phase; then the
@@ -32,9 +42,22 @@ impl Proof {
         assert!(self.merkle_openings.len() <= MAX_PHASES);
         let mut out = Vec::new();
         write_u32(&mut out, self.stream.len());
-        for element in &self.stream {
-            out.extend(element.c0.to_le_bytes());
-            out.extend(element.c1.to_le_bytes());
+        for chunk in self.stream.chunks(8) {
+            let mut mask = 0u8;
+            for (bit, &element) in chunk.iter().enumerate() {
+                if is_compact(element) {
+                    mask |= 1u8 << bit;
+                }
+            }
+            out.push(mask);
+        }
+        for &element in &self.stream {
+            if is_compact(element) {
+                write_varint(&mut out, element.c0);
+            } else {
+                out.extend(element.c0.to_le_bytes());
+                out.extend(element.c1.to_le_bytes());
+            }
         }
         write_u32(&mut out, self.merkle_openings.len());
         for phase in &self.merkle_openings {
@@ -47,8 +70,33 @@ impl Proof {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut input = Reader(bytes);
         let length = input.u32()? as usize;
-        let words = input.words(length.checked_mul(2)?)?;
-        let stream = words.as_chunks().0.iter().map(|[c0, c1]| E::new(c0.0, c1.0)).collect();
+        let mask_len = length.div_ceil(8);
+        // Every stream element takes at least one byte after the bitmask; reject hostile lengths before allocating.
+        if input.0.len() < mask_len.checked_add(length)? {
+            return None;
+        }
+        let mask = input.bytes(mask_len)?;
+        let rem = length % 8;
+        if rem != 0 && (*mask.last()? >> rem) != 0 {
+            return None;
+        }
+        let mut stream = Vec::with_capacity(length);
+        for i in 0..length {
+            let compact = (mask[i / 8] >> (i % 8)) & 1 != 0;
+            let element = if compact {
+                E::new(input.varint()?, 0)
+            } else {
+                let raw = input.bytes(16)?;
+                let c0 = u64::from_le_bytes(*raw[..8].as_array()?);
+                let c1 = u64::from_le_bytes(*raw[8..].as_array()?);
+                let element = E::new(c0, c1);
+                if is_compact(element) {
+                    return None;
+                }
+                element
+            };
+            stream.push(element);
+        }
         let phases = input.u32().filter(|&phases| phases as usize <= MAX_PHASES)?;
         let merkle_openings = (0..phases).map(|_| read_phase(&mut input)).collect::<Option<_>>()?;
         input.0.is_empty().then_some(Self {
@@ -158,6 +206,20 @@ fn write_u32(out: &mut Vec<u8>, value: usize) {
     out.extend(u32::try_from(value).expect("fits in u32").to_le_bytes());
 }
 
+/// Canonical unsigned LEB128 for `value < COMPACT_LIMIT` (1 to 8 bytes).
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    debug_assert!(value < COMPACT_LIMIT);
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
 /// Bytes being decoded, each read refused past their end.
 struct Reader<'a>(&'a [u8]);
 
@@ -170,6 +232,23 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(*self.bytes(4)?.as_array()?))
+    }
+
+    /// Canonical unsigned LEB128 below `COMPACT_LIMIT` (1 to 8 bytes, no redundant trailing zero byte).
+    fn varint(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..56).step_by(7) {
+            let byte = *self.bytes(1)?.first()?;
+            let low = u64::from(byte & 0x7f);
+            if byte & 0x80 == 0 {
+                if shift > 0 && low == 0 {
+                    return None;
+                }
+                return Some(value | (low << shift));
+            }
+            value |= low << shift;
+        }
+        None
     }
 
     fn hash(&mut self) -> Option<[u8; 32]> {
@@ -210,9 +289,72 @@ mod tests {
             merkle_openings: vec![vec![path(3), path(1), path(3)]],
         };
         let bytes = proof.to_bytes();
-        // The stream, then the phase: its queries, three sizes, two rows of two words, and two siblings.
-        assert_eq!(bytes.len(), (4 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32);
+        // The stream (length, 1-byte bitmask, 16-byte element), then the phase: queries, sizes, rows, siblings.
+        assert_eq!(bytes.len(), (4 + 1 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32);
         assert_eq!(Proof::from_bytes(&bytes), Some(proof));
         assert_eq!(Proof::from_bytes(&[&bytes[..], &[0]].concat()), None);
+    }
+
+    /// Compact scalars round-trip across boundary sizes, and non-canonical encodings are refused.
+    #[test]
+    fn compact_stream_is_canonical() {
+        let cases = vec![
+            E::new(0, 0),
+            E::new(1, 0),
+            E::new(127, 0),
+            E::new(128, 0),
+            E::new((1 << 14) - 1, 0),
+            E::new(1 << 14, 0),
+            E::new(COMPACT_LIMIT - 1, 0),
+            E::new(COMPACT_LIMIT, 0),
+            E::new(u64::MAX, 0),
+            E::new(0, 1),
+            E::new(42, 99),
+        ];
+        let proof = Proof {
+            stream: cases,
+            merkle_openings: Vec::new(),
+        };
+        let bytes = proof.to_bytes();
+        // 4 (len) + 2 (mask for 11 elements) + (1+1+1+2+2+3+8 compact) + (4*16 full) + 4 (phases=0).
+        assert_eq!(bytes.len(), 4 + 2 + 18 + 64 + 4);
+        assert_eq!(Proof::from_bytes(&bytes), Some(proof.clone()));
+
+        // Empty proof still encodes as eight zero bytes.
+        let empty = Proof {
+            stream: Vec::new(),
+            merkle_openings: Vec::new(),
+        };
+        assert_eq!(empty.to_bytes(), [0u8; 8]);
+        assert_eq!(Proof::from_bytes(&[0u8; 8]), Some(empty));
+
+        // Non-zero trailing bit in the bitmask is refused.
+        let mut bad_mask = bytes.clone();
+        bad_mask[5] |= 0x80;
+        assert_eq!(Proof::from_bytes(&bad_mask), None);
+
+        // Overlong LEB128 for 0 ([0x80, 0x00]) is refused.
+        let bad_varint = [1u32.to_le_bytes().as_slice(), &[0x01, 0x80, 0x00], &0u32.to_le_bytes()].concat();
+        assert_eq!(Proof::from_bytes(&bad_varint), None);
+
+        // 9-byte LEB128 (>= 2^56) is refused.
+        let too_wide = [
+            1u32.to_le_bytes().as_slice(),
+            &[0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+            &0u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(Proof::from_bytes(&too_wide), None);
+
+        // Full 16-byte encoding of a compact scalar is refused.
+        let non_compact = [
+            1u32.to_le_bytes().as_slice(),
+            &[0x00],
+            &7u64.to_le_bytes(),
+            &0u64.to_le_bytes(),
+            &0u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(Proof::from_bytes(&non_compact), None);
     }
 }

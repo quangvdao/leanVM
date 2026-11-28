@@ -19,7 +19,9 @@ Each reader of `Proof.fromBytes` reads back its writer's bytes and the rest unto
 (`readU32_u32Bytes`, `readWords_toBytes`, `readRows_toBytes`, …), and,
 conversely, what a reader accepts is its writer's bytes of what it returns
 (`readU32_eq_some_iff`, `readWords_eq_some_iff`, …: the one encoding of each field). The stream
-travels as its elements' limbs, regrouped in twos as `readProof` does (`streamOfWords`).
+reads back (`readStream_streamToBytes`) and is read only from its one encoding
+(`readStream_eq_some_iff`): the LEB128 of a compact element is canonical (`readVarint_eq_some_iff`),
+the bitmask's bits past the stream are zero, and an element sent whole is not compact.
 
 The base facts are about one 64-bit lane: `littleEndianLane` of a word's bytes is the word
 (`littleEndianLane_wordBytes_append`), and the bytes of the lane of eight bytes are those bytes
@@ -406,59 +408,285 @@ theorem readRows_toBytes {w : ℕ} {rows : List (List K)} (hrows : ∀ r ∈ row
 
 /-! ## The stream -/
 
-/-- The stream `readProof` regroups from its words: element `i` is the words `2 i, 2 i + 1` as
-its limbs (`F128::new`). -/
-def streamOfWords (length : ℕ) (words : List K) : List E :=
-  (List.range length).map fun i ↦ E.ofLimbs (words.getD (2 * i) 0) (words.getD (2 * i + 1) 0)
+/-! ### LEB128 -/
 
-/-- The words a stream travels as: each element's two limbs. -/
-def streamWords (stream : List E) : List K :=
-  stream.flatMap fun x ↦ [x.limb 0, x.limb 1]
+theorem varintBytes_of_lt {value : ℕ} (h : value < 128) :
+    Prover.varintBytes value = [UInt8.ofNat value] := by
+  rw [Prover.varintBytes]; simp [h]
 
-@[simp] theorem length_streamWords (stream : List E) :
-    (streamWords stream).length = 2 * stream.length := by
-  induction stream with
-  | nil => rfl
-  | cons x stream ih =>
-    simp only [streamWords, List.flatMap_cons, List.length_append] at ih ⊢
-    rw [ih]; simp; ring
+theorem varintBytes_of_le {value : ℕ} (h : 128 ≤ value) :
+    Prover.varintBytes value =
+      UInt8.ofNat (value % 128 + 128) :: Prover.varintBytes (value / 128) := by
+  rw [Prover.varintBytes]; simp [show ¬ value < 128 by omega]
+
+private theorem toNat_ofNat_of_lt {n : ℕ} (h : n < 256) : (UInt8.ofNat n).toNat = n := by
+  simp only [UInt8.toNat_ofNat']; omega
+
+/-- **What `readVarint` accepts:** with `fuel` bytes, the LEB128 of a number below `128 ^ fuel`,
+nonzero unless `first`, then the rest. -/
+theorem readVarint_eq_some_iff :
+    ∀ {fuel : ℕ} {first : Bool} {input rest : List UInt8} {value : ℕ},
+      readVarint fuel first input = some (value, rest) ↔
+        0 < fuel ∧ value < 128 ^ fuel ∧ (first = true ∨ value ≠ 0) ∧
+          input = Prover.varintBytes value ++ rest
+  | 0, first, input, rest, value => by simp [readVarint]
+  | fuel + 1, first, [], rest, value => by
+    simp only [readVarint, reduceCtorEq, false_iff, not_and]
+    intro _ _ _ h
+    by_cases hv : value < 128
+    · rw [varintBytes_of_lt hv] at h; simp at h
+    · rw [varintBytes_of_le (by omega)] at h; simp at h
+  | fuel + 1, first, byte :: input, rest, value => by
+    have hb := byte.toNat_lt
+    have hpow : 128 ≤ 128 ^ (fuel + 1) := Nat.le_self_pow (by omega) _
+    by_cases hbyte : byte.toNat < 128
+    · simp only [readVarint, hbyte, ↓reduceIte]
+      constructor
+      · intro h
+        split_ifs at h with hc
+        simp only [Option.some.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        refine ⟨by omega, by omega, hc, ?_⟩
+        rw [varintBytes_of_lt hbyte, UInt8.ofNat_toNat]; rfl
+      · rintro ⟨-, -, hc, h⟩
+        by_cases hv : value < 128
+        · rw [varintBytes_of_lt hv] at h
+          simp only [List.cons_append, List.nil_append, List.cons.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          rw [toNat_ofNat_of_lt (by omega)]
+          simp [hc]
+        · rw [varintBytes_of_le (by omega)] at h
+          simp only [List.cons_append, List.cons.injEq] at h
+          obtain ⟨rfl, -⟩ := h
+          rw [toNat_ofNat_of_lt (by omega)] at hbyte
+          omega
+    · simp only [readVarint, hbyte, ↓reduceIte, Option.map_eq_some_iff, Prod.exists,
+        Prod.mk.injEq]
+      constructor
+      · rintro ⟨high, input', hread, rfl, rfl⟩
+        obtain ⟨hfuel, hlt, hne, rfl⟩ := readVarint_eq_some_iff.1 hread
+        have hne : high ≠ 0 := by simpa using hne
+        refine ⟨by omega, ?_, Or.inr (by omega), ?_⟩
+        · rw [pow_succ]; omega
+        · rw [varintBytes_of_le (value := byte.toNat - 128 + 128 * high) (by omega),
+            show (byte.toNat - 128 + 128 * high) % 128 + 128 = byte.toNat by omega,
+            show (byte.toNat - 128 + 128 * high) / 128 = high by omega, UInt8.ofNat_toNat]
+          rfl
+      · rintro ⟨-, hlt, -, h⟩
+        by_cases hv : value < 128
+        · rw [varintBytes_of_lt hv] at h
+          simp only [List.cons_append, List.nil_append, List.cons.injEq] at h
+          obtain ⟨rfl, -⟩ := h
+          rw [toNat_ofNat_of_lt (by omega)] at hbyte
+          omega
+        · rw [varintBytes_of_le (by omega)] at h
+          simp only [List.cons_append, List.cons.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          rw [pow_succ] at hlt
+          have hfuel : 0 < fuel := by
+            rcases Nat.eq_zero_or_pos fuel with rfl | h
+            · simp at hlt; omega
+            · exact h
+          refine ⟨value / 128, rest,
+            readVarint_eq_some_iff.2 ⟨hfuel, by omega, Or.inr (by omega), rfl⟩, ?_, rfl⟩
+          rw [toNat_ofNat_of_lt (by omega)]
+          omega
+
+/-! ### The bitmask -/
+
+theorem leValue_lt : ∀ bytes : List UInt8, leValue bytes < 256 ^ bytes.length
+  | [] => by simp [leValue]
+  | byte :: bytes => by
+    have ih := leValue_lt bytes
+    have hb := byte.toNat_lt
+    rw [leValue, List.length_cons, pow_succ]
+    omega
+
+@[simp] theorem length_leBytes : ∀ count value : ℕ, (Prover.leBytes count value).length = count
+  | 0, _ => rfl
+  | count + 1, value => by simp [Prover.leBytes, length_leBytes count]
+
+theorem leBytes_leValue :
+    ∀ bytes : List UInt8, Prover.leBytes bytes.length (leValue bytes) = bytes
+  | [] => rfl
+  | byte :: bytes => by
+    have hb := byte.toNat_lt
+    rw [List.length_cons, leValue, Prover.leBytes,
+      show (byte.toNat + 256 * leValue bytes) % 256 = byte.toNat by omega,
+      show (byte.toNat + 256 * leValue bytes) / 256 = leValue bytes by omega,
+      leBytes_leValue bytes, UInt8.ofNat_toNat]
+
+theorem leValue_leBytes :
+    ∀ count value : ℕ, value < 256 ^ count → leValue (Prover.leBytes count value) = value
+  | 0, value, h => by simp at h; simp [h, leValue, Prover.leBytes]
+  | count + 1, value, h => by
+    rw [pow_succ] at h
+    rw [Prover.leBytes, leValue, leValue_leBytes count (value / 256) (by omega),
+      toNat_ofNat_of_lt (by omega)]
+    omega
+
+@[simp] theorem length_bitsOf : ∀ count value : ℕ, (bitsOf count value).length = count
+  | 0, _ => rfl
+  | count + 1, value => by simp [bitsOf, length_bitsOf count]
+
+theorem bitsValue_lt : ∀ bits : List Bool, Prover.bitsValue bits < 2 ^ bits.length
+  | [] => by simp [Prover.bitsValue]
+  | bit :: bits => by
+    have ih := bitsValue_lt bits
+    have hbit : bit.toNat ≤ 1 := by cases bit <;> simp
+    rw [Prover.bitsValue, List.length_cons, pow_succ]
+    omega
+
+theorem bitsOf_bitsValue : ∀ bits : List Bool, bitsOf bits.length (Prover.bitsValue bits) = bits
+  | [] => rfl
+  | bit :: bits => by
+    have h1 : (bit.toNat + 2 * Prover.bitsValue bits) / 2 = Prover.bitsValue bits := by
+      cases bit <;> simp only [Bool.toNat_false, Bool.toNat_true] <;> omega
+    have h2 : decide ((bit.toNat + 2 * Prover.bitsValue bits) % 2 = 1) = bit := by
+      cases bit <;> simp only [Bool.toNat_false, Bool.toNat_true, decide_eq_true_eq,
+        decide_eq_false_iff_not] <;> omega
+    rw [List.length_cons, bitsOf, Prover.bitsValue, h1, h2, bitsOf_bitsValue bits]
+
+theorem bitsValue_bitsOf :
+    ∀ count value : ℕ, value < 2 ^ count → Prover.bitsValue (bitsOf count value) = value
+  | 0, value, h => by simp at h; simp [h, bitsOf, Prover.bitsValue]
+  | count + 1, value, h => by
+    rw [pow_succ] at h
+    rw [bitsOf, Prover.bitsValue, bitsValue_bitsOf count (value / 2) (by omega)]
+    by_cases hv : value % 2 = 1 <;> simp [hv] <;> omega
+
+/-- The bitmask's bytes hold the bits of every element. -/
+private theorem two_pow_le_mask (length : ℕ) : 2 ^ length ≤ 256 ^ ((length + 7) / 8) :=
+  calc 2 ^ length ≤ 2 ^ (8 * ((length + 7) / 8)) := Nat.pow_le_pow_right (by norm_num) (by omega)
+    _ = 256 ^ ((length + 7) / 8) := by rw [pow_mul]; norm_num
+
+/-! ### The elements -/
 
 private theorem ofLimbs_limbs (x : E) : E.ofLimbs (x.limb 0) (x.limb 1) = x :=
   CompPoly.Extension.Ext.ext fun i ↦ by fin_cases i <;> rfl
 
-/-- The first element of a regrouped stream is its first two words. -/
-theorem streamOfWords_succ (length : ℕ) (a b : K) (words : List K) :
-    streamOfWords (length + 1) (a :: b :: words) =
-      E.ofLimbs a b :: streamOfWords length words := by
-  simp only [streamOfWords, List.range_succ_eq_map, List.map_cons, List.map_map]
-  refine congrArg₂ _ rfl (List.map_congr_left fun i _ ↦ ?_)
-  simp only [Function.comp_apply, List.getD_eq_getElem?_getD,
-    show 2 * (i + 1) = 2 * i + 2 by ring, List.getElem?_cons_succ]
+@[simp] theorem limb_ofLimbs_zero (a b : K) : (E.ofLimbs a b).limb 0 = a := rfl
 
-/-- Regrouping a stream's words gives the stream. -/
-theorem streamOfWords_streamWords :
-    ∀ stream : List E, streamOfWords stream.length (streamWords stream) = stream
-  | [] => rfl
-  | x :: stream => by
-    rw [streamWords, List.flatMap_cons, ← streamWords, List.length_cons, List.cons_append,
-      List.cons_append, List.nil_append, streamOfWords_succ,
-      streamOfWords_streamWords stream, ofLimbs_limbs]
+@[simp] theorem limb_ofLimbs_one (a b : K) : (E.ofLimbs a b).limb 1 = b := rfl
 
-/-- The words of a stream regrouped from `2 * length` words are those words. -/
-theorem streamWords_streamOfWords :
-    ∀ (length : ℕ) {words : List K}, words.length = 2 * length →
-      streamWords (streamOfWords length words) = words
-  | 0, words, h => by simp_all [streamOfWords, streamWords]
-  | length + 1, a :: b :: words, h => by
-    rw [streamOfWords_succ, streamWords, List.flatMap_cons, ← streamWords,
-      streamWords_streamOfWords length (by simp at h; omega)]
-    rfl
-  | length + 1, [], h => by simp at h
-  | length + 1, [_], h => by simp at h; omega
+/-- **What `readElement` accepts:** an element's bytes, compact as the bit says, then the rest. -/
+theorem readElement_eq_some_iff {compact : Bool} {input rest : List UInt8} {x : E} :
+    readElement compact input = some (x, rest) ↔
+      compactScalar x = compact ∧ input = Prover.elementBytes x ++ rest := by
+  cases compact with
+  | true =>
+    simp only [readElement, ↓reduceIte, Option.map_eq_some_iff, Prod.exists, Prod.mk.injEq]
+    constructor
+    · rintro ⟨value, input', hread, rfl, rfl⟩
+      obtain ⟨-, hlt, -, rfl⟩ := readVarint_eq_some_iff.1 hread
+      have hlane : (K.ofLane (UInt64.ofNat value)).lane.toNat = value := by
+        change (UInt64.ofNat value).toNat = value
+        simp only [UInt64.toNat_ofNat']; norm_num at hlt ⊢; omega
+      have hc : compactScalar (E.ofLimbs (K.ofLane (UInt64.ofNat value)) 0) = true := by
+        simp only [compactScalar, limb_ofLimbs_zero, limb_ofLimbs_one, hlane, wireCompactLimit,
+          decide_true, Bool.true_and, decide_eq_true_eq]
+        norm_num at hlt ⊢; omega
+      refine ⟨hc, ?_⟩
+      simp only [Prover.elementBytes, hc, ↓reduceIte, limb_ofLimbs_zero, hlane]
+    · rintro ⟨hc, rfl⟩
+      have hc' := hc
+      simp only [compactScalar, Bool.and_eq_true, decide_eq_true_eq, wireCompactLimit] at hc'
+      obtain ⟨h1, h0⟩ := hc'
+      refine ⟨(x.limb 0).lane.toNat, rest, readVarint_eq_some_iff.2
+        ⟨by norm_num, lt_of_lt_of_eq (of_decide_eq_true h0) (by norm_num), Or.inl rfl,
+          by simp [Prover.elementBytes, hc]⟩, ?_, rfl⟩
+      rw [UInt64.ofNat_toNat]
+      change E.ofLimbs (x.limb 0) 0 = x
+      rw [← h1, ofLimbs_limbs]
+  | false =>
+    simp only [readElement, Bool.false_eq_true, ↓reduceIte, Option.bind_eq_bind,
+      Option.bind_eq_some_iff, Prod.exists, Option.guard_eq_some', Option.some.injEq,
+      Prod.mk.injEq]
+    constructor
+    · rintro ⟨words, input', hwords, -, hc, rfl, rfl⟩
+      obtain ⟨hlength, rfl⟩ := readWords_eq_some_iff.1 hwords
+      match words, hlength with
+      | [a, b], _ =>
+        simp only [List.getD_cons_zero, List.getD_cons_succ] at hc ⊢
+        refine ⟨hc, ?_⟩
+        simp [Prover.elementBytes, hc, E.toBytes]
+    · rintro ⟨hc, rfl⟩
+      refine ⟨[x.limb 0, x.limb 1], rest, readWords_eq_some_iff.2 ⟨rfl, ?_⟩, ?_⟩
+      · simp [Prover.elementBytes, hc, E.toBytes]
+      · simp only [List.getD_cons_zero, List.getD_cons_succ, ofLimbs_limbs]
+        refine ⟨(), hc, ?_⟩
+        simp
 
-@[simp] theorem length_streamOfWords (length : ℕ) (words : List K) :
-    (streamOfWords length words).length = length := by
-  simp [streamOfWords]
+/-- **What `readElements` accepts:** the elements' bytes, compact as the bits say, then the
+rest. -/
+theorem readElements_eq_some_iff :
+    ∀ {flags : List Bool} {input rest : List UInt8} {xs : List E},
+      readElements flags input = some (xs, rest) ↔
+        xs.map compactScalar = flags ∧ input = xs.flatMap Prover.elementBytes ++ rest
+  | [], input, rest, xs => by
+    simp only [readElements, Option.some.injEq, Prod.mk.injEq, List.map_eq_nil_iff]
+    constructor
+    · rintro ⟨rfl, rfl⟩; simp
+    · rintro ⟨rfl, rfl⟩; simp
+  | compact :: flags, input, rest, xs => by
+    simp only [readElements, Option.bind_eq_bind, Option.bind_eq_some_iff, Prod.exists,
+      Option.some.injEq, Prod.mk.injEq]
+    constructor
+    · rintro ⟨x, input', hx, xs', rest', hxs, rfl, rfl⟩
+      obtain ⟨hc, rfl⟩ := readElement_eq_some_iff.1 hx
+      obtain ⟨hcs, rfl⟩ := readElements_eq_some_iff.1 hxs
+      simp [hc, hcs]
+    · rintro ⟨hmap, rfl⟩
+      match xs, hmap with
+      | x :: xs', hmap =>
+        simp only [List.map_cons, List.cons.injEq] at hmap
+        exact ⟨x, xs'.flatMap Prover.elementBytes ++ rest,
+          readElement_eq_some_iff.2 ⟨hmap.1, by simp⟩, xs', rest,
+          readElements_eq_some_iff.2 ⟨hmap.2, rfl⟩, rfl, rfl⟩
+
+/-! ### The stream -/
+
+private theorem guard_unit {p : Prop} [Decidable p] (hp : p) :
+    (guard p : Option Unit) = some () := by
+  simp [hp]
+
+/-- `readStream` reads back a stream of fewer than `2 ^ 32` elements. -/
+theorem readStream_streamToBytes {stream : List E} (hlength : stream.length < 2 ^ 32)
+    (rest : List UInt8) :
+    readStream (Prover.streamToBytes stream ++ rest) = some (stream, rest) := by
+  have hvalue := bitsValue_lt (stream.map compactScalar)
+  rw [List.length_map] at hvalue
+  have hmask := leValue_leBytes ((stream.length + 7) / 8) _
+    (lt_of_lt_of_le hvalue (two_pow_le_mask stream.length))
+  have hbits := bitsOf_bitsValue (stream.map compactScalar)
+  rw [List.length_map] at hbits
+  simp only [readStream, Prover.streamToBytes, List.append_assoc, readU32_u32Bytes hlength,
+    Option.bind_eq_bind, Option.bind_some]
+  rw [readBytes_eq_some_iff.2 ⟨length_leBytes _ _, rfl⟩]
+  simp only [Option.bind_some, hmask, hbits, guard_unit hvalue,
+    readElements_eq_some_iff.2 ⟨rfl, rfl⟩]
+
+/-- **What `readStream` accepts:** the bytes of a stream of fewer than `2 ^ 32` elements, then
+the rest. -/
+theorem readStream_eq_some_iff {input rest : List UInt8} {stream : List E} :
+    readStream input = some (stream, rest) ↔
+      stream.length < 2 ^ 32 ∧ input = Prover.streamToBytes stream ++ rest := by
+  constructor
+  · intro h
+    simp only [readStream, Option.bind_eq_bind, Option.bind_eq_some_iff, Prod.exists,
+      Option.guard_eq_some'] at h
+    obtain ⟨length, input₁, hlength, mask, input₂, hmask, -, hguard, hread⟩ := h
+    obtain ⟨hlt, rfl⟩ := readU32_eq_some_iff.1 hlength
+    obtain ⟨hmaskLength, rfl⟩ := readBytes_eq_some_iff.1 hmask
+    obtain ⟨hflags, rfl⟩ := readElements_eq_some_iff.1 hread
+    have hstreamLength : stream.length = length := by
+      simpa using congrArg List.length hflags
+    subst hstreamLength
+    refine ⟨hlt, ?_⟩
+    simp only [Prover.streamToBytes, List.append_assoc, hflags,
+      bitsValue_bitsOf _ _ hguard, ← hmaskLength, leBytes_leValue]
+  · rintro ⟨hlength, rfl⟩
+    exact readStream_streamToBytes hlength rest
 
 end
 

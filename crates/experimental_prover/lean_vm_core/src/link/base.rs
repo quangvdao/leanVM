@@ -11,7 +11,9 @@
 
 use super::{at, fold};
 use crate::form::Form;
-use primitives::field::{F64, F128, F128Unreduced};
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+use primitives::field::{Acc8, F64x8, F128x8, Prod8, fold_pairs8_ext};
+use primitives::field::{F64, F128, F128Unreduced, fold_adjacent};
 use std::mem::MaybeUninit;
 
 /// What a block's form is multiplied by.
@@ -332,9 +334,31 @@ impl<'a> Base<'a> {
             |(factored, direct), task| {
                 let range = task * FOLD_ROWS..pairs.min((task + 1) * FOLD_ROWS);
                 let rows = self.window(2 * range.start, 2 * range.end);
-                for k in range {
+                let mut k = range.start;
+                #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+                if self.folded.is_none() {
+                    let fast_end = range.end.min(whole);
+                    let col_len = rows.cols.first().map_or(0, |c| c.len());
+                    let mut factored8 = [Acc8::ZERO; 4];
+                    while k + 8 <= fast_end && 2 * (k + 8) - rows.start <= col_len {
+                        let under = self.pair_columns_omega_x8(&rows, k);
+                        let o0: &[F128; 8] = omega[2 * k..2 * k + 8].try_into().unwrap();
+                        let o1: &[F128; 8] = omega[2 * k + 8..2 * k + 16].try_into().unwrap();
+                        let (w0, w1) = F128x8::even_odd(F128x8::from_array(o0), F128x8::from_array(o1));
+                        let s = w0 + w1;
+                        for (f, v) in factored8.iter_mut().zip(under) {
+                            *f ^= v.mul_unreduced(s);
+                        }
+                        k += 8;
+                    }
+                    for (f, f8) in factored.iter_mut().zip(factored8) {
+                        *f ^= F128Unreduced::from(f8.reduce());
+                    }
+                }
+                while k < range.end {
                     let (w0, w1) = (omega[2 * k], at(omega, 2 * k + 1));
                     if w0.is_zero() && w1.is_zero() {
+                        k += 1;
                         continue;
                     }
                     let (mut under, mut eq_blocks) = ([F128::ZERO; 4], [F128::ZERO; 5]);
@@ -352,6 +376,7 @@ impl<'a> Base<'a> {
                         }
                         direct[4] += under[3] * wb;
                     }
+                    k += 1;
                 }
             },
             |(mut fa, mut da), (fb, db)| {
@@ -481,6 +506,139 @@ impl<'a> Base<'a> {
         }
     }
 
+    /// Eight consecutive pairs of `Weight::Omega` blocks from raw `K` columns before the first fold.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[inline]
+    fn pair_columns_omega_x8(&self, rows: &Window, k: usize) -> [F128x8; 4] {
+        let u = 2 * k - rows.start;
+        let n = self.factors.len();
+        let zero = F128x8::splat(F128::ZERO);
+        let mut factor_pairs = [MaybeUninit::<(F64x8, F64x8)>::uninit(); MAX_SLOTS];
+        for (dst, &c) in factor_pairs.iter_mut().zip(&self.factors) {
+            let col = rows.cols[c];
+            let a: &[F64; 8] = col[u..u + 8].try_into().unwrap();
+            let b: &[F64; 8] = col[u + 8..u + 16].try_into().unwrap();
+            dst.write(F64x8::even_odd(a, b));
+        }
+        let mut lo = [MaybeUninit::<F128x8>::uninit(); MAX_SLOTS];
+        let mut hi = [MaybeUninit::<F128x8>::uninit(); MAX_SLOTS];
+        for ((l, dst_lo), dst_hi) in self.linears.iter().zip(&mut lo).zip(&mut hi) {
+            let (mut alo, mut ahi) = (Prod8::ZERO, Prod8::ZERO);
+            for &(c, w) in &l.terms {
+                let col = rows.cols[c];
+                let a: &[F64; 8] = col[u..u + 8].try_into().unwrap();
+                let b: &[F64; 8] = col[u + 8..u + 16].try_into().unwrap();
+                let (e, o) = F64x8::even_odd(a, b);
+                let w8 = F128x8::splat(w);
+                alo ^= w8.mul_base_unreduced(e);
+                ahi ^= w8.mul_base_unreduced(o);
+            }
+            let c8 = F128x8::splat(l.constant);
+            dst_lo.write(alo.reduce_lanes() + c8);
+            dst_hi.write(ahi.reduce_lanes() + c8);
+        }
+        let m = self.linears.len();
+        // SAFETY: `factors` and `linears` loops initialized `0..n` and `0..m`.
+        let factor_pairs = unsafe { factor_pairs[..n].assume_init_ref() };
+        let (lo, hi) = unsafe { (lo[..m].assume_init_ref(), hi[..m].assume_init_ref()) };
+        let mut out = [zero; 4];
+        for block in &self.blocks {
+            if block.weight != Weight::Omega {
+                continue;
+            }
+            let (mut c0, mut c1, mut c2) = (Prod8::ZERO, Prod8::ZERO, Prod8::ZERO);
+            for &(f, l) in &block.products {
+                let ((a0, a1), (b0, b1)) = (factor_pairs[f], (lo[l - n], hi[l - n]));
+                c0 ^= b0.mul_base_unreduced(a0);
+                c1 ^= b1.mul_base_unreduced(a1);
+                c2 ^= (b0 + b1).mul_base_unreduced(a0 + a1);
+            }
+            let f0 = lo[block.linear - n] + c0.reduce_lanes();
+            let f1 = hi[block.linear - n] + c1.reduce_lanes();
+            let f2 = c2.reduce_lanes();
+            let mid = f0 + f1 + f2;
+            if let Some(g) = block.gate {
+                let (g0, g1) = factor_pairs[g];
+                let gb = g0 + g1;
+                out[0] = out[0] + f0.mul_base_unreduced(g0).reduce_lanes();
+                out[1] = out[1] + (mid.mul_base_unreduced(g0) ^ f0.mul_base_unreduced(gb)).reduce_lanes();
+                out[2] = out[2] + (f2.mul_base_unreduced(g0) ^ mid.mul_base_unreduced(gb)).reduce_lanes();
+                out[3] = out[3] + f2.mul_base_unreduced(gb).reduce_lanes();
+            } else {
+                out[0] = out[0] + f0;
+                out[1] = out[1] + mid;
+                out[2] = out[2] + f2;
+            }
+        }
+        out
+    }
+
+    /// Eight consecutive pairs of folded `Weight::Omega` blocks when no `Eq` block is present. Returns `false` if the
+    /// rows are not folded or fall past the explicit folded buffer.
+    #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+    #[inline]
+    pub fn pair_omega_folded_x8(&self, k: usize, x1: bool, omega: &mut [F128x8; 4]) -> bool {
+        let Some(folded) = &self.folded else {
+            return false;
+        };
+        if self.on_padding() {
+            return false;
+        }
+        let s = self.stride;
+        if s == 0 {
+            return true;
+        }
+        if 2 * (k + 8) * s > folded.len() {
+            return false;
+        }
+        let zero = F128x8::splat(F128::ZERO);
+        let mut lo = [MaybeUninit::<F128x8>::uninit(); MAX_SLOTS];
+        let mut hi = [MaybeUninit::<F128x8>::uninit(); MAX_SLOTS];
+        for slot in 0..s {
+            let a: [F128; 8] = std::array::from_fn(|lane| folded[2 * (k + lane) * s + slot]);
+            let b: [F128; 8] = std::array::from_fn(|lane| folded[(2 * (k + lane) + 1) * s + slot]);
+            lo[slot].write(F128x8::from_array(&a));
+            hi[slot].write(F128x8::from_array(&b));
+        }
+        // SAFETY: slots `0..s` are initialized.
+        let (lo, hi) = unsafe { (lo[..s].assume_init_ref(), hi[..s].assume_init_ref()) };
+        for block in &self.blocks {
+            if block.weight != Weight::Omega {
+                continue;
+            }
+            let exact = x1 || block.gate.is_some();
+            let (mut c0, mut c1, mut c2) = (Prod8::ZERO, Prod8::ZERO, Prod8::ZERO);
+            for &(f, l) in &block.products {
+                let (a0, a1, b0, b1) = (lo[f], hi[f], lo[l], hi[l]);
+                c0 ^= a0.mul_unreduced(b0);
+                if exact {
+                    c1 ^= a1.mul_unreduced(b1);
+                }
+                c2 ^= (a0 + a1).mul_unreduced(b0 + b1);
+            }
+            let f0 = lo[block.linear] + c0.reduce_lanes();
+            let f2 = c2.reduce_lanes();
+            let mid = if exact {
+                f0 + hi[block.linear] + c1.reduce_lanes() + f2
+            } else {
+                zero
+            };
+            if let Some(g) = block.gate {
+                let (g0, g1) = (lo[g], hi[g]);
+                let gb = g0 + g1;
+                omega[0] = omega[0] + f0 * g0;
+                omega[1] = omega[1] + (mid.mul_unreduced(g0) ^ f0.mul_unreduced(gb)).reduce_lanes();
+                omega[2] = omega[2] + (f2.mul_unreduced(g0) ^ mid.mul_unreduced(gb)).reduce_lanes();
+                omega[3] = omega[3] + f2 * gb;
+            } else {
+                omega[0] = omega[0] + f0;
+                omega[1] = omega[1] + mid;
+                omega[2] = omega[2] + f2;
+            }
+        }
+        true
+    }
+
     /// Bind the lowest row variable at `x`: `explicit` rows after.
     pub fn fold(&mut self, explicit: usize, x: F128) {
         let s = self.stride;
@@ -504,8 +662,61 @@ impl<'a> Base<'a> {
                     parallel::chunks_mut(out, s * FOLD_ROWS, |task, chunk| {
                         let start = 2 * task * FOLD_ROWS;
                         let cols = self.window(start, start + 2 * FOLD_ROWS);
-                        for (j, row) in chunk.chunks_mut(s).enumerate() {
+                        let chunk_rows = chunk.len() / s;
+                        let mut j = 0usize;
+                        #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+                        if self.folded.is_none() {
+                            let x8 = F128x8::splat(x);
+                            while j + 8 <= chunk_rows && 2 * (task * FOLD_ROWS + j + 8) <= rows {
+                                let u = 2 * j;
+                                for (slot, &c) in self.factors.iter().enumerate() {
+                                    let col = cols.cols[c];
+                                    let a: &[F64; 8] = col[u..u + 8].try_into().unwrap();
+                                    let b: &[F64; 8] = col[u + 8..u + 16].try_into().unwrap();
+                                    let (e, o) = F64x8::even_odd(a, b);
+                                    let vals =
+                                        (F128x8::from(e) + x8.mul_base_unreduced(e + o).reduce_lanes()).to_array();
+                                    for (lane, v) in vals.into_iter().enumerate() {
+                                        chunk[(j + lane) * s + slot].write(v);
+                                    }
+                                }
+                                for (l_idx, (constant, terms)) in split.iter().enumerate() {
+                                    let mut acc = Prod8::ZERO;
+                                    for &(c, w0, w1) in terms {
+                                        let col = cols.cols[c];
+                                        let a: &[F64; 8] = col[u..u + 8].try_into().unwrap();
+                                        let b: &[F64; 8] = col[u + 8..u + 16].try_into().unwrap();
+                                        let (e, o) = F64x8::even_odd(a, b);
+                                        acc ^= F128x8::splat(w0).mul_base_unreduced(e)
+                                            ^ F128x8::splat(w1).mul_base_unreduced(o);
+                                    }
+                                    let vals = (acc.reduce_lanes() + F128x8::splat(*constant)).to_array();
+                                    for (lane, v) in vals.into_iter().enumerate() {
+                                        chunk[(j + lane) * s + n + l_idx].write(v);
+                                    }
+                                }
+                                j += 8;
+                            }
+                        } else if let Some(prev) = &self.folded {
+                            let prev_rows = prev.len() / s;
+                            while j + 8 <= chunk_rows && 2 * (task * FOLD_ROWS + j + 8) <= prev_rows {
+                                let base_k = task * FOLD_ROWS + j;
+                                for slot in 0..s {
+                                    let a8: [F128; 8] =
+                                        std::array::from_fn(|lane| prev[(2 * (base_k + lane)) * s + slot]);
+                                    let b8: [F128; 8] =
+                                        std::array::from_fn(|lane| prev[(2 * (base_k + lane) + 1) * s + slot]);
+                                    let vals = fold_pairs8_ext(&a8, &b8, x);
+                                    for (lane, v) in vals.into_iter().enumerate() {
+                                        chunk[(j + lane) * s + slot].write(v);
+                                    }
+                                }
+                                j += 8;
+                            }
+                        }
+                        while j < chunk_rows {
                             let k = task * FOLD_ROWS + j;
+                            let row = &mut chunk[j * s..(j + 1) * s];
                             if self.folded.is_none() && 2 * k + 1 < rows {
                                 let u = 2 * j;
                                 let column = |c: usize| (cols.cols[c][u], cols.cols[c][u + 1]);
@@ -520,6 +731,7 @@ impl<'a> Base<'a> {
                                     });
                                     o.write(*constant + sum.reduce());
                                 }
+                                j += 1;
                                 continue;
                             }
                             self.with_row(&cols, 2 * k, |lo| {
@@ -529,6 +741,7 @@ impl<'a> Base<'a> {
                                     }
                                 })
                             });
+                            j += 1;
                         }
                     });
                 }
@@ -536,12 +749,18 @@ impl<'a> Base<'a> {
         };
         self.folded = Some(folded);
         if let Some(eq) = &mut self.eq {
-            *eq = (0..eq.len().div_ceil(2))
-                .map(|k| {
-                    let (a, b) = (eq[2 * k], at(eq, 2 * k + 1));
-                    a + x * (a + b)
+            let half = eq.len().div_ceil(2);
+            let full = eq.len() / 2;
+            // SAFETY: every entry is written.
+            *eq = unsafe {
+                primitives::filled_vec(half, |out| {
+                    fold_adjacent(&mut out[..full], &eq[..2 * full], x);
+                    if full < half {
+                        let a = eq[2 * full];
+                        out[full].write(a + x * a);
+                    }
                 })
-                .collect();
+            };
         }
     }
 

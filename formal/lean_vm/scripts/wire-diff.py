@@ -22,7 +22,8 @@ The cases, per honest wire proof:
   append      one zero byte, one 0xff byte, four bytes, a digest's 32 bytes, a copy of the first
               phase;
   stream      the stream's length one more, one fewer, zero (with and without the elements),
-              2^32 - 1;
+              2^32 - 1; a compact element sent whole, with an overlong LEB128, and with its
+              bitmask bit cleared; a whole element's bit set; a bitmask bit past the stream;
   phases      the phase count one more, one fewer, zero, 9 and 2^32 - 1 (bytes unchanged);
               no phase; the phases repeated up to `MAX_PHASES` (8, decodes) and one past it (9);
   count       a phase's query count one more, one fewer, zero, 257 and 2^32 - 1 (bytes unchanged);
@@ -41,7 +42,7 @@ The cases, per honest wire proof:
               (decode), one past it (33), one less;
   sibling     a surplus digest at the bottom and at the top level, a missing first and last digest,
               a phase's carried siblings all dropped;
-  flip        one bit of a stream word, a query, the height, a row word, a carried digest, the last
+  flip        one bit of a stream byte, a query, the height, a row word, a carried digest, the last
               byte;
   random      random single-bit flips and random truncations, from `--seed`.
 
@@ -87,13 +88,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from proofio import Phase, Wire, batch, carried_nodes, parse_wire, u32
+from proofio import COMPACT_LIMIT, Phase, Wire, batch, carried_nodes, encode_stream, parse_wire, u32
 
 ROOT = Path(__file__).resolve().parent.parent
 LEAN_EXE = ROOT / ".lake" / "build" / "bin" / "wire-diff"
 RUST_EXE = ROOT / "scripts" / "wire-diff" / "target" / "release" / "leanvm-rust-wire"
 VECTOR = ROOT / "tests" / "fixtures" / "wire" / "round-trip-vector.bin"
-VECTOR_LENGTH = (4 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32
+VECTOR_LENGTH = (4 + 1 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32
 
 MAX_PHASES, MAX_QUERIES, MAX_LEAF_WORDS, MAX_HEIGHT = 8, 256, 64, 32
 
@@ -130,7 +131,8 @@ def mutations(data: bytes, rng: random.Random, random_cases: int, all_phases: bo
     phase, or with `all_phases` false on the first and the last only."""
     wire, offsets = parse_wire(data)
     stream_count = len(wire.stream) // 16
-    phase_count_at = 4 + len(wire.stream)
+    stream_bytes = len(wire.encoded_stream())
+    phase_count_at = stream_bytes
     cases = []
 
     def add(kind, label, value):
@@ -142,7 +144,7 @@ def mutations(data: bytes, rng: random.Random, random_cases: int, all_phases: bo
         return Wire(wire.stream, phases).encode()
 
     # truncate
-    cuts = {0, 1, 3, 4, len(data) - 1, len(data) - 33, 4 + len(wire.stream) // 2, phase_count_at,
+    cuts = {0, 1, 3, 4, len(data) - 1, len(data) - 33, stream_bytes // 2, phase_count_at,
             phase_count_at + 2}
     for start, rows_at, siblings_at, end in offsets:
         cuts |= {start, start + 2, rows_at - 1, rows_at + 4, siblings_at + 16, end - 1}
@@ -161,6 +163,21 @@ def mutations(data: bytes, rng: random.Random, random_cases: int, all_phases: bo
         if count >= 0:
             add("stream", f"length {label}", put(data, 0, u32(count)))
     add("stream", "empty", Wire(b"", wire.phases).encode())
+    phases_bytes = data[stream_bytes:]
+    compact = [i for i in range(stream_count)
+               if wire.stream[16 * i + 8:16 * i + 16] == bytes(8)
+               and int.from_bytes(wire.stream[16 * i:16 * i + 8], "little") < COMPACT_LIMIT]
+    if compact:
+        add("stream", "a compact element whole", encode_stream(wire.stream, whole={compact[0]})
+            + phases_bytes)
+        add("stream", "a compact element overlong",
+            encode_stream(wire.stream, overlong={compact[0]}) + phases_bytes)
+        add("stream", "a compact element's bit cleared", flip(data, 4 + compact[0] // 8, compact[0] % 8))
+    if len(compact) < stream_count:
+        whole = next(i for i in range(stream_count) if i not in compact)
+        add("stream", "a whole element's bit set", flip(data, 4 + whole // 8, whole % 8))
+    if stream_count % 8:
+        add("stream", "a bitmask bit past the stream", flip(data, 4 + stream_count // 8, 7))
 
     # phases
     n = len(wire.phases)
@@ -272,7 +289,7 @@ def mutations(data: bytes, rng: random.Random, random_cases: int, all_phases: bo
             add("flip", f"{tag} a carried digest", flip(data, siblings_at + rng.randrange(end - siblings_at), rng.randrange(8)))
 
     if wire.stream:
-        add("flip", "a stream word", flip(data, 4 + rng.randrange(len(wire.stream)), rng.randrange(8)))
+        add("flip", "a stream byte", flip(data, 4 + rng.randrange(stream_bytes - 4), rng.randrange(8)))
     add("flip", "the last byte", flip(data, len(data) - 1, 7))
 
     # random

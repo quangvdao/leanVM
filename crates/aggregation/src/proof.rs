@@ -47,10 +47,17 @@ impl AggregateProof {
         encode(&self.bytecode_point, &self.proof.to_bytes())
     }
 
-    /// The VM proof's scalar stream length, and its encoding's length in bytes: the bench's.
+    /// The VM proof's scalar stream length, compressed stream byte length, and total encoding byte length: the bench's.
     #[doc(hidden)]
-    pub fn __vm_proof_shape(&self) -> (usize, usize) {
-        (self.proof.stream.len(), self.proof.to_bytes().len())
+    pub fn __vm_proof_shape(&self) -> (usize, usize, usize) {
+        let vm_bytes = self.proof.to_bytes().len();
+        let stream_only = verifier::Proof {
+            stream: self.proof.stream.clone(),
+            merkle_openings: Vec::new(),
+        };
+        // Subtract the 4-byte stream length and 4-byte phase count headers.
+        let stream_bytes = stream_only.to_bytes().len() - 8;
+        (self.proof.stream.len(), stream_bytes, vm_bytes)
     }
 
     /// Decode a proof, `None` if the bytes are not one. This does not verify: call [`Self::verify`].

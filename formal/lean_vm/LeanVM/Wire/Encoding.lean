@@ -34,12 +34,15 @@ open LeanVM.Parameters LeanVM.Semantics LeanVM.Protocol.KeccakHash
 A proof travels as one byte string, `Proof::to_bytes` (`Proof.toBytes`, below), and the verifier
 decodes it, `Proof::from_bytes` (`Proof.fromBytes`, below), then verifies the proof. Every count and
 size is a little-endian 32-bit word, every `K` word eight little-endian bytes, every digest its 32
-bytes. A phase travels pruned: the queries' positions, the height, the leaf width and the row width,
-the leaf at each distinct position as its last row-width words (the words before are zero in every
-leaf of the phase), and the siblings no other path of the phase gives, bottom level first and left
-to right; decoding recomputes the others by hashing, Keccak-256 over `π` as the verifier hashes
-(`hash_leaf`, `hash_pair`, `crates/verifier/src/merkle.rs`). Decoding verifies nothing: it
-refuses everything but the one encoding of a proof within the bounds below.
+bytes. The stream travels as its length, a bitmask of one bit per element marking the compact ones
+(`compactScalar`: a `y` limb of zero and a `y^0` limb below `2 ^ 56`), then each element: a compact
+one as its `y^0` limb in canonical unsigned LEB128 (one to eight bytes), any other as its two limbs'
+16 bytes (`readStream`). A phase travels pruned: the queries' positions, the height, the leaf width
+and the row width, the leaf at each distinct position as its last row-width words (the words before
+are zero in every leaf of the phase), and the siblings no other path of the phase gives, bottom
+level first and left to right; decoding recomputes the others by hashing, Keccak-256 over `π` as the
+verifier hashes (`hash_leaf`, `hash_pair`, `crates/verifier/src/merkle.rs`). Decoding verifies
+nothing: it refuses everything but the one encoding of a proof within the bounds below.
 
 The Rust hashes a phase's shared nodes while it reads the phase's siblings; which siblings it reads
 depends on the positions only, never on a hash, so here the bytes are read first (`readProof`) and
@@ -47,6 +50,15 @@ the shared nodes hashed after (`unprunePhase`), in the Rust's order. On bytes th
 has hashed some nodes, which changes nothing it returns. Sizes are natural numbers here, `usize` on
 a 64-bit host in the Rust, where no product of the decoding overflows.
 -/
+
+/-- `COMPACT_LIMIT`: the bound below which a stream scalar's `y^0` limb travels compact
+(`wire.rs`). -/
+def wireCompactLimit : ℕ := 2 ^ 56
+
+/-- `is_compact`: a stream element travels compact when its `y` limb is zero and its `y^0` limb is
+below `wireCompactLimit` (`wire.rs`). -/
+def compactScalar (x : E) : Bool :=
+  decide (x.limb 1 = 0) && decide ((x.limb 0).lane.toNat < wireCompactLimit)
 
 /-- `MAX_PHASES`: the most phases a decoded proof has (`wire.rs`). -/
 def wireMaxPhases : ℕ := 8
@@ -114,6 +126,61 @@ def readDigest (input : Bytes) : Option (Digest × Bytes) :=
   (readBytes 32 input).map fun (head, rest) ↦
     (#v[KeccakHash.littleEndianLane head 0, KeccakHash.littleEndianLane head 1,
       KeccakHash.littleEndianLane head 2, KeccakHash.littleEndianLane head 3], rest)
+
+/-- `Reader::varint`, with `fuel` bytes left to read: canonical unsigned LEB128, seven bits a
+byte, least significant first, the high bit set on every byte but the last. Refused past `fuel`
+bytes, and refused when the last byte is zero unless it is the first (`first`), the only zero last
+byte of a canonical encoding. The Rust reads at most eight bytes (`readVarint 8 true`). -/
+def readVarint : (fuel : ℕ) → (first : Bool) → Bytes → Option (ℕ × Bytes)
+  | 0, _, _ => none
+  | _ + 1, _, [] => none
+  | fuel + 1, first, byte :: input =>
+    if byte.toNat < 128 then
+      if first = true ∨ byte.toNat ≠ 0 then some (byte.toNat, input) else none
+    else
+      (readVarint fuel false input).map fun (high, input) ↦ (byte.toNat - 128 + 128 * high, input)
+
+/-- Bytes as the little-endian number `∑ b_k 256^k`. -/
+def leValue : List UInt8 → ℕ
+  | [] => 0
+  | byte :: bytes => byte.toNat + 256 * leValue bytes
+
+/-- The low `count` bits of a number, least significant first. -/
+def bitsOf : (count : ℕ) → ℕ → List Bool
+  | 0, _ => []
+  | count + 1, value => decide (value % 2 = 1) :: bitsOf count (value / 2)
+
+/-- One stream element, compact or not as its bitmask bit says: a compact one as its `y^0` limb's
+LEB128 (`readVarint 8 true`), its `y` limb zero; any other as its two limbs' words, refused when the
+element is compact, which has the shorter encoding. -/
+def readElement (compact : Bool) (input : Bytes) : Option (E × Bytes) :=
+  if compact then
+    (readVarint 8 true input).map fun (value, input) ↦
+      (E.ofLimbs (K.ofLane (UInt64.ofNat value)) 0, input)
+  else do
+    let (words, input) ← readWords 2 input
+    let element := E.ofLimbs (words.getD 0 0) (words.getD 1 0)
+    guard (compactScalar element = false)
+    some (element, input)
+
+/-- The stream elements, one per bitmask bit, in order. -/
+def readElements : List Bool → Bytes → Option (List E × Bytes)
+  | [], input => some ([], input)
+  | compact :: flags, input => do
+    let (element, input) ← readElement compact input
+    let (elements, input) ← readElements flags input
+    some (element :: elements, input)
+
+/-- The stream (`Proof::from_bytes`, `wire.rs`): its length `n`; the bitmask, `⌈n / 8⌉` bytes,
+bit `i` (bit `i % 8` of byte `i / 8`) marking element `i` compact, refused unless its bits from `n`
+on are zero, here as the bytes' little-endian number being below `2 ^ n`; then the elements
+(`readElements`). The Rust first refuses bytes too few for the bitmask and one byte per element,
+which `readElements` refuses too. -/
+def readStream (input : Bytes) : Option (List E × Bytes) := do
+  let (length, input) ← readU32 input
+  let (mask, input) ← readBytes ((length + 7) / 8) input
+  guard (leValue mask < 2 ^ length)
+  readElements (bitsOf length (leValue mask)) input
 
 /-- `count` digests, in order. -/
 def readDigests : (count : ℕ) → Bytes → Option (List Digest × Bytes)
@@ -189,14 +256,10 @@ def readPhases : (count : ℕ) → Bytes → Option (List PrunedPhase × Bytes)
     let (phases, input) ← readPhases count input
     some (phase :: phases, input)
 
-/-- `Proof::from_bytes` up to the hashing (`wire.rs`): the stream's length and its elements,
-each two words `c0, c1` (`F128::new`); the number of phases, at most `wireMaxPhases`, and the
-phases; refused unless no byte is left. -/
+/-- `Proof::from_bytes` up to the hashing (`wire.rs`): the stream (`readStream`); the number of
+phases, at most `wireMaxPhases`, and the phases; refused unless no byte is left. -/
 def readProof (bytes : Bytes) : Option (List E × List PrunedPhase) := do
-  let (length, input) ← readU32 bytes
-  let (words, input) ← readWords (2 * length) input
-  let stream := (List.range length).map fun i ↦
-    E.ofLimbs (words.getD (2 * i) 0) (words.getD (2 * i + 1) 0)
+  let (stream, input) ← readStream bytes
   let (phaseCount, input) ← readU32 input
   guard (phaseCount ≤ wireMaxPhases)
   let (phases, input) ← readPhases phaseCount input
@@ -275,6 +338,37 @@ open LeanVM.Protocol.KeccakHash in
 def u32Bytes (value : ℕ) : List UInt8 :=
   (List.range 4).map fun k ↦ UInt8.ofNat (value / 256 ^ k)
 
+/-- `write_varint`: canonical unsigned LEB128, seven bits a byte, least significant first, the
+high bit set on every byte but the last (`wire.rs`). -/
+def varintBytes (value : ℕ) : List UInt8 :=
+  if value < 128 then [UInt8.ofNat value]
+  else UInt8.ofNat (value % 128 + 128) :: varintBytes (value / 128)
+termination_by value
+decreasing_by omega
+
+/-- The `count` little-endian bytes of a number, modulo `256 ^ count`. -/
+def leBytes : (count : ℕ) → ℕ → List UInt8
+  | 0, _ => []
+  | count + 1, value => UInt8.ofNat (value % 256) :: leBytes count (value / 256)
+
+/-- Bits as the number they are the low bits of, least significant first. -/
+def bitsValue : List Bool → ℕ
+  | [] => 0
+  | bit :: bits => bit.toNat + 2 * bitsValue bits
+
+open LeanVM.Protocol.KeccakHash in
+/-- One stream element's bytes: a compact one as its `y^0` limb's LEB128, any other as its two
+limbs' 16 bytes (`wire.rs`). -/
+def elementBytes (x : E) : List UInt8 :=
+  if compactScalar x then varintBytes (x.limb 0).lane.toNat else x.toBytes
+
+/-- The stream's bytes (`Proof::to_bytes`, `wire.rs`): its length `n`; the bitmask, `⌈n / 8⌉`
+bytes, bit `i` set when element `i` is compact; then each element (`elementBytes`). -/
+def streamToBytes (stream : List E) : List UInt8 :=
+  u32Bytes stream.length ++
+    leBytes ((stream.length + 7) / 8) (bitsValue (stream.map compactScalar)) ++
+    stream.flatMap elementBytes
+
 open LeanVM.Protocol.KeccakHash in
 /-- `write_phase` (`wire.rs`): the queries' count and positions, in sampling order; the
 height, the leaf width and the row width, the leaf width less the leading zero words every distinct
@@ -297,10 +391,10 @@ def phaseToBytes (paths : List Opening) : List UInt8 :=
       (nodes.filter fun (node, _) ↦ node ^^^ 1 ∉ nodes.map Prod.fst).flatMap
         fun (_, sibling) ↦ digestBytes sibling
 
-/-- **The proof's one encoding** (`Proof::to_bytes`, `wire.rs`): the stream's length, then
-each element as its two words; the number of phases, then each phase pruned (`phaseToBytes`). -/
+/-- **The proof's one encoding** (`Proof::to_bytes`, `wire.rs`): the stream (`streamToBytes`);
+the number of phases, then each phase pruned (`phaseToBytes`). -/
 def _root_.LeanVM.Protocol.Compile.Proof.toBytes (proof : Proof) : List UInt8 :=
-  u32Bytes proof.stream.length ++ proof.stream.flatMap E.toBytes ++
+  streamToBytes proof.stream ++
     u32Bytes proof.openings.length ++ proof.openings.flatMap phaseToBytes
 
 end LeanVM.Prover

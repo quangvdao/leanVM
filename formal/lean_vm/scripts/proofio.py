@@ -6,9 +6,11 @@ file formats, read without hashing, and the running of their child processes.
     `u64` position, its `u32` leaf length and that many `u64` words, its `u32` sibling count and
     that many 32-byte digests (`parse_phases`);
   * `proof.wire`, the one wire encoding (`Proof::to_bytes`, `crates/verifier/src/wire.rs`): the
-    `u32` stream length and the stream, 16 bytes a scalar; the `u32` phase count; per phase its
-    `u32` query count and positions, its `u32` height, leaf width and row width, the row of every
-    distinct position, ascending, and the carried siblings (`parse_wire`, `Wire`, `Phase`).
+    `u32` stream length, a bitmask of one bit per scalar marking the compact ones, and each scalar,
+    a compact one as LEB128 of its low word and any other as its 16 bytes (`encode_stream`); the
+    `u32` phase count; per phase its `u32` query count and positions, its `u32` height, leaf width
+    and row width, the row of every distinct position, ascending, and the carried siblings
+    (`parse_wire`, `Wire`, `Phase`).
 
 The scripts run under `python3 -I`, so they load this module by its path.
 """
@@ -113,15 +115,58 @@ class Phase:
         return sum(len(carried_nodes(self.positions(), level)) for level in range(self.height))
 
 
+COMPACT_LIMIT = 1 << 56
+
+
+def varint(value: int) -> bytes:
+    """Canonical unsigned LEB128 (`write_varint`)."""
+    out = bytearray()
+    while True:
+        byte, value = value & 0x7F, value >> 7
+        if value == 0:
+            out.append(byte)
+            return bytes(out)
+        out.append(byte | 0x80)
+
+
+def encode_stream(stream: bytes, count=None, whole=(), overlong=()) -> bytes:
+    """The stream's bytes from its elements, 16 bytes each (`c0`, `c1`): its length, a bitmask of
+    one bit per element marking the compact ones (`c1 == 0 and c0 < 2^56`), then each element, a
+    compact one as LEB128 of `c0`, any other as its 16 bytes; `count` overrides the length
+    written, and the elements at the indices `whole` travel whole (not compact), those at
+    `overlong` with one redundant LEB128 byte (both refused when compact)."""
+    elements = [stream[i:i + 16] for i in range(0, len(stream), 16)]
+    compact = []
+    for i, element in enumerate(elements):
+        c0, c1 = struct.unpack("<QQ", element)
+        compact.append(c1 == 0 and c0 < COMPACT_LIMIT and i not in whole)
+    out = bytearray(u32(len(elements) if count is None else count))
+    for chunk in range(0, len(elements), 8):
+        out.append(sum(1 << bit for bit, flag in enumerate(compact[chunk:chunk + 8]) if flag))
+    for i, (element, flag) in enumerate(zip(elements, compact)):
+        if not flag:
+            out += element
+        elif i in overlong:
+            leb = bytearray(varint(struct.unpack("<Q", element[:8])[0]))
+            leb[-1] |= 0x80
+            out += leb + b"\0"
+        else:
+            out += varint(struct.unpack("<Q", element[:8])[0])
+    return bytes(out)
+
+
 class Wire:
-    """A proof as its encoding gives it."""
+    """A proof as its encoding gives it: the stream as its elements' 16 bytes each, and the
+    phases."""
 
     def __init__(self, stream: bytes, phases: list):
         self.stream, self.phases = stream, phases
 
+    def encoded_stream(self, stream_count=None) -> bytes:
+        return encode_stream(self.stream, stream_count)
+
     def encode(self, stream_count=None, phase_count=None) -> bytes:
-        out = bytearray(u32(len(self.stream) // 16 if stream_count is None else stream_count))
-        out += self.stream
+        out = bytearray(self.encoded_stream(stream_count))
         out += u32(len(self.phases) if phase_count is None else phase_count)
         for phase in self.phases:
             out += phase.encode()
@@ -144,7 +189,32 @@ def parse_wire(data: bytes) -> tuple:
     def read_u32():
         return struct.unpack("<I", take(4))[0]
 
-    stream = take(16 * read_u32())
+    def read_varint():
+        value = 0
+        for shift in range(0, 56, 7):
+            byte = take(1)[0]
+            if byte & 0x80 == 0:
+                if shift and byte == 0:
+                    raise ValueError("non-canonical LEB128")
+                return value | (byte << shift)
+            value |= (byte & 0x7F) << shift
+        raise ValueError("LEB128 past 2^56")
+
+    count = read_u32()
+    mask = take((count + 7) // 8)
+    if int.from_bytes(mask, "little") >> count:
+        raise ValueError("bitmask bits past the stream")
+    stream = bytearray()
+    for i in range(count):
+        if mask[i // 8] >> (i % 8) & 1:
+            stream += struct.pack("<QQ", read_varint(), 0)
+        else:
+            element = take(16)
+            c0, c1 = struct.unpack("<QQ", element)
+            if c1 == 0 and c0 < COMPACT_LIMIT:
+                raise ValueError("a compact element sent whole")
+            stream += element
+    stream = bytes(stream)
     phases, offsets = [], []
     for _ in range(read_u32()):
         start = offset

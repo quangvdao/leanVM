@@ -8,10 +8,15 @@ The vector of `proof_round_trips_through_its_one_encoding` (`crates/verifier/src
 leanVM): a tree of four rows `[0, 0, 1]`, `[0, 2, 3]`, `[0, 0, 4]`,
 `[0, 5, 0]`, opened at the queries `3, 1, 3` with leaves of `3` words (built by the test: the sibling at level `l` of query `q` is the node
 `(q >> l) ^ 1`), and the stream `[E::new(1, 2)]`. As the Rust asserts: the encoding is
-`(4 + 16) + 4 + (4 + 3·4) + 3·4 + 2·2·8 + 2·32 = 148` bytes (the stream; the phase count; the
-queries; three sizes; two rows of two words, the common zero word dropped; two siblings); it
-decodes, with Keccak-256 over Keccak-f[1600], to the proof, whose encoding is the bytes; and one
-more byte is refused.
+`(4 + 1 + 16) + 4 + (4 + 3·4) + 3·4 + 2·2·8 + 2·32 = 149` bytes (the stream: its length, a
+one-byte bitmask and one whole element; the phase count; the queries; three sizes; two rows of two
+words, the common zero word dropped; two siblings); it decodes, with Keccak-256 over
+Keccak-f[1600], to the proof, whose encoding is the bytes; and one more byte is refused.
+
+The vector of `compact_stream_is_canonical`: eleven stream elements, seven of them compact (LEB128
+of one, one, one, two, two, three and eight bytes) and four whole, so `4 + 2 + 18 + 64 + 4` bytes;
+they round-trip; the empty proof is eight zero bytes; and decoding refuses a bitmask bit past the
+stream, an overlong LEB128 of zero, a LEB128 of nine bytes, and a compact element sent whole.
 
 Each check is run compiled (`#guard`, the hash compiled by `Statement.Fast.Keccak`). The kernel
 does not reduce the encoding or the decoding themselves: both sort the positions with core's
@@ -56,7 +61,7 @@ def fields (p : Proof) : List (List UInt8) × List (List (ℕ × List K × List 
 def decode (bytes : Bytes) : Option Proof :=
   Proof.fromBytes (m := Id) (fun s ↦ pure (keccakF1600 s)) bytes
 
-#guard proof.toBytes.length = (4 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32
+#guard proof.toBytes.length = (4 + 1 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32
 
 #guard (decode proof.toBytes).map fields == some (fields proof)
 
@@ -64,5 +69,49 @@ def decode (bytes : Bytes) : Option Proof :=
 
 /- One encoding: the decoded proof's encoding is the bytes. -/
 #guard (decode proof.toBytes).map Proof.toBytes == some proof.toBytes
+
+/-- An element from its two limbs' lanes. -/
+def element (c0 c1 : UInt64) : E := E.ofLimbs (K.ofLane c0) (K.ofLane c1)
+
+/-- The stream of `compact_stream_is_canonical`, around both ends of each LEB128 length and of
+`COMPACT_LIMIT`. -/
+def compactCases : List E :=
+  [element 0 0, element 1 0, element 127 0, element 128 0, element (2 ^ 14 - 1) 0,
+    element (2 ^ 14) 0, element (2 ^ 56 - 1) 0, element (2 ^ 56) 0,
+    element 0xFFFFFFFFFFFFFFFF 0, element 0 1, element 42 99]
+
+/-- The proof of `compact_stream_is_canonical`: the stream, no phase. -/
+def compactProof : Proof := ⟨compactCases, []⟩
+
+/-- The compact proof's bytes. -/
+def compactBytes : Bytes := compactProof.toBytes
+
+/-- Its stream elements, comparable. -/
+def streamFields (p : Proof) : List (List UInt8) := p.stream.map E.toBytes
+
+#guard compactBytes.length = 4 + 2 + 18 + 64 + 4
+
+#guard (decode compactBytes).map streamFields == some (streamFields compactProof)
+
+#guard (decode compactBytes).map Proof.toBytes == some compactBytes
+
+#guard (⟨[], []⟩ : Proof).toBytes == List.replicate 8 0
+
+#guard ((decode (List.replicate 8 0)).map streamFields) == some []
+
+/- A bitmask bit past the stream (the high bit of the second bitmask byte). -/
+#guard (decode (compactBytes.set 5 (compactBytes[5]! ||| 0x80))).isNone
+
+/- An overlong LEB128 of zero. -/
+#guard (decode (LeanVM.Prover.u32Bytes 1 ++ [0x01, 0x80, 0x00] ++
+  LeanVM.Prover.u32Bytes 0)).isNone
+
+/- A LEB128 of nine bytes. -/
+#guard (decode (LeanVM.Prover.u32Bytes 1 ++ [0x01] ++ List.replicate 8 0x80 ++ [0x01] ++
+  LeanVM.Prover.u32Bytes 0)).isNone
+
+/- A compact element sent whole. -/
+#guard (decode (LeanVM.Prover.u32Bytes 1 ++ [0x00] ++ K.toBytes (K.ofLane 7) ++ K.toBytes 0 ++
+  LeanVM.Prover.u32Bytes 0)).isNone
 
 end LeanVMTests.Wire.RustVector

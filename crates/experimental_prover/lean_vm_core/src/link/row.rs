@@ -28,7 +28,9 @@ use super::base::Base;
 use super::pointer::{ChunkEq, Chunks, NO_INDEX, Shifts, SplitEq, eval_chunk, mirror};
 use super::{at, fold};
 use primitives::bit_fold::fold_sparse_bits;
-use primitives::field::{F128, F128Unreduced};
+#[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+use primitives::field::{Acc8, F128x8};
+use primitives::field::{F128, F128Unreduced, fold_adjacent, fold_pairs8_ext};
 use std::mem::MaybeUninit;
 
 /// Room for the coefficients of one round: degree `max(d + 2, 4) ≤ 11`.
@@ -1244,8 +1246,22 @@ impl Strided {
         self.data = unsafe {
             primitives::filled_vec(len * s, |out| {
                 parallel::chunks_mut(out, s * TASK_PAIRS, |task, chunk| {
-                    for (j, row) in chunk.chunks_mut(s).enumerate() {
+                    let rows = chunk.len() / s;
+                    let mut j = 0;
+                    // Eight rows at a time, column by column.
+                    while j + 8 <= rows {
                         let k = task * TASK_PAIRS + j;
+                        for i in 0..s {
+                            let lo: [F128; 8] = std::array::from_fn(|t| self.at(2 * (k + t), i));
+                            let hi: [F128; 8] = std::array::from_fn(|t| self.at(2 * (k + t) + 1, i));
+                            for (t, v) in fold_pairs8_ext(&lo, &hi, x).into_iter().enumerate() {
+                                chunk[(j + t) * s + i].write(v);
+                            }
+                        }
+                        j += 8;
+                    }
+                    for (jj, row) in chunk[j * s..].chunks_mut(s).enumerate() {
+                        let k = task * TASK_PAIRS + j + jj;
                         for (i, o) in row.iter_mut().enumerate() {
                             o.write(fold(self.at(2 * k, i), self.at(2 * k + 1, i), x));
                         }
@@ -1531,7 +1547,18 @@ impl<'a> Column<'a> {
             values = rest;
             let (lo, hi) = (self.view(2 * k), self.view(2 * k + 1));
             let (lo_len, hi_len) = (lo.values.len(), hi.values.len());
-            for (j, o) in row.iter_mut().enumerate() {
+            // The values both rows store fold eight at a time.
+            let both = len.min(lo_len).min(hi_len);
+            let mut start = 0;
+            while start + 8 <= both {
+                let a: &[F128; 8] = lo.values[start..start + 8].try_into().unwrap();
+                let b: &[F128; 8] = hi.values[start..start + 8].try_into().unwrap();
+                for (o, v) in row[start..start + 8].iter_mut().zip(fold_pairs8_ext(a, b, x)) {
+                    o.write(v);
+                }
+                start += 8;
+            }
+            for (j, o) in row.iter_mut().enumerate().skip(start) {
                 let a = if j < lo_len {
                     lo.values[j]
                 } else {
@@ -1819,7 +1846,99 @@ impl<'a> State<'a> {
                 Some(_) => &[],
             })
             .collect();
-        for k in range.clone() {
+        // The columns' terms at the pair `k`, added to `sums`.
+        let add_columns = |k: usize, aux: &[(F128, F128)], sums: &mut Sums| {
+            for (((column, tables), weighted), run) in self.columns.iter().zip(tables).zip(weighted).zip(&word_runs) {
+                let words = (tables.as_slice(), weighted.as_slice());
+                let mut sums = sums.reborrow();
+                match &column.values {
+                    None if n == 1
+                        && column.shifts.is_empty()
+                        && Self::pair_single(column, k, aux, chunks, points, sums.reborrow()) => {}
+                    None if n == 2
+                        && column.shifts.is_empty()
+                        && Self::pair_group::<2>(column, weighted, k, aux, chunks, points, sums.reborrow()) => {}
+                    None if n == 4
+                        && column.shifts.is_empty()
+                        && Self::pair_group::<4>(column, weighted, k, aux, chunks, points, sums.reborrow()) => {}
+                    None => {
+                        let run = (first_word, &**run);
+                        Self::pair_words(column, words, run, &self.bound, k, aux, chunks, points, sums);
+                    }
+                    Some(_) => Self::pair_folded(column, words.0, k, aux, points, chunks, sums),
+                }
+            }
+        };
+        // A pair `k < whole`: the columns add their terms under `ω`, with the certificate's, to `under_omega`, which
+        // holds the pair's base terms, and those under `act` to `under_one`. The caller then scales `under_omega` by
+        // `ω_0 + ω_1`.
+        let whole_pair = |k: usize, under_omega: &mut [F128; MAX_COEFFS], under_one: &mut Acc| {
+            let aux = self.aux_pair(k);
+            let mut cert = [F128Unreduced::ZERO; 3];
+            let mut cols_omega = [F128Unreduced::ZERO; MAX_COEFFS];
+            add_columns(
+                k,
+                &aux,
+                &mut Sums {
+                    omega: &mut cols_omega,
+                    act: under_one,
+                    cert: &mut cert,
+                    x1: !derive,
+                },
+            );
+            for (o, c) in under_omega.iter_mut().zip(&cert) {
+                *o += c.reduce();
+            }
+            debug_assert!(under_omega[len.max(BASE_COEFFS)..].iter().all(|c| c.is_zero()));
+            for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
+                *o += c.reduce();
+            }
+        };
+        let mut k = range.start;
+        // Eight pairs below `whole` at a time once the base terms are folded: the base terms of all eight in one
+        // vector pass, and the scale `ω_0 + ω_1` as one product of eight lanes per coefficient. A pair whose `ω` is
+        // zero at both rows has scale zero, so its base terms add nothing, as in the scalar loop, which skips them.
+        #[cfg(all(target_arch = "x86_64", target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+        {
+            let mut factored8 = [Acc8::ZERO; MAX_COEFFS];
+            if self.base_first.is_none() && !self.base.on_padding() {
+                let end = range.end.min(whole);
+                while k + 8 <= end {
+                    let mut base8 = [F128x8::splat(F128::ZERO); BASE_COEFFS];
+                    if !self.base.pair_omega_folded_x8(k, !derive, &mut base8) {
+                        break;
+                    }
+                    let base8 = base8.map(F128x8::to_array);
+                    let mut lanes = [[F128::ZERO; 8]; MAX_COEFFS];
+                    for t in 0..8 {
+                        let mut under_omega = [F128::ZERO; MAX_COEFFS];
+                        for (o, b) in under_omega.iter_mut().zip(&base8) {
+                            *o = b[t];
+                        }
+                        whole_pair(k + t, &mut under_omega, &mut under_one);
+                        for (lane, &v) in lanes.iter_mut().zip(&under_omega) {
+                            lane[t] = v;
+                        }
+                    }
+                    // `k + 8 ≤ whole`, so all sixteen rows are executed and `ω` holds them.
+                    let w0: &[F128; 8] = self.omega[2 * k..2 * k + 8].try_into().unwrap();
+                    let w1: &[F128; 8] = self.omega[2 * k + 8..2 * k + 16].try_into().unwrap();
+                    let (lo, hi) = F128x8::even_odd(F128x8::from_array(w0), F128x8::from_array(w1));
+                    let scale = lo + hi;
+                    for (j, (f, lane)) in factored8[..len].iter_mut().zip(&lanes).enumerate() {
+                        if derive && j == 1 {
+                            continue;
+                        }
+                        *f ^= scale.mul_unreduced(F128x8::from_array(lane));
+                    }
+                    k += 8;
+                }
+            }
+            for (f, f8) in factored.iter_mut().zip(factored8) {
+                *f ^= F128Unreduced::from(f8.reduce());
+            }
+        }
+        for k in k..range.end {
             let omega = (at(&self.omega, 2 * k), at(&self.omega, 2 * k + 1));
             // The base terms under `ω`, reduced: at most `BASE_COEFFS` coefficients.
             let mut under_omega = [F128::ZERO; MAX_COEFFS];
@@ -1831,66 +1950,32 @@ impl<'a> State<'a> {
             if is_zero_pair(omega) && 2 * k >= self.support {
                 continue;
             }
-            let act = (self.act(2 * k), self.act(2 * k + 1));
-            let aux = self.aux_pair(k);
-            let mut cert = [F128Unreduced::ZERO; 3];
-            let add_columns = |sums: &mut Sums| {
-                for (((column, tables), weighted), run) in self.columns.iter().zip(tables).zip(weighted).zip(&word_runs)
-                {
-                    let words = (tables.as_slice(), weighted.as_slice());
-                    let mut sums = sums.reborrow();
-                    match &column.values {
-                        None if n == 1
-                            && column.shifts.is_empty()
-                            && Self::pair_single(column, k, &aux, chunks, points, sums.reborrow()) => {}
-                        None if n == 2
-                            && column.shifts.is_empty()
-                            && Self::pair_group::<2>(column, weighted, k, &aux, chunks, points, sums.reborrow()) => {}
-                        None if n == 4
-                            && column.shifts.is_empty()
-                            && Self::pair_group::<4>(column, weighted, k, &aux, chunks, points, sums.reborrow()) => {}
-                        None => {
-                            let run = (first_word, &**run);
-                            Self::pair_words(column, words, run, &self.bound, k, &aux, chunks, points, sums);
-                        }
-                        Some(_) => Self::pair_folded(column, words.0, k, &aux, points, chunks, sums),
-                    }
-                }
-            };
             if k < whole {
-                // The columns add their terms under `ω` to `cols_omega` and those under `act` to `under_one`; the
-                // pair's terms under `ω` then take the scale `ω_0 + ω_1` together.
-                let mut cols_omega = [F128Unreduced::ZERO; MAX_COEFFS];
-                add_columns(&mut Sums {
-                    omega: &mut cols_omega,
-                    act: &mut under_one,
-                    cert: &mut cert,
-                    x1: !derive,
-                });
-                for (o, c) in under_omega.iter_mut().zip(&cert) {
-                    *o += c.reduce();
-                }
-                debug_assert!(under_omega[len.max(BASE_COEFFS)..].iter().all(|c| c.is_zero()));
+                // The pair's terms under `ω` take the scale `ω_0 + ω_1` together.
+                whole_pair(k, &mut under_omega, &mut under_one);
                 let scale = omega.0 + omega.1;
-                for (j, (f, (c, &v))) in factored[..len]
-                    .iter_mut()
-                    .zip(cols_omega.iter().zip(&under_omega))
-                    .enumerate()
-                {
-                    if (derive && j == 1) || (*c == F128Unreduced::ZERO && v.is_zero()) {
+                for (j, (f, &v)) in factored[..len].iter_mut().zip(&under_omega).enumerate() {
+                    if (derive && j == 1) || v.is_zero() {
                         continue;
                     }
-                    *f ^= scale.mul_unreduced(c.reduce() + v);
+                    *f ^= scale.mul_unreduced(v);
                 }
             } else {
+                let act = (self.act(2 * k), self.act(2 * k + 1));
+                let aux = self.aux_pair(k);
+                let mut cert = [F128Unreduced::ZERO; 3];
                 let (mut cols_omega, mut cols_act) =
                     ([F128Unreduced::ZERO; MAX_COEFFS], [F128Unreduced::ZERO; MAX_COEFFS]);
-                add_columns(&mut Sums {
-                    omega: &mut cols_omega,
-                    act: &mut cols_act,
-                    cert: &mut cert,
-                    x1: true,
-                });
+                add_columns(
+                    k,
+                    &aux,
+                    &mut Sums {
+                        omega: &mut cols_omega,
+                        act: &mut cols_act,
+                        cert: &mut cert,
+                        x1: true,
+                    },
+                );
                 for (o, c) in under_omega[..len].iter_mut().zip(&cols_omega) {
                     *o += c.reduce();
                 }
@@ -2347,8 +2432,13 @@ impl<'a> State<'a> {
         self.omega = unsafe {
             primitives::filled_vec(support, |out| {
                 parallel::chunks_mut(out, ROW_BLOCK, |task, chunk| {
-                    for (j, o) in chunk.iter_mut().enumerate() {
-                        let k = task * ROW_BLOCK + j;
+                    let start = task * ROW_BLOCK;
+                    // The pairs whose rows are both stored fold eight at a time; an odd last row pairs with zero.
+                    let stored = (omega.len() / 2).saturating_sub(start).min(chunk.len());
+                    let (head, tail) = chunk.split_at_mut(stored);
+                    fold_adjacent(head, &omega[2 * start..2 * (start + stored)], x);
+                    for (j, o) in tail.iter_mut().enumerate() {
+                        let k = start + stored + j;
                         o.write(fold(at(omega, 2 * k), at(omega, 2 * k + 1), x));
                     }
                 });

@@ -18,8 +18,8 @@ import Mathlib.Data.List.GetD
 the paths: the queries' count and positions, the height, the leaf width and the row width (the leaf
 width less the zero words common to the fronts of the leaves, `zeroPrefix`, as `phaseToBytes`
 computes them), each leaf without that prefix, and the carried siblings' digests level by level, in
-order. `encodePruned` is `Proof.toBytes` from the pruned form: the stream's length and elements, the
-phase count and each phase.
+order. `encodePruned` is `Proof.toBytes` from the pruned form: the stream, the phase count and each
+phase.
 
 The reader is deterministic: bytes `readPhase` accepts are `encodePhase` of the phase read, then
 the rest (`eq_encodePhase_of_readPhase`), and bytes `readProof` accepts are `encodePruned` of what
@@ -56,11 +56,10 @@ def encodePhase (ph : PrunedPhase) : Bytes :=
     ph.leaves.flatMap (fun leaf ↦ (leaf.drop zeros).flatMap K.toBytes) ++
     ph.carried.flatMap fun level ↦ level.flatMap fun carried ↦ digestBytes carried.2
 
-/-- The bytes of a pruned proof, as `Proof.toBytes` writes them: the stream's length, then each
-element as its two words; the number of phases, then each phase (`encodePhase`). -/
+/-- The bytes of a pruned proof, as `Proof.toBytes` writes them: the stream
+(`Prover.streamToBytes`); the number of phases, then each phase (`encodePhase`). -/
 def encodePruned (x : List E × List PrunedPhase) : Bytes :=
-  Prover.u32Bytes x.1.length ++ x.1.flatMap E.toBytes ++
-    Prover.u32Bytes x.2.length ++ x.2.flatMap encodePhase
+  Prover.streamToBytes x.1 ++ Prover.u32Bytes x.2.length ++ x.2.flatMap encodePhase
 
 /-! ## What `readPhase` guarantees -/
 
@@ -170,33 +169,6 @@ theorem zeroPrefix_map_paddedLeaf (rows : List (List K)) (leafWords rowWords : �
 theorem drop_paddedLeaf (row : List K) (leafWords : ℕ) :
     (paddedLeaf row leafWords).drop (leafWords - row.length) = row :=
   List.drop_left' (by simp)
-
-/-- The stream's words, regrouped by two into elements as `readProof` does, are written back as
-the same words. -/
-theorem stream_flatMap_toBytes (count : ℕ) (words : List K) (hlength : words.length = 2 * count) :
-    ((List.range count).map fun i ↦ E.ofLimbs (words.getD (2 * i) 0)
-        (words.getD (2 * i + 1) 0)).flatMap E.toBytes = words.flatMap K.toBytes := by
-  induction count generalizing words with
-  | zero =>
-    cases words with
-    | nil => rfl
-    | cons => simp at hlength
-  | succ count ih =>
-    match words, hlength with
-    | c0 :: c1 :: rest, hlength =>
-      have hrest : rest.length = 2 * count := by simp at hlength; omega
-      rw [List.range_succ_eq_map, List.map_cons, List.map_map]
-      simp only [List.flatMap_cons]
-      rw [← ih rest hrest]
-      have hshift : ∀ i j, (c0 :: c1 :: rest).getD (2 * (i + 1) + j) 0 =
-          rest.getD (2 * i + j) 0 := fun i j ↦ by
-        rw [show 2 * (i + 1) + j = (2 * i + j) + 1 + 1 by omega]
-        simp only [List.getD_cons_succ]
-      have hshift0 := fun i ↦ hshift i 0
-      simp only [Nat.add_zero] at hshift0
-      simp only [Function.comp_def, hshift0, List.getD_cons_zero,
-        List.getD_cons_succ, Nat.mul_zero, Nat.zero_add, E.toBytes, List.append_assoc]
-      rfl
 
 /-! ## The reader's determinism -/
 
@@ -311,17 +283,15 @@ theorem readProof_eq {bytes : Bytes} {x : List E × List PrunedPhase}
   obtain ⟨stream, phases⟩ := x
   simp only [readProof, Option.bind_eq_bind, Option.bind_eq_some_iff, Prod.exists,
     Option.guard_eq_some', Option.some.injEq, Prod.mk.injEq] at h
-  obtain ⟨length, input₁, hlength, words, input₂, hwords, phaseCount, input₃, hcount, -, hcountLe,
-    phases', input₄, hphases, -, hempty, rfl, rfl⟩ := h
-  obtain ⟨hlengthLt, rfl⟩ := readU32_eq_some_iff.1 hlength
-  obtain ⟨hwordsLength, rfl⟩ := readWords_eq_some_iff.1 hwords
+  obtain ⟨stream', input₁, hstream, phaseCount, input₂, hcount, -, hcountLe,
+    phases', input₃, hphases, -, hempty, rfl, rfl⟩ := h
+  obtain ⟨hlengthLt, rfl⟩ := readStream_eq_some_iff.1 hstream
   obtain ⟨-, rfl⟩ := readU32_eq_some_iff.1 hcount
   obtain ⟨rfl, hall, rfl⟩ := readPhases_eq _ _ _ _ hphases
-  have hempty' : input₄ = [] := by simpa using hempty
+  have hempty' : input₃ = [] := by simpa using hempty
   subst hempty'
-  refine ⟨?_, by simpa using hlengthLt, hcountLe, hall⟩
-  simp only [encodePruned, List.length_map, List.length_range, List.append_nil, List.append_assoc,
-    stream_flatMap_toBytes length words hwordsLength]
+  refine ⟨?_, hlengthLt, hcountLe, hall⟩
+  simp only [encodePruned, List.append_nil, List.append_assoc]
 
 
 end LeanVM.Wire

@@ -92,7 +92,7 @@ fn vector() -> Vec<u8> {
         merkle_openings: vec![open(4, &[3, 1, 3], 3, node, |q| rows[q])],
     };
     let bytes = proof.to_bytes();
-    assert_eq!(bytes.len(), (4 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32);
+    assert_eq!(bytes.len(), (4 + 1 + 16) + 4 + (4 + 3 * 4) + 3 * 4 + 2 * 2 * 8 + 2 * 32);
     assert_eq!(Proof::from_bytes(&bytes), Some(proof));
     assert_eq!(Proof::from_bytes(&[&bytes[..], &[0]].concat()), None);
     bytes

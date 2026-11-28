@@ -133,6 +133,13 @@ mod portable {
         pub fn from_array(k: &[F64; 8]) -> Self {
             Self(*k)
         }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline]
+        pub fn even_odd(a: &[F64; 8], b: &[F64; 8]) -> (Self, Self) {
+            let (even, odd) = even_odd(a, b);
+            (Self(even), Self(odd))
+        }
     }
 
     impl core::ops::Add for F64x8 {
@@ -483,6 +490,14 @@ mod avx2 {
             let (halves, _) = k.as_chunks::<4>();
             Self([F64x4::load(&halves[0]), F64x4::load(&halves[1])])
         }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline(always)]
+        pub fn even_odd(a: &[F64; 8], b: &[F64; 8]) -> (Self, Self) {
+            let even = [a[0], a[2], a[4], a[6], b[0], b[2], b[4], b[6]];
+            let odd = [a[1], a[3], a[5], a[7], b[1], b[3], b[5], b[7]];
+            (Self::from_array(&even), Self::from_array(&odd))
+        }
     }
 
     impl core::ops::Add for F64x8 {
@@ -574,6 +589,19 @@ mod avx512 {
         #[inline(always)]
         pub fn from_array(k: &[F64; 8]) -> Self {
             Self(load(k, 0))
+        }
+
+        /// `([a0, a2, a4, a6, b0, b2, b4, b6], [a1, a3, a5, a7, b1, b3, b5, b7])`.
+        #[inline(always)]
+        pub fn even_odd(a: &[F64; 8], b: &[F64; 8]) -> (Self, Self) {
+            let z0 = load(a, 0);
+            let z1 = load(b, 0);
+            // SAFETY: the module is compiled only with avx512f enabled.
+            unsafe {
+                let even = _mm512_permutex2var_epi64(z0, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), z1);
+                let odd = _mm512_permutex2var_epi64(z0, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), z1);
+                (Self(even), Self(odd))
+            }
         }
     }
 
@@ -975,5 +1003,17 @@ mod tests {
                 "length {len}"
             );
         }
+    }
+
+    #[test]
+    fn f64x8_even_odd_matches_scalar() {
+        let mut rng = crate::test_rng::Rng::new(0xF648);
+        let a: [F64; 8] = core::array::from_fn(|_| F64(rng.next_u64()));
+        let b: [F64; 8] = core::array::from_fn(|_| F64(rng.next_u64()));
+        let (even, odd) = F64x8::even_odd(&a, &b);
+        let want_even = [a[0], a[2], a[4], a[6], b[0], b[2], b[4], b[6]].map(F128::from);
+        let want_odd = [a[1], a[3], a[5], a[7], b[1], b[3], b[5], b[7]].map(F128::from);
+        assert_eq!(F128x8::from(even).to_array(), want_even);
+        assert_eq!(F128x8::from(odd).to_array(), want_odd);
     }
 }

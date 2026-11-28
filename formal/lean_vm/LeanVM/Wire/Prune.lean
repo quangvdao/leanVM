@@ -36,49 +36,6 @@ open LeanVM.Protocol.Compile LeanVM.Wire.PruneList
 
 namespace Prune
 
-/-- The two limbs of each stream element, in order. -/
-def limbWords (s : List E) : List K :=
-  s.flatMap fun x ↦ [x.limb 0, x.limb 1]
-
-theorem limbWords_toBytes (s : List E) :
-    (limbWords s).flatMap K.toBytes = s.flatMap E.toBytes := by
-  induction s with
-  | nil => rfl
-  | cons x s ih =>
-    simp only [limbWords] at ih
-    simp [limbWords, ih, E.toBytes]
-
-theorem length_limbWords (s : List E) : (limbWords s).length = 2 * s.length := by
-  induction s with
-  | nil => rfl
-  | cons x s ih => simp [limbWords] at ih ⊢; omega
-
-/-- `readProof`'s regrouping of the stream's words gives the stream back. -/
-theorem regroup_limbWords :
-    ∀ s : List E, (List.range s.length).map (fun i ↦ E.ofLimbs ((limbWords s).getD (2 * i) 0)
-      ((limbWords s).getD (2 * i + 1) 0)) = s
-  | [] => rfl
-  | x :: s => by
-    have ih := regroup_limbWords s
-    rw [List.length_cons, List.range_succ_eq_map, List.map_cons, List.map_map]
-    refine congrArg₂ List.cons ?_ (Eq.trans ?_ ih)
-    · simpa [limbWords] using (CompPoly.Extension.Ext.ext fun i ↦ by fin_cases i <;> rfl :
-        E.ofLimbs (x.limb 0) (x.limb 1) = x)
-    · apply List.map_congr_left
-      intro i _
-      simp only [Function.comp, limbWords, List.flatMap_cons]
-      have h2 : 2 * (i + 1) = 2 * i + 2 := by ring
-      simp [List.getD_eq_getElem?_getD, h2, Nat.add_assoc]
-
-/-- The stream's form of `readProof_toBytes`, from `readWords_toBytes` (`ReadWrite`'s
-`streamOfWords`, `streamWords` are not exposed). -/
-theorem readStream_of_readWords (s : List E) (rest : Bytes) : ∃ ws,
-      readWords (2 * s.length) (s.flatMap E.toBytes ++ rest) = some (ws, rest) ∧
-        (List.range s.length).map (fun i ↦
-          E.ofLimbs (ws.getD (2 * i) 0) (ws.getD (2 * i + 1) 0)) = s :=
-  ⟨limbWords s, by rw [← length_limbWords, ← limbWords_toBytes]; exact readWords_toBytes _ _,
-    regroup_limbWords s⟩
-
 /-- The siblings a level writes: the filter of nodes paired with their values. -/
 theorem filter_flatMap_pairs (N : List ℕ) (v : ℕ → Digest) (nodes : List (ℕ × Digest))
     (hnodes : nodes = N.map fun n ↦ (n, v n)) :
@@ -395,15 +352,13 @@ theorem readPhases_flatMap :
 /-- **`readProof` reads back the encoding of a proof that survives it.** -/
 theorem readProof_toBytes {proof : Proof} (hw : WireDecodable h proof) :
     readProof proof.toBytes = some (proof.stream, proof.openings.map prunePhase) := by
-  obtain ⟨ws, hws, hstream⟩ := readStream_of_readWords proof.stream
-    (Prover.u32Bytes proof.openings.length ++ proof.openings.flatMap Prover.phaseToBytes)
   have hphases := readPhases_flatMap proof.openings hw.phases []
   rw [List.append_nil] at hphases
   have hcount : proof.openings.length < 2 ^ 32 :=
     lt_of_le_of_lt hw.phases_le (by norm_num [wireMaxPhases])
   simp only [readProof, Proof.toBytes, List.append_assoc]
-  simp only [readU32_u32Bytes hw.stream_lt, Option.bind_eq_bind, Option.bind_some, hws,
-    readU32_u32Bytes hcount, guard_some hw.phases_le, hphases, hstream,
+  simp only [readStream_streamToBytes hw.stream_lt, Option.bind_eq_bind, Option.bind_some,
+    readU32_u32Bytes hcount, guard_some hw.phases_le, hphases,
     guard_some (show ([] : Bytes).isEmpty from rfl)]
 
 end Phase

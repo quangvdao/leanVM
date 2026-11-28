@@ -56,7 +56,13 @@ pub fn run(n: usize, depth: usize, log_inv_rate: usize, plan: Plan) -> Report {
         prove,
         verify,
         stream_len: proof.stream.len(),
-        merkle_bytes: proof.to_bytes().len() - 16 * proof.stream.len(),
+        // The proof without its stream: the Merkle openings and the two length headers.
+        merkle_bytes: verifier::Proof {
+            stream: Vec::new(),
+            merkle_openings: proof.merkle_openings.clone(),
+        }
+        .to_bytes()
+        .len(),
     }
 }
 
